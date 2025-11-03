@@ -1,0 +1,5 @@
+torch>=2.0.0
+torch-geometric>=2.3.0
+numpy>=1.20.0
+tensorboard>=2.13.0
+maturin>=1.0.0

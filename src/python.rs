@@ -1,0 +1,302 @@
+use crate::{Board as RustBoard, Bug as RustBug, Color as RustColor, Hex, Rules, Turn as RustTurn};
+use minimax::Game;
+use pyo3::prelude::*;
+use pyo3::types::PyList;
+
+/// Represents a bug type in the Hive game
+#[pyclass]
+#[derive(Clone)]
+pub struct Bug {
+    inner: RustBug,
+}
+
+#[pymethods]
+impl Bug {
+    #[new]
+    fn new(name: &str) -> PyResult<Self> {
+        let inner = match name.to_lowercase().as_str() {
+            "queen" => RustBug::Queen,
+            "grasshopper" => RustBug::Grasshopper,
+            "spider" => RustBug::Spider,
+            "ant" => RustBug::Ant,
+            "beetle" => RustBug::Beetle,
+            "mosquito" => RustBug::Mosquito,
+            "ladybug" => RustBug::Ladybug,
+            "pillbug" => RustBug::Pillbug,
+            _ => return Err(pyo3::exceptions::PyValueError::new_err("Invalid bug name")),
+        };
+        Ok(Bug { inner })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Bug('{}')", self.inner.name())
+    }
+
+    fn __str__(&self) -> String {
+        self.inner.name().to_string()
+    }
+
+    #[getter]
+    fn name(&self) -> String {
+        self.inner.name().to_string()
+    }
+}
+
+/// Represents the color of a player (Black or White)
+#[pyclass]
+#[derive(Clone, Copy)]
+pub struct Color {
+    inner: RustColor,
+}
+
+#[pymethods]
+impl Color {
+    #[new]
+    fn new(color: &str) -> PyResult<Self> {
+        let inner = match color.to_lowercase().as_str() {
+            "black" => RustColor::Black,
+            "white" => RustColor::White,
+            _ => return Err(pyo3::exceptions::PyValueError::new_err("Invalid color")),
+        };
+        Ok(Color { inner })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Color('{}')", if self.inner == RustColor::Black { "Black" } else { "White" })
+    }
+
+    fn __str__(&self) -> String {
+        if self.inner == RustColor::Black { "Black" } else { "White" }.to_string()
+    }
+
+    #[getter]
+    fn name(&self) -> String {
+        if self.inner == RustColor::Black { "Black" } else { "White" }.to_string()
+    }
+}
+
+/// Represents a turn/move in the game
+#[pyclass]
+#[derive(Clone)]
+pub struct Turn {
+    inner: RustTurn,
+}
+
+#[pymethods]
+impl Turn {
+    #[staticmethod]
+    fn place(hex: u16, bug: Bug) -> Self {
+        Turn { inner: RustTurn::Place(hex as Hex, bug.inner) }
+    }
+
+    #[staticmethod]
+    fn move_bug(from_hex: u16, to_hex: u16) -> Self {
+        Turn { inner: RustTurn::Move(from_hex as Hex, to_hex as Hex) }
+    }
+
+    #[staticmethod]
+    fn pass() -> Self {
+        Turn { inner: RustTurn::Pass }
+    }
+
+    fn __repr__(&self) -> String {
+        match self.inner {
+            RustTurn::Place(hex, bug) => format!("Turn.place({}, Bug('{}'))", hex, bug.name()),
+            RustTurn::Move(from, to) => format!("Turn.move_bug({}, {})", from, to),
+            RustTurn::Pass => "Turn.pass()".to_string(),
+        }
+    }
+
+    fn is_place(&self) -> bool {
+        matches!(self.inner, RustTurn::Place(_, _))
+    }
+
+    fn is_move(&self) -> bool {
+        matches!(self.inner, RustTurn::Move(_, _))
+    }
+
+    fn is_pass(&self) -> bool {
+        matches!(self.inner, RustTurn::Pass)
+    }
+
+    fn get_place_info(&self) -> PyResult<(u16, String)> {
+        match self.inner {
+            RustTurn::Place(hex, bug) => Ok((hex as u16, bug.name().to_string())),
+            _ => Err(pyo3::exceptions::PyValueError::new_err("Not a Place turn")),
+        }
+    }
+
+    fn get_move_info(&self) -> PyResult<(u16, u16)> {
+        match self.inner {
+            RustTurn::Move(from, to) => Ok((from as u16, to as u16)),
+            _ => Err(pyo3::exceptions::PyValueError::new_err("Not a Move turn")),
+        }
+    }
+}
+
+/// Represents the Hive game board state
+#[pyclass]
+pub struct Board {
+    inner: RustBoard,
+}
+
+#[pymethods]
+impl Board {
+    #[new]
+    fn new() -> Self {
+        Board { inner: RustBoard::default() }
+    }
+
+    /// Generate all legal moves for the current position
+    fn legal_moves(&self) -> Vec<Turn> {
+        let mut moves = Vec::new();
+        Rules::generate_moves(&self.inner, &mut moves);
+        moves.into_iter().map(|m| Turn { inner: m }).collect()
+    }
+
+    /// Apply a move to the board
+    fn apply(&mut self, turn: &Turn) {
+        self.inner.apply(turn.inner);
+    }
+
+    /// Undo a move
+    fn undo(&mut self, turn: &Turn) {
+        self.inner.undo(turn.inner);
+    }
+
+    /// Get the current player to move
+    fn to_move(&self) -> Color {
+        Color { inner: self.inner.to_move() }
+    }
+
+    /// Get the current turn number
+    fn turn_num(&self) -> u16 {
+        self.inner.turn_num
+    }
+
+    /// Clone the board
+    fn clone(&self) -> Self {
+        Board { inner: self.inner.clone() }
+    }
+
+    /// Check if the game is over and get the winner
+    fn get_winner(&self) -> Option<String> {
+        Rules::get_winner(&self.inner).map(|w| match w {
+            minimax::Winner::Draw => "Draw".to_string(),
+            minimax::Winner::PlayerToMove => {
+                if self.inner.to_move() == RustColor::Black {
+                    "Black".to_string()
+                } else {
+                    "White".to_string()
+                }
+            }
+            minimax::Winner::PlayerJustMoved => {
+                if self.inner.to_move() == RustColor::Black {
+                    "White".to_string()
+                } else {
+                    "Black".to_string()
+                }
+            }
+        })
+    }
+
+    /// Convert board state to a graph representation
+    /// Returns (node_features, edge_index, edge_features)
+    fn to_graph(&self, py: Python) -> PyResult<PyObject> {
+        let mut nodes = Vec::new();
+        let mut edges_from = Vec::new();
+        let mut edges_to = Vec::new();
+        let mut node_features = Vec::new();
+
+        // Map hex positions to node indices
+        let mut hex_to_node: std::collections::HashMap<Hex, usize> =
+            std::collections::HashMap::new();
+
+        // Collect all occupied hexes and create nodes
+        for color_idx in 0..2 {
+            for &hex in self.inner.occupied_hexes[color_idx].iter() {
+                let node_idx = nodes.len();
+                hex_to_node.insert(hex, node_idx);
+                nodes.push(hex);
+
+                let node = self.inner.node(hex);
+                let height = self.inner.height(hex);
+
+                // Node features: [color (0/1), bug_type (0-7), height, on_top (0/1)]
+                let features = vec![
+                    node.color() as usize as f32,
+                    node.bug() as usize as f32,
+                    height as f32,
+                    if height > 1 { 1.0 } else { 0.0 },
+                ];
+                node_features.push(features);
+            }
+        }
+
+        // Create edges between adjacent pieces
+        use crate::hex_grid::{adjacent, Direction};
+        for (i, &hex) in nodes.iter().enumerate() {
+            for &adj_hex in adjacent(hex).iter() {
+                if let Some(&j) = hex_to_node.get(&adj_hex) {
+                    edges_from.push(i);
+                    edges_to.push(j);
+                }
+            }
+        }
+
+        // Convert to Python objects
+        let node_features_py = PyList::new(py, node_features.iter().map(|f| PyList::new(py, f)));
+        let edge_index_py =
+            PyList::new(py, vec![PyList::new(py, &edges_from), PyList::new(py, &edges_to)]);
+
+        // Return as tuple
+        Ok((node_features_py, edge_index_py).into_py(py))
+    }
+
+    /// Get board state as a compact representation for features
+    /// Returns a list of (hex, color, bug, height) tuples
+    fn get_pieces(&self) -> Vec<(u16, String, String, u8)> {
+        let mut pieces = Vec::new();
+
+        for color_idx in 0..2 {
+            for &hex in self.inner.occupied_hexes[color_idx].iter() {
+                let node = self.inner.node(hex);
+                let height = self.inner.height(hex);
+
+                let color_str = if node.color() == RustColor::Black { "Black" } else { "White" };
+
+                pieces.push((
+                    hex as u16,
+                    color_str.to_string(),
+                    node.bug().name().to_string(),
+                    height,
+                ));
+            }
+        }
+
+        pieces
+    }
+
+    /// Get the hash of the board position
+    fn zobrist_hash(&self) -> u64 {
+        Rules::zobrist_hash(&self.inner)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Board(turn={}, to_move={})",
+            self.inner.turn_num,
+            if self.inner.to_move() == RustColor::Black { "Black" } else { "White" }
+        )
+    }
+}
+
+/// Python module initialization
+#[pymodule]
+fn nokamute(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_class::<Board>()?;
+    m.add_class::<Turn>()?;
+    m.add_class::<Bug>()?;
+    m.add_class::<Color>()?;
+    Ok(())
+}

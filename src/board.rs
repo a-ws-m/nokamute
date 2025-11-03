@@ -238,7 +238,7 @@ impl Board {
         }
     }
 
-    fn height(&self, hex: Hex) -> u8 {
+    pub fn height(&self, hex: Hex) -> u8 {
         self.underworld_height(hex, self.node(hex))
     }
 
