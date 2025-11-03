@@ -203,43 +203,109 @@ impl Board {
     /// Convert board state to a graph representation
     /// Returns (node_features, edge_index, edge_features)
     fn to_graph(&self, py: Python) -> PyResult<PyObject> {
-        let mut nodes = Vec::new();
-        let mut edges_from = Vec::new();
-        let mut edges_to = Vec::new();
+        use crate::hex_grid::adjacent;
+        use std::collections::{HashMap, HashSet};
+
+        // Map (hex, height) to node indices
+        let mut position_to_node: HashMap<(Hex, u8), usize> = HashMap::new();
         let mut node_features = Vec::new();
 
-        // Map hex positions to node indices
-        let mut hex_to_node: std::collections::HashMap<Hex, usize> =
-            std::collections::HashMap::new();
-
-        // Collect all occupied hexes and create nodes
+        // First pass: collect all occupied positions (hex, height)
+        let mut occupied_positions = Vec::new();
         for color_idx in 0..2 {
             for &hex in self.inner.occupied_hexes[color_idx].iter() {
-                let node_idx = nodes.len();
-                hex_to_node.insert(hex, node_idx);
-                nodes.push(hex);
-
-                let node = self.inner.node(hex);
                 let height = self.inner.height(hex);
-
-                // Node features: [color (0/1), bug_type (0-7), height, on_top (0/1)]
-                let features = vec![
-                    node.color() as usize as f32,
-                    node.bug() as usize as f32,
-                    height as f32,
-                    if height > 1 { 1.0 } else { 0.0 },
-                ];
-                node_features.push(features);
+                // Add nodes for each height level (stacked pieces)
+                for h in 1..=height {
+                    occupied_positions.push((hex, h));
+                }
             }
         }
 
-        // Create edges between adjacent pieces
-        use crate::hex_grid::{adjacent, Direction};
-        for (i, &hex) in nodes.iter().enumerate() {
+        // Collect empty spaces adjacent to pieces
+        let mut empty_spaces = HashSet::new();
+        for &(hex, _) in &occupied_positions {
             for &adj_hex in adjacent(hex).iter() {
-                if let Some(&j) = hex_to_node.get(&adj_hex) {
+                // Only add empty space at height 1 if no piece exists there
+                if self.inner.height(adj_hex) == 0 {
+                    empty_spaces.insert(adj_hex);
+                }
+            }
+        }
+
+        // Create nodes for occupied positions
+        for &(hex, h) in &occupied_positions {
+            let node_idx = position_to_node.len();
+            position_to_node.insert((hex, h), node_idx);
+
+            let node = self.inner.node(hex);
+            let color = node.color();
+            let bug = node.bug();
+
+            // One-hot encode bug type (8 bug types + 1 for empty = 9 total)
+            // Queen=0, Grasshopper=1, Spider=2, Ant=3, Beetle=4, Mosquito=5, Ladybug=6, Pillbug=7, Empty=8
+            let mut bug_onehot = vec![0.0f32; 9];
+            bug_onehot[bug as usize] = 1.0;
+
+            // Node features: [color (0/1), bug_onehot (9 values), height]
+            let mut features = vec![color as usize as f32];
+            features.extend(bug_onehot);
+            features.push(h as f32);
+
+            node_features.push(features);
+        }
+
+        // Create nodes for empty spaces
+        for &hex in &empty_spaces {
+            let node_idx = position_to_node.len();
+            position_to_node.insert((hex, 1), node_idx);
+
+            // Empty space: color=0, bug_type=Empty (index 8), height=1
+            let mut bug_onehot = vec![0.0f32; 9];
+            bug_onehot[8] = 1.0; // Empty space
+
+            let mut features = vec![0.0]; // color doesn't matter for empty
+            features.extend(bug_onehot);
+            features.push(1.0); // height=1 for empty spaces
+
+            node_features.push(features);
+        }
+
+        // Create edges
+        let mut edges_from = Vec::new();
+        let mut edges_to = Vec::new();
+
+        // Iterate through all positions
+        for &(hex, h) in position_to_node.keys() {
+            let i = position_to_node[&(hex, h)];
+
+            // 1. Vertical edges (same hex, different heights)
+            if let Some(&j) = position_to_node.get(&(hex, h + 1)) {
+                edges_from.push(i);
+                edges_to.push(j);
+                // Add reverse edge for undirected graph
+                edges_from.push(j);
+                edges_to.push(i);
+            }
+
+            // 2. Horizontal edges (adjacent hexes at same height)
+            for &adj_hex in adjacent(hex).iter() {
+                if let Some(&j) = position_to_node.get(&(adj_hex, h)) {
                     edges_from.push(i);
                     edges_to.push(j);
+                }
+            }
+
+            // 3. Edges to adjacent hexes at different heights
+            for &adj_hex in adjacent(hex).iter() {
+                // Check all height levels at the adjacent hex
+                for dh in 1..=self.inner.height(adj_hex).max(1) {
+                    if dh != h {
+                        if let Some(&j) = position_to_node.get(&(adj_hex, dh)) {
+                            edges_from.push(i);
+                            edges_to.push(j);
+                        }
+                    }
                 }
             }
         }
