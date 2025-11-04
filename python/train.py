@@ -241,7 +241,7 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
     return training_examples
 
 
-def evaluate_model(model, num_games=50, device="cpu"):
+def evaluate_model(model, num_games=50, device="cpu", max_moves=400):
     """
     Evaluate model performance through self-play.
 
@@ -249,11 +249,12 @@ def evaluate_model(model, num_games=50, device="cpu"):
         model: GNN model to evaluate
         num_games: Number of games to play
         device: Device to run on
+        max_moves: Maximum number of moves per game
 
     Returns:
         Statistics dictionary
     """
-    player = SelfPlayGame(model=model, temperature=0.1, device=device)
+    player = SelfPlayGame(model=model, temperature=0.1, device=device, max_moves=max_moves)
 
     results = {"wins": 0, "losses": 0, "draws": 0, "avg_game_length": 0}
     total_moves = 0
@@ -348,6 +349,12 @@ def main():
         default=0.5,
         help="Fraction of games to generate from branch points (default: 0.5)",
     )
+    parser.add_argument(
+        "--max-moves",
+        type=int,
+        default=400,
+        help="Maximum number of moves per game before declaring a draw (default: 400)",
+    )
 
     args = parser.parse_args()
 
@@ -401,6 +408,7 @@ def main():
             temperature=args.temperature,
             device=args.device,
             enable_branching=args.enable_branching,
+            max_moves=args.max_moves,
         )
         
         if args.enable_branching:
@@ -453,7 +461,7 @@ def main():
 
         # Evaluate model (self-play)
         print("\nEvaluating model (self-play)...")
-        eval_stats = evaluate_model(model, num_games=20, device=args.device)
+        eval_stats = evaluate_model(model, num_games=20, device=args.device, max_moves=args.max_moves)
         print(f"Self-play evaluation results: {eval_stats}")
 
         writer.add_scalar(

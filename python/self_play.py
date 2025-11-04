@@ -43,18 +43,20 @@ class SelfPlayGame:
     Supports branching MCMC for efficient parallel game generation.
     """
 
-    def __init__(self, model=None, temperature=1.0, device="cpu", enable_branching=False):
+    def __init__(self, model=None, temperature=1.0, device="cpu", enable_branching=False, max_moves=400):
         """
         Args:
             model: GNN model for position evaluation (optional)
             temperature: Temperature for move selection (higher = more exploration)
             device: Device to run model on
             enable_branching: Enable branching MCMC for game generation
+            max_moves: Maximum number of moves before declaring a draw (default: 400)
         """
         self.model = model
         self.temperature = temperature
         self.device = device
         self.enable_branching = enable_branching
+        self.max_moves = max_moves
         
         # Branching MCMC state
         self.game_tree: Dict[str, GameNode] = {}  # board_state -> GameNode
@@ -261,7 +263,7 @@ class SelfPlayGame:
 
         return move_values
 
-    def play_game(self, max_moves=400, start_board=None, start_depth=0):
+    def play_game(self, max_moves=None, start_board=None, start_depth=0):
         """
         Play a single self-play game.
         
@@ -271,7 +273,7 @@ class SelfPlayGame:
         3. Max moves reached (to prevent infinite games)
 
         Args:
-            max_moves: Maximum number of moves before declaring draw
+            max_moves: Maximum number of moves before declaring draw (uses self.max_moves if None)
             start_board: Optional starting board position (for branching)
             start_depth: Starting depth (for branching)
 
@@ -279,6 +281,9 @@ class SelfPlayGame:
             game_data: List of (board_state, legal_moves, selected_move)
             result: Game result (1.0 for player 1 win, -1.0 for player 2 win, 0.0 for draw)
         """
+        if max_moves is None:
+            max_moves = self.max_moves
+        
         board = start_board.clone() if start_board is not None else nokamute.Board()
         game_data = []
 
