@@ -12,21 +12,23 @@ import torch.nn.functional as F
 from model import create_model
 from self_play import SelfPlayGame, prepare_training_data
 from torch.utils.tensorboard import SummaryWriter
+import nokamute
 from torch_geometric.data import Batch, Data
 from elo_tracker import EloTracker
 from evaluate_vs_engine import evaluate_and_update_elo
 
 
-def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu"):
+def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu", gamma=0.99):
     """
-    Train the model for one epoch.
+    Train the model for one epoch using temporal difference learning.
 
     Args:
         model: GNN model
-        training_data: List of (node_features, edge_index, target_value)
+        training_data: List of (node_features, edge_index, td_target)
         optimizer: Optimizer
         batch_size: Batch size
         device: Device to train on
+        gamma: TD discount factor (default: 0.99)
 
     Returns:
         Average loss for the epoch
@@ -48,7 +50,7 @@ def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu"):
         data_list = []
         targets = []
 
-        for node_features, edge_index, target_value in batch_data:
+        for node_features, edge_index, td_target in batch_data:
             if len(node_features) == 0:
                 continue
 
@@ -57,7 +59,7 @@ def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu"):
 
             data = Data(x=x, edge_index=edge_index_tensor)
             data_list.append(data)
-            targets.append(target_value)
+            targets.append(td_target)
 
         if len(data_list) == 0:
             continue
@@ -70,7 +72,7 @@ def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu"):
         optimizer.zero_grad()
         predictions, _ = model(batch.x, batch.edge_index, batch.batch)
 
-        # Compute loss (MSE between predicted and target values)
+        # Compute TD loss (MSE between predicted value and TD target)
         loss = F.mse_loss(predictions, targets)
 
         # Backward pass
@@ -81,6 +83,111 @@ def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu"):
         num_batches += 1
 
     return total_loss / max(num_batches, 1)
+
+
+def prepare_td_training_data(games, model, device="cpu", gamma=0.99):
+    """
+    Prepare training data using temporal difference learning.
+    
+    TD target: V(s_t) = r_t + gamma * V(s_{t+1})
+    Where:
+    - V(s_t) is the value of current state
+    - r_t is the immediate reward (0 for non-terminal states)
+    - V(s_{t+1}) is the value of next state (from model)
+    
+    For terminal states: V(s_terminal) = final_result
+    
+    Args:
+        games: List of (game_data, result) tuples from self-play
+        model: Current model to estimate future values
+        device: Device to run model on
+        gamma: Discount factor for future rewards
+        
+    Returns:
+        training_examples: List of (node_features, edge_index, td_target)
+    """
+    training_examples = []
+    model.eval()
+    
+    for game_data, final_result in games:
+        if len(game_data) == 0:
+            continue
+            
+        # Process positions in reverse (from end to start)
+        # This allows us to compute TD targets efficiently
+        next_value = None
+        
+        for position_idx in reversed(range(len(game_data))):
+            board_graph, legal_moves, selected_move, player = game_data[position_idx]
+            node_features, edge_index = board_graph
+            
+            # Skip empty boards
+            if len(node_features) == 0:
+                continue
+            
+            # Determine if this is the last position
+            is_terminal = (position_idx == len(game_data) - 1)
+            
+            if is_terminal:
+                # Terminal state: use final game result
+                if player.name == "White":
+                    td_target = final_result
+                else:
+                    td_target = -final_result
+            else:
+                # Non-terminal state: use TD target
+                # If we haven't computed next value yet, get it from model
+                if next_value is None:
+                    # Get next position
+                    next_board_graph, _, _, next_player = game_data[position_idx + 1]
+                    next_node_features, next_edge_index = next_board_graph
+                    
+                    if len(next_node_features) > 0:
+                        # Evaluate next position with model
+                        with torch.no_grad():
+                            x = torch.tensor(next_node_features, dtype=torch.float32).to(device)
+                            edge_index_tensor = torch.tensor(next_edge_index, dtype=torch.long).to(device)
+                            
+                            # Create temporary batch with single item
+                            data = Data(x=x, edge_index=edge_index_tensor)
+                            batch = Batch.from_data_list([data]).to(device)
+                            
+                            prediction, _ = model(batch.x, batch.edge_index, batch.batch)
+                            next_value_raw = prediction.item()
+                            
+                            # Flip sign if different player
+                            if player.name == next_player.name:
+                                # Same player (shouldn't happen in normal gameplay)
+                                next_value = next_value_raw
+                            else:
+                                # Different player - negate value
+                                next_value = -next_value_raw
+                    else:
+                        next_value = 0.0
+                
+                # TD target: immediate reward (0) + discounted next value
+                # We use gamma * next_value because opponent's good position is bad for us
+                td_target = gamma * next_value
+            
+            # Store training example
+            training_examples.append((node_features, edge_index, td_target))
+            
+            # Current position becomes "next position" for previous iteration
+            # Evaluate current position to use as next_value in next iteration
+            if position_idx > 0:
+                with torch.no_grad():
+                    x = torch.tensor(node_features, dtype=torch.float32).to(device)
+                    edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).to(device)
+                    
+                    data = Data(x=x, edge_index=edge_index_tensor)
+                    batch = Batch.from_data_list([data]).to(device)
+                    
+                    prediction, _ = model(batch.x, batch.edge_index, batch.batch)
+                    next_value = prediction.item()
+            else:
+                next_value = None
+    
+    return training_examples
 
 
 def evaluate_model(model, num_games=50, device="cpu"):
@@ -126,7 +233,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--hidden-dim", type=int, default=128, help="Hidden dimension")
     parser.add_argument(
-        "--num-layers", type=int, default=4, help="Number of GNN layers"
+        "--num-layers", type=int, default=3, help="Number of GNN layers"
     )
     parser.add_argument(
         "--temperature", type=float, default=1.0, help="Move selection temperature"
@@ -167,6 +274,17 @@ def main():
         type=int,
         default=32,
         help="K-factor for ELO rating system",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.99,
+        help="TD learning discount factor (default: 0.99)",
+    )
+    parser.add_argument(
+        "--use-td",
+        action="store_true",
+        help="Use temporal difference learning instead of Monte Carlo returns",
     )
 
     args = parser.parse_args()
@@ -226,7 +344,14 @@ def main():
 
         # Prepare training data
         print("Preparing training data...")
-        training_data = prepare_training_data(games)
+        if args.use_td:
+            print(f"Using TD learning with gamma={args.gamma}")
+            training_data = prepare_td_training_data(
+                games, model, device=args.device, gamma=args.gamma
+            )
+        else:
+            print("Using Monte Carlo returns")
+            training_data = prepare_training_data(games)
         print(f"Training examples: {len(training_data)}")
 
         # Train for multiple epochs
@@ -238,6 +363,7 @@ def main():
                 optimizer,
                 batch_size=args.batch_size,
                 device=args.device,
+                gamma=args.gamma,
             )
 
             print(f"Epoch {epoch + 1}/{args.epochs}, Loss: {loss:.6f}")
