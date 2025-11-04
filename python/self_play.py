@@ -33,6 +33,7 @@ class SelfPlayGame:
     def select_move(self, board, legal_moves):
         """
         Select a move based on model evaluation or random selection.
+        Checks for immediate winning moves first.
 
         Args:
             board: Current board state
@@ -43,6 +44,20 @@ class SelfPlayGame:
         """
         if len(legal_moves) == 1:
             return legal_moves[0]
+
+        # Check for immediate winning moves
+        current_player = board.to_move().name
+        for move in legal_moves:
+            board_copy = board.clone()
+            board_copy.apply(move)
+            winner = board_copy.get_winner()
+            
+            if winner == current_player:
+                # This move wins immediately - play it!
+                return move
+            
+            # Clean up the board copy (though it will be garbage collected anyway)
+            del board_copy
 
         if self.model is None:
             # Random selection
