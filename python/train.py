@@ -18,6 +18,19 @@ from torch_geometric.data import Batch, Data
 from elo_tracker import EloTracker
 from evaluate_vs_engine import evaluate_and_update_elo
 
+# Import pre-training modules
+try:
+    from pretrain.eval_matching import (
+        generate_eval_matching_data,
+        pretrain_eval_matching,
+        save_eval_data,
+        load_eval_data,
+    )
+    PRETRAIN_AVAILABLE = True
+except ImportError:
+    PRETRAIN_AVAILABLE = False
+    print("Warning: Pre-training modules not available")
+
 
 def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu", gamma=0.99):
     """
@@ -355,6 +368,45 @@ def main():
         default=400,
         help="Maximum number of moves per game before declaring a draw (default: 400)",
     )
+    
+    # Pre-training arguments
+    parser.add_argument(
+        "--pretrain",
+        type=str,
+        choices=["eval-matching", "none"],
+        default="none",
+        help="Pre-training method to use (runs pre-training only, then exits)",
+    )
+    parser.add_argument(
+        "--pretrain-games",
+        type=int,
+        default=10000,
+        help="Number of games to generate for pre-training (default: 10000)",
+    )
+    parser.add_argument(
+        "--pretrain-depth",
+        type=int,
+        default=7,
+        help="Engine search depth for pre-training data generation (default: 7)",
+    )
+    parser.add_argument(
+        "--pretrain-epochs",
+        type=int,
+        default=100,
+        help="Number of epochs for pre-training (default: 100)",
+    )
+    parser.add_argument(
+        "--pretrain-randomness",
+        type=float,
+        default=0.0,
+        help="Randomness rate for pre-training data generation (default: 0.0)",
+    )
+    parser.add_argument(
+        "--pretrain-data-path",
+        type=str,
+        default=None,
+        help="Path to saved pre-training data (auto-generated if not provided)",
+    )
 
     args = parser.parse_args()
 
@@ -390,6 +442,117 @@ def main():
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Device: {args.device}")
+
+    # Pre-training phase (standalone mode - exits after completion)
+    if args.pretrain != "none":
+        if not PRETRAIN_AVAILABLE:
+            print("\nError: Pre-training requested but modules not available.")
+            print("Make sure the pretrain package is installed correctly.")
+            return
+        
+        print("\n" + "=" * 60)
+        print("PRE-TRAINING MODE")
+        print("=" * 60)
+        
+        if args.pretrain == "eval-matching":
+            print(f"\nPre-training method: Evaluation Matching")
+            print(f"Target: Match analytical BasicEvaluator scores")
+            
+            # Determine data file path
+            if args.pretrain_data_path:
+                data_file_path = args.pretrain_data_path
+            else:
+                # Auto-generate path based on settings
+                data_filename = f"pretrain_eval_d{args.pretrain_depth}_g{args.pretrain_games}_r{int(args.pretrain_randomness*100)}.pkl"
+                data_file_path = os.path.join(args.model_path, data_filename)
+            
+            # Load or generate pre-training data
+            if os.path.exists(data_file_path):
+                print(f"\nLoading existing pre-training data from: {data_file_path}")
+                pretrain_data = load_eval_data(data_file_path)
+            else:
+                print(f"\nGenerating new pre-training data...")
+                print(f"  Games: {args.pretrain_games}")
+                print(f"  Engine depth: {args.pretrain_depth}")
+                print(f"  Randomness rate: {args.pretrain_randomness}")
+                print(f"  Max moves per game: {args.max_moves}")
+                
+                pretrain_data = generate_eval_matching_data(
+                    num_games=args.pretrain_games,
+                    depth=args.pretrain_depth,
+                    aggression=3,
+                    randomness_rate=args.pretrain_randomness,
+                    max_moves=args.max_moves,
+                    verbose=True,
+                )
+                
+                # Always save generated data for future use
+                print(f"\nSaving pre-training data to: {data_file_path}")
+                save_eval_data(pretrain_data, data_file_path)
+            
+            # Pre-train the model
+            print(f"\nPre-training for {args.pretrain_epochs} epochs...")
+            print(f"Batch size: {args.batch_size}")
+            print(f"Learning rate: {args.lr}")
+            
+            pretrain_losses = pretrain_eval_matching(
+                model=model,
+                training_data=pretrain_data,
+                optimizer=optimizer,
+                num_epochs=args.pretrain_epochs,
+                batch_size=args.batch_size,
+                device=args.device,
+                verbose=True,
+            )
+            
+            # Log to tensorboard
+            for epoch, loss in enumerate(pretrain_losses):
+                writer.add_scalar("Pretrain/Loss", loss, epoch)
+            
+            # Save pre-trained model
+            pretrain_model_path = os.path.join(args.model_path, "model_pretrained.pt")
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "pretrain_method": args.pretrain,
+                "pretrain_loss": pretrain_losses[-1],
+                "config": model_config,
+                "pretrain_games": args.pretrain_games,
+                "pretrain_depth": args.pretrain_depth,
+                "pretrain_epochs": args.pretrain_epochs,
+            }, pretrain_model_path)
+            print(f"\nPre-trained model saved to: {pretrain_model_path}")
+            print(f"Final pre-training loss: {pretrain_losses[-1]:.6f}")
+            
+            # Evaluate pre-trained model against engine
+            print("\nEvaluating pre-trained model against engine...")
+            pretrain_eval_results = evaluate_and_update_elo(
+                model=model,
+                elo_tracker=elo_tracker,
+                model_name="model_pretrained",
+                engine_depths=args.eval_depths,
+                games_per_depth=args.eval_games,
+                device=args.device,
+                verbose=True,
+            )
+            
+            current_elo = elo_tracker.get_rating("model_pretrained")
+            print(f"\nPre-trained model ELO: {current_elo:.1f}")
+            writer.add_scalar("Pretrain/ELO", current_elo, 0)
+            
+            # Print results summary
+            print("\n" + "=" * 60)
+            print("PRE-TRAINING COMPLETE!")
+            print("=" * 60)
+            print(f"\nPre-trained model: {pretrain_model_path}")
+            print(f"Training data: {data_file_path}")
+            print(f"Final loss: {pretrain_losses[-1]:.6f}")
+            print(f"ELO rating: {current_elo:.1f}")
+            print("\nTo continue with self-play training, run:")
+            print(f"  python train.py --resume {pretrain_model_path} --iterations N")
+        
+        writer.close()
+        return  # Exit after pre-training
 
     # Training loop
     for iteration in range(start_iteration, args.iterations):

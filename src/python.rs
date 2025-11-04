@@ -369,9 +369,8 @@ impl Board {
 
         let eval = BasicEvaluator::new(aggression.unwrap_or(3));
         let opts = minimax::IterativeOptions::new()
-            .with_table_byte_size(100 << 20)
-            .with_countermoves()
-            .with_countermove_history();
+            .verbose()
+            .with_table_byte_size(100 << 20);
         
         let mut strategy = minimax::IterativeSearch::new(eval, opts);
         
@@ -383,6 +382,23 @@ impl Board {
 
         let best_move = strategy.choose_move(&self.inner);
         Ok(best_move.map(|m| Turn { inner: m }))
+    }
+
+    /// Get the analytical evaluation of the current position
+    /// 
+    /// Args:
+    ///     aggression: Aggression level 1-5 for the evaluator (default: 3)
+    /// 
+    /// Returns:
+    ///     i16: Evaluation score from the perspective of the player to move.
+    ///          Positive values favor the current player, negative favor opponent.
+    fn get_evaluation(&self, aggression: Option<u8>) -> PyResult<i16> {
+        use minimax::Evaluator;
+        use crate::BasicEvaluator;
+
+        let eval = BasicEvaluator::new(aggression.unwrap_or(3));
+        let score = eval.evaluate(&self.inner);
+        Ok(score)
     }
 
     fn __repr__(&self) -> String {
