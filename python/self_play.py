@@ -153,7 +153,7 @@ class SelfPlayGame:
 
         return move_values
 
-    def play_game(self, max_moves=200):
+    def play_game(self, max_moves=400):
         """
         Play a single self-play game.
         
