@@ -161,6 +161,7 @@ class SelfPlayGame:
     def _batch_evaluate_moves(self, board, legal_moves):
         """
         Evaluate all legal moves in a single batch using DataLoader.
+        Deduplicates positions with identical zobrist hashes to avoid redundant evaluations.
 
         Args:
             board: Current board state
@@ -169,39 +170,64 @@ class SelfPlayGame:
         Returns:
             List of values for each move (from current player's perspective)
         """
-        # Prepare all board states after each move
-        data_list = []
+        # Group moves by resulting zobrist hash to deduplicate equivalent positions
+        hash_to_moves = {}  # zobrist_hash -> list of (move_idx, move)
+        hash_to_data = {}   # zobrist_hash -> (node_features, edge_index) or None
         
-        for move in legal_moves:
+        for move_idx, move in enumerate(legal_moves):
             # Create a copy and apply the move
             board_copy = board.clone()
             board_copy.apply(move)
 
-            # Convert to graph
-            node_features, edge_index = board_copy.to_graph()
+            # Get zobrist hash for deduplication
+            zobrist = board_copy.zobrist_hash()
+            
+            # Track this move
+            if zobrist not in hash_to_moves:
+                hash_to_moves[zobrist] = []
+                
+                # Convert to graph (only once per unique position)
+                node_features, edge_index = board_copy.to_graph()
 
-            # Skip if empty board
-            if len(node_features) == 0:
-                data_list.append(None)
-            else:
+                # Store graph data
+                if len(node_features) == 0:
+                    hash_to_data[zobrist] = None
+                else:
+                    hash_to_data[zobrist] = (node_features, edge_index)
+            
+            hash_to_moves[zobrist].append((move_idx, move))
+
+            # Undo the move
+            board_copy.undo(move)
+
+        # Prepare batch for unique positions only
+        unique_hashes = []
+        data_list = []
+        
+        for zobrist_hash, graph_data in hash_to_data.items():
+            unique_hashes.append(zobrist_hash)
+            
+            if graph_data is not None:
+                node_features, edge_index = graph_data
                 # Convert to PyG Data object
                 x = torch.tensor(node_features, dtype=torch.float32)
                 edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
                 
                 data = Data(x=x, edge_index=edge_index_tensor)
                 data_list.append(data)
+            else:
+                data_list.append(None)
 
-            # Undo the move
-            board_copy.undo(move)
-
-        # Batch evaluate all valid positions
-        move_values = []
-        valid_data = [d for d in data_list if d is not None]
-        
-        if len(valid_data) == 0:
+        # Batch evaluate all unique valid positions
+        if len([d for d in data_list if d is not None]) == 0:
             # All moves lead to empty boards (shouldn't happen in practice)
             return [0.0] * len(legal_moves)
 
+        # Evaluate unique positions
+        hash_to_value = {}
+        valid_data = [d for d in data_list if d is not None]
+        valid_hashes = [h for h, d in zip(unique_hashes, data_list) if d is not None]
+        
         # Create batch from all data
         batch = Batch.from_data_list(valid_data).to(self.device)
         
@@ -216,15 +242,22 @@ class SelfPlayGame:
         else:
             values = values.tolist()
 
-        # Map values back to all moves (including None positions)
-        value_idx = 0
-        for data in data_list:
-            if data is None:
-                move_values.append(0.0)
-            else:
-                # Negate value (we want opponent's perspective after our move)
-                move_values.append(-values[value_idx])
-                value_idx += 1
+        # Map values to zobrist hashes
+        for zobrist_hash, value in zip(valid_hashes, values):
+            # Negate value (we want opponent's perspective after our move)
+            hash_to_value[zobrist_hash] = -value
+        
+        # Handle None positions
+        for zobrist_hash, graph_data in hash_to_data.items():
+            if graph_data is None:
+                hash_to_value[zobrist_hash] = 0.0
+
+        # Map values back to all moves (including duplicates)
+        move_values = [0.0] * len(legal_moves)
+        for zobrist_hash, move_list in hash_to_moves.items():
+            value = hash_to_value[zobrist_hash]
+            for move_idx, _ in move_list:
+                move_values[move_idx] = value
 
         return move_values
 
