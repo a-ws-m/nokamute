@@ -188,7 +188,7 @@ def prepare_training_data(games):
 
             # Flip result based on player perspective
             # White = positive, Black = negative
-            if player.name() == "White":
+            if player.name == "White":
                 target_value = final_result
             else:
                 target_value = -final_result

@@ -348,6 +348,43 @@ impl Board {
         Rules::zobrist_hash(&self.inner)
     }
 
+    /// Get the best move according to the minimax engine
+    /// 
+    /// Args:
+    ///     depth: Search depth for minimax (default: 3)
+    ///     time_limit_ms: Time limit in milliseconds (optional, overrides depth)
+    ///     aggression: Aggression level 1-5 for the evaluator (default: 3)
+    /// 
+    /// Returns:
+    ///     Turn: Best move according to the engine, or None if game is over
+    fn get_engine_move(&self, depth: Option<u8>, time_limit_ms: Option<u64>, aggression: Option<u8>) -> PyResult<Option<Turn>> {
+        use minimax::{Game, Strategy};
+        use crate::BasicEvaluator;
+        use std::time::Duration;
+
+        // Check if game is over
+        if Rules::get_winner(&self.inner).is_some() {
+            return Ok(None);
+        }
+
+        let eval = BasicEvaluator::new(aggression.unwrap_or(3));
+        let opts = minimax::IterativeOptions::new()
+            .with_table_byte_size(100 << 20)
+            .with_countermoves()
+            .with_countermove_history();
+        
+        let mut strategy = minimax::IterativeSearch::new(eval, opts);
+        
+        if let Some(time_ms) = time_limit_ms {
+            strategy.set_timeout(Duration::from_millis(time_ms));
+        } else {
+            strategy.set_max_depth(depth.unwrap_or(3));
+        }
+
+        let best_move = strategy.choose_move(&self.inner);
+        Ok(best_move.map(|m| Turn { inner: m }))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Board(turn={}, to_move={})",

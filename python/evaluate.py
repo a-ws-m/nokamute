@@ -34,7 +34,7 @@ def play_interactive_game(model, device="cpu", human_first=True):
     print(f"AI is playing as {ai_color}\n")
 
     while True:
-        current_player = board.to_move().name()
+        current_player = board.to_move().name
         legal_moves = board.legal_moves()
 
         # Check for game over
@@ -130,8 +130,8 @@ def evaluate_vs_random(model, num_games=100, device="cpu"):
                 break
 
             # Select move based on current player
-            current_is_ai = (board.to_move().name() == "White" and ai_is_white) or (
-                board.to_move().name() == "Black" and not ai_is_white
+            current_is_ai = (board.to_move().name == "White" and ai_is_white) or (
+                board.to_move().name == "Black" and not ai_is_white
             )
 
             if current_is_ai:

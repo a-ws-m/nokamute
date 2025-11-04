@@ -13,6 +13,8 @@ from model import create_model
 from self_play import SelfPlayGame, prepare_training_data
 from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.data import Batch, Data
+from elo_tracker import EloTracker
+from evaluate_vs_engine import evaluate_and_update_elo
 
 
 def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu"):
@@ -141,6 +143,31 @@ def main():
     parser.add_argument(
         "--resume", type=str, default=None, help="Resume from checkpoint"
     )
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        default=5,
+        help="Evaluate against engine every N iterations",
+    )
+    parser.add_argument(
+        "--eval-games",
+        type=int,
+        default=20,
+        help="Number of games per evaluation",
+    )
+    parser.add_argument(
+        "--eval-depths",
+        type=int,
+        nargs="+",
+        default=[3],
+        help="Engine depths to evaluate against",
+    )
+    parser.add_argument(
+        "--elo-k-factor",
+        type=int,
+        default=32,
+        help="K-factor for ELO rating system",
+    )
 
     args = parser.parse_args()
 
@@ -149,6 +176,11 @@ def main():
 
     # Setup tensorboard
     writer = SummaryWriter(log_dir=os.path.join(args.model_path, "logs"))
+
+    # Initialize ELO tracker
+    elo_path = os.path.join(args.model_path, "elo_history.json")
+    elo_tracker = EloTracker(save_path=elo_path, k_factor=args.elo_k_factor)
+    print(f"ELO tracker initialized at {elo_path}")
 
     # Create model
     print("Creating model...")
@@ -214,16 +246,62 @@ def main():
             global_step = iteration * args.epochs + epoch
             writer.add_scalar("Loss/train", loss, global_step)
 
-        # Evaluate model
-        print("\nEvaluating model...")
+        # Evaluate model (self-play)
+        print("\nEvaluating model (self-play)...")
         eval_stats = evaluate_model(model, num_games=20, device=args.device)
-        print(f"Evaluation results: {eval_stats}")
+        print(f"Self-play evaluation results: {eval_stats}")
 
         writer.add_scalar(
             "Eval/avg_game_length", eval_stats["avg_game_length"], iteration
         )
         writer.add_scalar("Eval/wins", eval_stats["wins"], iteration)
         writer.add_scalar("Eval/draws", eval_stats["draws"], iteration)
+
+        # Periodic evaluation against engine
+        model_name = f"model_iter_{iteration}"
+        if (iteration + 1) % args.eval_interval == 0 or iteration == 0:
+            print("\n" + "=" * 60)
+            print("EVALUATING AGAINST ENGINE")
+            print("=" * 60)
+            
+            engine_eval_results = evaluate_and_update_elo(
+                model=model,
+                model_name=model_name,
+                elo_tracker=elo_tracker,
+                engine_depths=args.eval_depths,
+                games_per_depth=args.eval_games,
+                device=args.device,
+                verbose=True,
+            )
+            
+            # Log engine evaluation results
+            for depth_key, results in engine_eval_results.items():
+                depth = int(depth_key.split("_")[1])
+                writer.add_scalar(
+                    f"EngineEval/depth_{depth}_win_rate",
+                    results.get("win_rate", 0),
+                    iteration,
+                )
+                writer.add_scalar(
+                    f"EngineEval/depth_{depth}_avg_moves",
+                    results.get("avg_moves", 0),
+                    iteration,
+                )
+            
+            # Log current ELO rating
+            current_elo = elo_tracker.get_rating(model_name)
+            writer.add_scalar("ELO/model_rating", current_elo, iteration)
+            
+            print(f"\nCurrent ELO: {current_elo:.1f}")
+            
+            # Print leaderboard
+            print("\nTop 10 Leaderboard:")
+            for rank, (player, rating) in enumerate(elo_tracker.get_leaderboard(10), 1):
+                print(f"  {rank}. {player}: {rating:.1f}")
+            
+            # Update eval_stats with engine results
+            eval_stats["engine_eval"] = engine_eval_results
+            eval_stats["elo_rating"] = current_elo
 
         # Save checkpoint
         checkpoint_path = os.path.join(args.model_path, f"model_iter_{iteration}.pt")
@@ -253,7 +331,24 @@ def main():
         )
 
     writer.close()
-    print("\nTraining complete!")
+    
+    # Final summary
+    print("\n" + "=" * 60)
+    print("TRAINING COMPLETE!")
+    print("=" * 60)
+    
+    best_model = elo_tracker.get_best_model(prefix="model_iter_")
+    if best_model:
+        print(f"\nBest model: {best_model}")
+        print(f"Best ELO: {elo_tracker.get_rating(best_model):.1f}")
+        elo_tracker.print_stats(best_model)
+    
+    print("\nFinal Leaderboard:")
+    for rank, (player, rating) in enumerate(elo_tracker.get_leaderboard(15), 1):
+        print(f"  {rank}. {player}: {rating:.1f}")
+    
+    print(f"\nELO history saved to: {elo_path}")
+    print(f"Model checkpoints saved to: {args.model_path}")
 
 
 if __name__ == "__main__":

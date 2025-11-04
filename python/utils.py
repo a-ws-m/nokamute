@@ -71,7 +71,7 @@ def print_board_state(board):
     """
     pieces = board.get_pieces()
 
-    print(f"\nTurn {board.turn_num()}: {board.to_move().name()} to move")
+    print(f"\nTurn {board.turn_num()}: {board.to_move().name} to move")
     print(f"Pieces on board: {len(pieces)}")
 
     if len(pieces) > 0:
