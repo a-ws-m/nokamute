@@ -291,12 +291,12 @@ def main():
     parser = argparse.ArgumentParser(description="Train Hive GNN with self-play")
     parser.add_argument("--games", type=int, default=100, help="Games per iteration")
     parser.add_argument(
-        "--iterations", type=int, default=10, help="Training iterations"
+        "--iterations", type=int, default=1000, help="Training iterations"
     )
     parser.add_argument("--epochs", type=int, default=10, help="Epochs per iteration")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--hidden-dim", type=int, default=128, help="Hidden dimension")
+    parser.add_argument("--hidden-dim", type=int, default=64, help="Hidden dimension")
     parser.add_argument(
         "--num-layers", type=int, default=3, help="Number of GNN layers"
     )
@@ -318,7 +318,7 @@ def main():
     parser.add_argument(
         "--eval-interval",
         type=int,
-        default=5,
+        default=100,
         help="Evaluate against engine every N iterations",
     )
     parser.add_argument(
@@ -380,14 +380,14 @@ def main():
     parser.add_argument(
         "--pretrain-games",
         type=int,
-        default=10000,
-        help="Number of games to generate for pre-training (default: 10000)",
+        default=5,
+        help="Number of games to generate for pre-training (default: 10)",
     )
     parser.add_argument(
         "--pretrain-depth",
         type=int,
-        default=7,
-        help="Engine search depth for pre-training data generation (default: 7)",
+        default=3,
+        help="Engine search depth for pre-training data generation (default: 3)",
     )
     parser.add_argument(
         "--pretrain-epochs",
@@ -398,8 +398,8 @@ def main():
     parser.add_argument(
         "--pretrain-randomness",
         type=float,
-        default=0.0,
-        help="Randomness rate for pre-training data generation (default: 0.0)",
+        default=0.1,
+        help="Randomness rate for pre-training data generation (default: 0.1)",
     )
     parser.add_argument(
         "--pretrain-data-path",
