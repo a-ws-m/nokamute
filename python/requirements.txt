@@ -3,3 +3,6 @@ torch-geometric>=2.3.0
 numpy>=1.20.0
 tensorboard>=2.13.0
 maturin>=1.0.0
+torchrl>=0.3.0
+tensordict>=0.3.0
+tqdm>=4.65.0
