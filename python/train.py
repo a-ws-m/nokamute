@@ -286,6 +286,17 @@ def main():
         action="store_true",
         help="Use temporal difference learning instead of Monte Carlo returns",
     )
+    parser.add_argument(
+        "--enable-branching",
+        action="store_true",
+        help="Enable branching MCMC for parallel game generation",
+    )
+    parser.add_argument(
+        "--branch-ratio",
+        type=float,
+        default=0.5,
+        help="Fraction of games to generate from branch points (default: 0.5)",
+    )
 
     args = parser.parse_args()
 
@@ -330,17 +341,34 @@ def main():
 
         # Generate self-play games
         print(f"\nGenerating {args.games} self-play games...")
+        if args.enable_branching:
+            print(f"Using branching MCMC with branch ratio: {args.branch_ratio}")
         start_time = time.time()
 
         player = SelfPlayGame(
             model=model if iteration > 0 else None,
             temperature=args.temperature,
             device=args.device,
+            enable_branching=args.enable_branching,
         )
-        games = player.generate_games(args.games)
+        
+        if args.enable_branching:
+            games = player.generate_games_with_branching(
+                num_games=args.games,
+                branch_ratio=args.branch_ratio
+            )
+        else:
+            games = player.generate_games(args.games)
 
         gen_time = time.time() - start_time
         print(f"Generated {len(games)} games in {gen_time:.2f}s")
+        
+        # Clear branch cache for next iteration (fresh start)
+        if args.enable_branching:
+            num_branches = len(player.branch_points)
+            num_nodes = len(player.game_tree)
+            print(f"Collected {num_branches} branch points from {num_nodes} unique positions")
+            player.clear_branch_cache()
 
         # Prepare training data
         print("Preparing training data...")
