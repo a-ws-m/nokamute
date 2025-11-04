@@ -7,6 +7,7 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from model import create_model
@@ -85,7 +86,7 @@ def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu", ga
     return total_loss / max(num_batches, 1)
 
 
-def prepare_td_training_data(games, model, device="cpu", gamma=0.99):
+def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=32):
     """
     Prepare training data using temporal difference learning.
     
@@ -97,32 +98,108 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99):
     
     For terminal states: V(s_terminal) = final_result
     
+    This implementation uses batch evaluation with deduplication for efficiency:
+    1. Collect all unique positions (by zobrist hash)
+    2. Batch evaluate all unique positions in batches
+    3. Compute TD targets using cached evaluations
+    
     Args:
         games: List of (game_data, result) tuples from self-play
         model: Current model to estimate future values
         device: Device to run model on
         gamma: Discount factor for future rewards
+        batch_size: Batch size for evaluating positions
         
     Returns:
         training_examples: List of (node_features, edge_index, td_target)
     """
-    training_examples = []
     model.eval()
     
-    for game_data, final_result in games:
-        if len(game_data) == 0:
-            continue
+    # Phase 1: Collect all unique positions and build index
+    # Map zobrist hash -> (node_features, edge_index, player_name)
+    hash_to_position = {}
+    # Track all position references: (game_idx, position_idx) -> zobrist_hash
+    position_refs = {}
+    
+    for game_idx, (game_data, final_result) in enumerate(games):
+        for position_idx, item in enumerate(game_data):
+            # Handle both old format (4 items) and new format (5 items with zobrist)
+            board_graph, legal_moves, selected_move, player, zobrist_hash = item
             
-        # Process positions in reverse (from end to start)
-        # This allows us to compute TD targets efficiently
-        next_value = None
-        
-        for position_idx in reversed(range(len(game_data))):
-            board_graph, legal_moves, selected_move, player = game_data[position_idx]
             node_features, edge_index = board_graph
             
             # Skip empty boards
             if len(node_features) == 0:
+                continue
+            
+            # Store position data if not seen before
+            if zobrist_hash not in hash_to_position:
+                hash_to_position[zobrist_hash] = (node_features, edge_index, player.name)
+            
+            # Track this position reference
+            position_refs[(game_idx, position_idx)] = zobrist_hash
+    
+    # Phase 2: Batch evaluate all unique positions
+    print(f"  Evaluating {len(hash_to_position)} unique positions (from {len(position_refs)} total)...")
+    
+    # Prepare all data
+    hash_list = []
+    data_list = []
+    
+    for zobrist_hash, (node_features, edge_index, _) in hash_to_position.items():
+        hash_list.append(zobrist_hash)
+        
+        x = torch.tensor(node_features, dtype=torch.float32)
+        edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
+        data = Data(x=x, edge_index=edge_index_tensor)
+        data_list.append(data)
+    
+    # Evaluate positions in batches
+    hash_to_value = {}
+    
+    if len(data_list) > 0:
+        all_values = []
+        
+        # Process in batches
+        for i in range(0, len(data_list), batch_size):
+            batch_data = data_list[i:i + batch_size]
+            batch = Batch.from_data_list(batch_data).to(device)
+            
+            with torch.no_grad():
+                predictions, _ = model(batch.x, batch.edge_index, batch.batch)
+                values = predictions.squeeze().cpu().numpy()
+            
+            # Handle single value case
+            if len(batch_data) == 1:
+                all_values.append(values.item())
+            else:
+                all_values.extend(values.tolist())
+        
+        # Map values to hashes
+        for zobrist_hash, value in zip(hash_list, all_values):
+            hash_to_value[zobrist_hash] = value
+    
+    # Phase 3: Compute TD targets for each position
+    training_examples = []
+    
+    for game_idx, (game_data, final_result) in enumerate(games):
+        if len(game_data) == 0:
+            continue
+        
+        # Process each position in the game
+        for position_idx, item in enumerate(game_data):
+            # Handle both old format (4 items) and new format (5 items with zobrist)
+            board_graph, legal_moves, selected_move, player, zobrist_hash = item
+            
+            node_features, edge_index = board_graph
+            
+            # Skip empty boards
+            if len(node_features) == 0:
+                continue
+            
+            # Get position hash
+            zobrist_hash = position_refs.get((game_idx, position_idx))
+            if zobrist_hash is None:
                 continue
             
             # Determine if this is the last position
@@ -135,57 +212,31 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99):
                 else:
                     td_target = -final_result
             else:
-                # Non-terminal state: use TD target
-                # If we haven't computed next value yet, get it from model
-                if next_value is None:
-                    # Get next position
-                    next_board_graph, _, _, next_player = game_data[position_idx + 1]
-                    next_node_features, next_edge_index = next_board_graph
-                    
-                    if len(next_node_features) > 0:
-                        # Evaluate next position with model
-                        with torch.no_grad():
-                            x = torch.tensor(next_node_features, dtype=torch.float32).to(device)
-                            edge_index_tensor = torch.tensor(next_edge_index, dtype=torch.long).to(device)
-                            
-                            # Create temporary batch with single item
-                            data = Data(x=x, edge_index=edge_index_tensor)
-                            batch = Batch.from_data_list([data]).to(device)
-                            
-                            prediction, _ = model(batch.x, batch.edge_index, batch.batch)
-                            next_value_raw = prediction.item()
-                            
-                            # Flip sign if different player
-                            if player.name == next_player.name:
-                                # Same player (shouldn't happen in normal gameplay)
-                                next_value = next_value_raw
-                            else:
-                                # Different player - negate value
-                                next_value = -next_value_raw
-                    else:
-                        next_value = 0.0
+                # Non-terminal state: compute TD target
+                # Get next position info
+                next_ref = (game_idx, position_idx + 1)
+                next_hash = position_refs.get(next_ref)
                 
-                # TD target: immediate reward (0) + discounted next value
-                # We use gamma * next_value because opponent's good position is bad for us
+                if next_hash is not None and next_hash in hash_to_value:
+                    next_item = game_data[position_idx + 1]
+                    # Extract player from next position
+                    _, _, _, next_player, _ = next_item
+                    
+                    next_value_raw = hash_to_value[next_hash]
+                    
+                    # Flip sign if different player (opponent's perspective)
+                    if player.name != next_player.name:
+                        next_value = -next_value_raw
+                    else:
+                        next_value = next_value_raw
+                else:
+                    next_value = 0.0
+                
+                # TD target: gamma * V(s_{t+1})
                 td_target = gamma * next_value
             
             # Store training example
             training_examples.append((node_features, edge_index, td_target))
-            
-            # Current position becomes "next position" for previous iteration
-            # Evaluate current position to use as next_value in next iteration
-            if position_idx > 0:
-                with torch.no_grad():
-                    x = torch.tensor(node_features, dtype=torch.float32).to(device)
-                    edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).to(device)
-                    
-                    data = Data(x=x, edge_index=edge_index_tensor)
-                    batch = Batch.from_data_list([data]).to(device)
-                    
-                    prediction, _ = model(batch.x, batch.edge_index, batch.batch)
-                    next_value = prediction.item()
-            else:
-                next_value = None
     
     return training_examples
 
@@ -375,7 +426,7 @@ def main():
         if args.use_td:
             print(f"Using TD learning with gamma={args.gamma}")
             training_data = prepare_td_training_data(
-                games, model, device=args.device, gamma=args.gamma
+                games, model, device=args.device, gamma=args.gamma, batch_size=args.batch_size
             )
         else:
             print("Using Monte Carlo returns")

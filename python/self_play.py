@@ -301,6 +301,7 @@ class SelfPlayGame:
             # Store board state before move
             current_player = board.to_move()
             board_graph = board.to_graph()
+            zobrist_hash = board.zobrist_hash()
 
             # Select move and get probabilities
             if self.enable_branching:
@@ -327,11 +328,11 @@ class SelfPlayGame:
                     # Only keep branch points from early/mid game
                     self.branch_points.append((board.clone(), node, current_depth))
                 
-                game_data.append((board_graph, legal_moves, selected_move, current_player))
+                game_data.append((board_graph, legal_moves, selected_move, current_player, zobrist_hash))
             else:
                 # Standard play without branching
                 selected_move = self.select_move(board, legal_moves)
-                game_data.append((board_graph, legal_moves, selected_move, current_player))
+                game_data.append((board_graph, legal_moves, selected_move, current_player, zobrist_hash))
 
             board.apply(selected_move)
 
@@ -486,12 +487,13 @@ def prepare_training_data(games):
 
     for game_data, final_result in games:
         # Assign values to each position based on final result
-        for position_idx, (
-            board_graph,
-            legal_moves,
-            selected_move,
-            player,
-        ) in enumerate(game_data):
+        for item in game_data:
+            # Handle both old format (4 items) and new format (5 items with zobrist)
+            if len(item) == 5:
+                board_graph, legal_moves, selected_move, player, zobrist_hash = item
+            else:
+                board_graph, legal_moves, selected_move, player = item
+            
             node_features, edge_index = board_graph
 
             # Skip empty boards
@@ -521,7 +523,14 @@ if __name__ == "__main__":
     print(f"Number of positions: {len(game_data)}")
 
     if len(game_data) > 0:
-        board_graph, legal_moves, selected_move, player_color = game_data[0]
+        # Handle both old (4-item) and new (5-item with zobrist) formats
+        first_item = game_data[0]
+        if len(first_item) == 5:
+            board_graph, legal_moves, selected_move, player_color, zobrist_hash = first_item
+            print(f"Zobrist hash: {zobrist_hash}")
+        else:
+            board_graph, legal_moves, selected_move, player_color = first_item
+        
         node_features, edge_index = board_graph
         print(f"First position: {len(node_features)} nodes, {len(edge_index[0])} edges")
 
