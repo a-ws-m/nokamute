@@ -271,6 +271,10 @@ def pretrain_eval_matching(
             targets = []
             
             for node_features, edge_index, eval_score in batch_data:
+                # Skip empty graphs
+                if len(node_features) == 0:
+                    continue
+                    
                 # Convert to tensors
                 x = torch.tensor(node_features, dtype=torch.float32)
                 edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
@@ -291,6 +295,10 @@ def pretrain_eval_matching(
             # Forward pass
             optimizer.zero_grad()
             predictions, _ = model(batch.x, batch.edge_index, batch.batch)
+            
+            # Ensure predictions and targets have the same shape
+            # This handles cases where the batch might be smaller than batch_size
+            assert predictions.shape == targets.shape, f"Shape mismatch: predictions {predictions.shape} vs targets {targets.shape}"
             
             # Compute MSE loss
             loss = F.mse_loss(predictions, targets)
