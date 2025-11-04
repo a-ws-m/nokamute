@@ -7,6 +7,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
+from torch_geometric.data import Data, Batch
+from torch_geometric.loader import DataLoader
 
 import nokamute
 
@@ -34,6 +36,7 @@ class SelfPlayGame:
         """
         Select a move based on model evaluation or random selection.
         Checks for immediate winning moves first.
+        Uses batch evaluation for all legal moves when model is available.
 
         Args:
             board: Current board state
@@ -63,34 +66,8 @@ class SelfPlayGame:
             # Random selection
             return random.choice(legal_moves)
 
-        # Evaluate each move
-        move_values = []
-        for move in legal_moves:
-            # Create a copy and apply the move
-            board_copy = board.clone()
-            board_copy.apply(move)
-
-            # Convert to graph and evaluate
-            node_features, edge_index = board_copy.to_graph()
-
-            # Convert to tensors
-            if len(node_features) == 0:
-                # Empty board
-                value = 0.0
-            else:
-                x = torch.tensor(node_features, dtype=torch.float32).to(self.device)
-                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).to(
-                    self.device
-                )
-
-                with torch.no_grad():
-                    value = self.model.predict_value(x, edge_index_tensor).item()
-
-            # Negate value (we want opponent's perspective after our move)
-            move_values.append(-value)
-
-            # Undo the move
-            board_copy.undo(move)
+        # Batch evaluate all moves
+        move_values = self._batch_evaluate_moves(board, legal_moves)
 
         # Apply temperature and select
         if self.temperature == 0:
@@ -105,6 +82,76 @@ class SelfPlayGame:
 
             selected_idx = np.random.choice(len(legal_moves), p=probs)
             return legal_moves[selected_idx]
+
+    def _batch_evaluate_moves(self, board, legal_moves):
+        """
+        Evaluate all legal moves in a single batch using DataLoader.
+
+        Args:
+            board: Current board state
+            legal_moves: List of legal moves
+
+        Returns:
+            List of values for each move (from current player's perspective)
+        """
+        # Prepare all board states after each move
+        data_list = []
+        
+        for move in legal_moves:
+            # Create a copy and apply the move
+            board_copy = board.clone()
+            board_copy.apply(move)
+
+            # Convert to graph
+            node_features, edge_index = board_copy.to_graph()
+
+            # Skip if empty board
+            if len(node_features) == 0:
+                data_list.append(None)
+            else:
+                # Convert to PyG Data object
+                x = torch.tensor(node_features, dtype=torch.float32)
+                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
+                
+                data = Data(x=x, edge_index=edge_index_tensor)
+                data_list.append(data)
+
+            # Undo the move
+            board_copy.undo(move)
+
+        # Batch evaluate all valid positions
+        move_values = []
+        valid_data = [d for d in data_list if d is not None]
+        
+        if len(valid_data) == 0:
+            # All moves lead to empty boards (shouldn't happen in practice)
+            return [0.0] * len(legal_moves)
+
+        # Create batch from all data
+        batch = Batch.from_data_list(valid_data).to(self.device)
+        
+        # Evaluate all positions in a single forward pass
+        with torch.no_grad():
+            predictions, _ = self.model(batch.x, batch.edge_index, batch.batch)
+            values = predictions.squeeze().cpu().numpy()
+        
+        # Handle single value case (only one valid move)
+        if len(valid_data) == 1:
+            values = [values.item()]
+        else:
+            values = values.tolist()
+
+        # Map values back to all moves (including None positions)
+        value_idx = 0
+        for data in data_list:
+            if data is None:
+                move_values.append(0.0)
+            else:
+                # Negate value (we want opponent's perspective after our move)
+                move_values.append(-values[value_idx])
+                value_idx += 1
+
+        return move_values
 
     def play_game(self, max_moves=200):
         """
