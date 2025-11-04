@@ -156,6 +156,11 @@ class SelfPlayGame:
     def play_game(self, max_moves=200):
         """
         Play a single self-play game.
+        
+        Draw conditions in Hive:
+        1. Threefold repetition (same position occurs 3 times)
+        2. Both Queen bees are surrounded simultaneously
+        3. Max moves reached (to prevent infinite games)
 
         Args:
             max_moves: Maximum number of moves before declaring draw
@@ -182,10 +187,6 @@ class SelfPlayGame:
                     result = -1.0  # Negative for black win
 
                 return game_data, result
-
-            # Check for pass (no legal moves except pass)
-            if len(legal_moves) == 1 and legal_moves[0].is_pass():
-                return game_data, 0.0  # Draw
 
             # Store board state before move
             current_player = board.to_move()

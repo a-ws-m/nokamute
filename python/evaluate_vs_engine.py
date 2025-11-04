@@ -65,7 +65,7 @@ class MLPlayer:
 
     def select_move(self, board: nokamute.Board) -> Optional[nokamute.Turn]:
         """
-        Select a move using the model.
+        Select a move using the model with batch evaluation.
         
         Args:
             board: Current board state
@@ -74,6 +74,7 @@ class MLPlayer:
             Selected move or None if no legal moves
         """
         import numpy as np
+        from torch_geometric.data import Data, Batch
 
         legal_moves = board.legal_moves()
         
@@ -83,28 +84,22 @@ class MLPlayer:
         if len(legal_moves) == 1:
             return legal_moves[0]
 
-        # Evaluate each move
-        move_values = []
+        # Check for immediate winning moves
+        current_player = board.to_move().name
         for move in legal_moves:
             board_copy = board.clone()
             board_copy.apply(move)
+            winner = board_copy.get_winner()
             
-            # Convert to graph
-            node_features, edge_index = board_copy.to_graph()
+            if winner == current_player:
+                # This move wins immediately - play it!
+                del board_copy
+                return move
             
-            if len(node_features) == 0:
-                value = 0.0
-            else:
-                x = torch.tensor(node_features, dtype=torch.float32).to(self.device)
-                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).to(self.device)
-                
-                with torch.no_grad():
-                    value = self.model.predict_value(x, edge_index_tensor).item()
-            
-            # Negate for opponent's perspective
-            move_values.append(-value)
-            
-            board_copy.undo(move)
+            del board_copy
+
+        # Batch evaluate all moves using DataLoader
+        move_values = self._batch_evaluate_moves(board, legal_moves)
 
         # Select move based on temperature
         if self.temperature == 0:
@@ -117,6 +112,78 @@ class MLPlayer:
             selected_idx = np.random.choice(len(legal_moves), p=probs)
             return legal_moves[selected_idx]
 
+    def _batch_evaluate_moves(self, board: nokamute.Board, legal_moves) -> list:
+        """
+        Evaluate all legal moves in a single batch.
+
+        Args:
+            board: Current board state
+            legal_moves: List of legal moves
+
+        Returns:
+            List of values for each move (from current player's perspective)
+        """
+        from torch_geometric.data import Data, Batch
+        
+        # Prepare all board states after each move
+        data_list = []
+        
+        for move in legal_moves:
+            # Create a copy and apply the move
+            board_copy = board.clone()
+            board_copy.apply(move)
+
+            # Convert to graph
+            node_features, edge_index = board_copy.to_graph()
+
+            # Skip if empty board
+            if len(node_features) == 0:
+                data_list.append(None)
+            else:
+                # Convert to PyG Data object
+                x = torch.tensor(node_features, dtype=torch.float32)
+                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
+                
+                data = Data(x=x, edge_index=edge_index_tensor)
+                data_list.append(data)
+
+            # Undo the move
+            board_copy.undo(move)
+
+        # Batch evaluate all valid positions
+        move_values = []
+        valid_data = [d for d in data_list if d is not None]
+        
+        if len(valid_data) == 0:
+            # All moves lead to empty boards (shouldn't happen in practice)
+            return [0.0] * len(legal_moves)
+
+        # Create batch from all data
+        batch = Batch.from_data_list(valid_data).to(self.device)
+        
+        # Evaluate all positions in a single forward pass
+        with torch.no_grad():
+            predictions, _ = self.model(batch.x, batch.edge_index, batch.batch)
+            values = predictions.squeeze().cpu().numpy()
+        
+        # Handle single value case (only one valid move)
+        if len(valid_data) == 1:
+            values = [values.item()]
+        else:
+            values = values.tolist()
+
+        # Map values back to all moves (including None positions)
+        value_idx = 0
+        for data in data_list:
+            if data is None:
+                move_values.append(0.0)
+            else:
+                # Negate value (we want opponent's perspective after our move)
+                move_values.append(-values[value_idx])
+                value_idx += 1
+
+        return move_values
+
 
 def play_game(
     player1,
@@ -126,6 +193,11 @@ def play_game(
 ) -> Tuple[Optional[str], int, Dict]:
     """
     Play a game between two players.
+    
+    Draw conditions in Hive:
+    1. Threefold repetition (same position occurs 3 times) - detected by board.get_winner()
+    2. Both Queen bees are surrounded simultaneously - detected by board.get_winner()
+    3. Max moves reached (to prevent infinite games)
     
     Args:
         player1: First player (plays Black)
@@ -171,15 +243,15 @@ def play_game(
         # Get move
         move = current_player.select_move(board)
         
-        if move is None or move.is_pass():
-            # No legal moves or pass - draw
+        if move is None:
+            # No legal moves - this shouldn't happen as get_winner() should catch it
             metadata = {
                 "num_moves": num_moves,
                 "duration": time.time() - start_time,
-                "outcome": "Draw (no moves)",
+                "outcome": "Draw (no legal moves)",
             }
             if verbose:
-                print(f"Game over: draw (no moves) after {num_moves} moves")
+                print(f"Game over: draw (no legal moves) after {num_moves} moves")
             return "draw", num_moves, metadata
         
         board.apply(move)
