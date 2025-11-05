@@ -61,7 +61,7 @@ class SelfPlayGame:
         
         # Branching MCMC state
         self.game_tree: Dict[str, GameNode] = {}  # board_state -> GameNode
-        self.branch_points: List[Tuple[nokamute.Board, GameNode, int]] = []  # (board, node, depth)
+        self.branch_points: List[Tuple[nokamute.Board, GameNode, int, str]] = []  # (board, node, depth, branch_id)
 
         if self.model is not None:
             self.model.eval()
@@ -264,7 +264,7 @@ class SelfPlayGame:
 
         return move_values
 
-    def play_game(self, max_moves=None, start_board=None, start_depth=0):
+    def play_game(self, max_moves=None, start_board=None, start_depth=0, branch_id=None):
         """
         Play a single self-play game.
         
@@ -277,10 +277,12 @@ class SelfPlayGame:
             max_moves: Maximum number of moves before declaring draw (uses self.max_moves if None)
             start_board: Optional starting board position (for branching)
             start_depth: Starting depth (for branching)
+            branch_id: Identifier for the branch point (for tracking which games share early positions)
 
         Returns:
             game_data: List of (board_state, legal_moves, selected_move)
             result: Game result (1.0 for player 1 win, -1.0 for player 2 win, 0.0 for draw)
+            branch_id: The branch identifier (for tracking related games)
         """
         if max_moves is None:
             max_moves = self.max_moves
@@ -302,7 +304,7 @@ class SelfPlayGame:
                 else:  # Black
                     result = -1.0  # Negative for black win
 
-                return game_data, result
+                return game_data, result, branch_id
 
             # Store board state before move
             current_player = board.to_move()
@@ -335,7 +337,9 @@ class SelfPlayGame:
                 num_viable_moves = sum(1 for p in move_probs.values() if p > branch_threshold)
                 if num_viable_moves > 1 and current_depth < max_moves // 2:
                     # Only keep branch points from early/mid game
-                    self.branch_points.append((board.clone(), node, current_depth))
+                    # Use branch_id if available, otherwise this shouldn't be a branch point
+                    if branch_id is not None:
+                        self.branch_points.append((board.clone(), node, current_depth, branch_id))
                 
                 game_data.append((nx_graph, legal_moves, selected_move, current_player, pos_hash))
             else:
@@ -346,7 +350,7 @@ class SelfPlayGame:
             board.apply(selected_move)
 
         # Max moves reached - draw
-        return game_data, 0.0
+        return game_data, 0.0, branch_id
 
     def generate_games(self, num_games=100):
         """
@@ -357,7 +361,7 @@ class SelfPlayGame:
             num_games: Number of games to generate
 
         Returns:
-            List of (game_data, result) tuples
+            List of (game_data, result, branch_id) tuples
         """
         if self.enable_branching:
             return self.generate_games_with_branching(num_games)
@@ -367,12 +371,13 @@ class SelfPlayGame:
     def _generate_games_sequential(self, num_games):
         """
         Generate games sequentially (standard approach).
+        Each game gets a unique branch_id since they don't share positions.
         """
         games = []
 
         for i in range(num_games):
-            game_data, result = self.play_game()
-            games.append((game_data, result))
+            game_data, result, _ = self.play_game(branch_id=f"seq_{i}")
+            games.append((game_data, result, f"seq_{i}"))
 
             if (i + 1) % 10 == 0:
                 print(f"Generated {i + 1}/{num_games} games...")
@@ -393,7 +398,7 @@ class SelfPlayGame:
             branch_ratio: Fraction of games to start from branch points vs. start
             
         Returns:
-            List of (game_data, result) tuples
+            List of (game_data, result, branch_id) tuples
         """
         games = []
         
@@ -404,8 +409,8 @@ class SelfPlayGame:
         # Phase 1: Generate initial games from scratch to build branch points
         print(f"Generating {num_from_start} games from start position...")
         for i in range(num_from_start):
-            game_data, result = self.play_game()
-            games.append((game_data, result))
+            game_data, result, _ = self.play_game(branch_id=f"root_{i}")
+            games.append((game_data, result, f"root_{i}"))
             
             if (i + 1) % 10 == 0:
                 print(f"  {i + 1}/{num_from_start} initial games, "
@@ -417,14 +422,15 @@ class SelfPlayGame:
             
             for i in range(num_from_branches):
                 # Select a branch point (weighted by move probabilities)
-                board, node, depth = self._select_branch_point()
+                board, node, depth, branch_id = self._select_branch_point()
                 
-                # Play from this position
-                game_data, result = self.play_game(
+                # Play from this position with the same branch_id
+                game_data, result, _ = self.play_game(
                     start_board=board,
-                    start_depth=depth
+                    start_depth=depth,
+                    branch_id=branch_id
                 )
-                games.append((game_data, result))
+                games.append((game_data, result, branch_id))
                 
                 if (i + 1) % 10 == 0:
                     print(f"  {i + 1}/{num_from_branches} branched games...")
@@ -437,17 +443,17 @@ class SelfPlayGame:
         Prefers less-visited positions and those with higher entropy.
         
         Returns:
-            (board, node, depth) tuple
+            (board, node, depth, branch_id) tuple
         """
         if not self.branch_points:
             # Fallback to empty board
-            return nokamute.Board(), GameNode(board_state="", move_probs={}), 0
+            return nokamute.Board(), GameNode(board_state="", move_probs={}), 0, "fallback"
         
         # Calculate selection weights based on:
         # 1. Move probability entropy (higher = more uncertain/interesting)
         # 2. Visit count (lower = less explored)
         weights = []
-        for board, node, depth in self.branch_points:
+        for board, node, depth, branch_id in self.branch_points:
             # Entropy of move probabilities
             probs = list(node.move_probs.values())
             if len(probs) > 1:
@@ -485,9 +491,12 @@ class SelfPlayGame:
 def prepare_training_data(games):
     """
     Convert self-play games to training data.
+    
+    Handles multiple results for the same position by averaging the target values.
+    This can occur when branching from the same position leads to different outcomes.
 
     Args:
-        games: List of (game_data, result) tuples from self-play
+        games: List of (game_data, result, branch_id) tuples from self-play
               Each game_data contains (nx_graph, legal_moves, selected_move, player, pos_hash)
 
     Returns:
@@ -495,9 +504,11 @@ def prepare_training_data(games):
     """
     from graph_utils import networkx_to_pyg
     
-    training_examples = []
-
-    for game_data, final_result in games:
+    # First pass: collect all (position_hash, target_value) pairs
+    position_targets = {}  # pos_hash -> list of target values
+    position_data = {}     # pos_hash -> (node_features, edge_index)
+    
+    for game_data, final_result, branch_id in games:
         # Assign values to each position based on final result
         for item in game_data:
             # Handle both old format and new format with NetworkX graphs
@@ -507,12 +518,15 @@ def prepare_training_data(games):
                 # Old format - shouldn't happen but handle gracefully
                 continue
             
-            # Convert NetworkX graph back to PyG format
-            node_features, edge_index = networkx_to_pyg(nx_graph)
-
-            # Skip empty boards
-            if len(node_features) == 0:
-                continue
+            # Convert NetworkX graph back to PyG format (once per unique position)
+            if pos_hash not in position_data:
+                node_features, edge_index = networkx_to_pyg(nx_graph)
+                
+                # Skip empty boards
+                if len(node_features) == 0:
+                    continue
+                
+                position_data[pos_hash] = (node_features, edge_index)
 
             # Flip result based on player perspective
             # White = positive, Black = negative
@@ -521,8 +535,18 @@ def prepare_training_data(games):
             else:
                 target_value = -final_result
 
-            training_examples.append((node_features, edge_index, target_value))
-
+            # Collect target for this position
+            if pos_hash not in position_targets:
+                position_targets[pos_hash] = []
+            position_targets[pos_hash].append(target_value)
+    
+    # Second pass: average targets for positions with multiple outcomes
+    training_examples = []
+    for pos_hash, (node_features, edge_index) in position_data.items():
+        targets = position_targets[pos_hash]
+        avg_target = sum(targets) / len(targets)
+        training_examples.append((node_features, edge_index, avg_target))
+    
     return training_examples
 
 
@@ -531,9 +555,10 @@ if __name__ == "__main__":
     print("Testing self-play game generation...")
 
     player = SelfPlayGame()
-    game_data, result = player.play_game()
+    game_data, result, branch_id = player.play_game()
 
     print(f"Game finished with result: {result}")
+    print(f"Branch ID: {branch_id}")
     print(f"Number of positions: {len(game_data)}")
 
     if len(game_data) > 0:

@@ -45,7 +45,7 @@ def demo_comparison():
     print(f"Average: {time_traditional/num_games:.3f}s per game")
     
     # Calculate statistics
-    total_positions = sum(len(game_data) for game_data, _ in games_traditional)
+    total_positions = sum(len(game_data) for game_data, _, _ in games_traditional)
     avg_game_length = total_positions / num_games
     print(f"Total positions evaluated: {total_positions}")
     print(f"Average game length: {avg_game_length:.1f} moves")
@@ -73,7 +73,7 @@ def demo_comparison():
     print(f"Average: {time_branching/num_games:.3f}s per game")
     
     # Calculate statistics
-    total_positions_br = sum(len(game_data) for game_data, _ in games_branching)
+    total_positions_br = sum(len(game_data) for game_data, _, _ in games_branching)
     avg_game_length_br = total_positions_br / num_games
     print(f"Total positions evaluated: {total_positions_br}")
     print(f"Average game length: {avg_game_length_br:.1f} moves")
@@ -88,12 +88,12 @@ def demo_comparison():
     # Show some example branch points
     if player_branching.branch_points:
         print(f"\nExample branch points (showing first 5):")
-        for i, (board, node, depth) in enumerate(player_branching.branch_points[:5]):
+        for i, (board, node, depth, branch_id) in enumerate(player_branching.branch_points[:5]):
             moves = list(node.move_probs.keys())
             top_probs = sorted(node.move_probs.values(), reverse=True)[:3]
             print(f"  {i+1}. Depth {depth}, {len(moves)} moves, "
                   f"top probs: {', '.join(f'{p:.2%}' for p in top_probs)}, "
-                  f"visits: {node.visit_count}")
+                  f"visits: {node.visit_count}, branch: {branch_id}")
     
     # Comparison
     print("\n" + "=" * 70)
@@ -126,9 +126,9 @@ def demo_comparison():
     print("=" * 70)
     
     def analyze_outcomes(games, label):
-        white_wins = sum(1 for _, result in games if result > 0.5)
-        black_wins = sum(1 for _, result in games if result < -0.5)
-        draws = sum(1 for _, result in games if -0.5 <= result <= 0.5)
+        white_wins = sum(1 for _, result, _ in games if result > 0.5)
+        black_wins = sum(1 for _, result, _ in games if result < -0.5)
+        draws = sum(1 for _, result, _ in games if -0.5 <= result <= 0.5)
         
         print(f"\n{label}:")
         print(f"  White wins: {white_wins} ({white_wins/len(games)*100:.1f}%)")
@@ -166,7 +166,7 @@ def demo_branch_point_selection():
     
     # Show the distribution of branch points by depth
     from collections import Counter
-    depth_counts = Counter(depth for _, _, depth in player.branch_points)
+    depth_counts = Counter(depth for _, _, depth, _ in player.branch_points)
     
     print("\nBranch points by depth:")
     for depth in sorted(depth_counts.keys())[:10]:
@@ -179,7 +179,7 @@ def demo_branch_point_selection():
     import numpy as np
     
     entropies = []
-    for _, node, _ in player.branch_points:
+    for _, node, _, _ in player.branch_points:
         probs = list(node.move_probs.values())
         if len(probs) > 1:
             entropy = -sum(p * np.log(p + 1e-10) for p in probs)

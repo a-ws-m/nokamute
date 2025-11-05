@@ -102,23 +102,30 @@ def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu", ga
 
 def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=32):
     """
-    Prepare training data using temporal difference learning.
+    Prepare training data using semi-gradient TD(0) learning.
     
+    This implements the semi-gradient form where we update parameters based on:
     TD target: V(s_t) = r_t + gamma * V(s_{t+1})
+    
     Where:
-    - V(s_t) is the value of current state
+    - V(s_t) is the value of current state (trainable)
     - r_t is the immediate reward (0 for non-terminal states)
-    - V(s_{t+1}) is the value of next state (from model)
+    - V(s_{t+1}) is the value of next state (computed from model, held constant)
+    
+    The "semi-gradient" aspect means we do NOT backpropagate through V(s_{t+1}),
+    treating it as a fixed target. This is the standard approach in TD learning.
     
     For terminal states: V(s_terminal) = final_result
     
     This implementation uses batch evaluation with deduplication for efficiency:
-    1. Collect all unique positions (by zobrist hash)
-    2. Batch evaluate all unique positions in batches
-    3. Compute TD targets using cached evaluations
+    1. Group games by branch_id to share early position evaluations
+    2. Collect all unique positions (by graph hash)
+    3. Batch evaluate all unique positions
+    4. Compute TD targets using cached evaluations
+    5. Handle multiple results for the same position by averaging
     
     Args:
-        games: List of (game_data, result) tuples from self-play
+        games: List of (game_data, result, branch_id) tuples from self-play
         model: Current model to estimate future values
         device: Device to run model on
         gamma: Discount factor for future rewards
@@ -129,13 +136,22 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
     """
     model.eval()
     
+    # Group games by branch_id for efficient processing
+    branch_groups = {}  # branch_id -> list of (game_data, result)
+    for game_data, final_result, branch_id in games:
+        if branch_id not in branch_groups:
+            branch_groups[branch_id] = []
+        branch_groups[branch_id].append((game_data, final_result))
+    
+    print(f"  Games grouped into {len(branch_groups)} branches")
+    
     # Phase 1: Collect all unique positions and build index
     # Map graph hash -> (node_features, edge_index, player_name)
     hash_to_position = {}
     # Track all position references: (game_idx, position_idx) -> graph_hash
     position_refs = {}
     
-    for game_idx, (game_data, final_result) in enumerate(games):
+    for game_idx, (game_data, final_result, branch_id) in enumerate(games):
         for position_idx, item in enumerate(game_data):
             # New format: (nx_graph, legal_moves, selected_move, player, pos_hash)
             nx_graph, legal_moves, selected_move, player, pos_hash = item
@@ -195,9 +211,11 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
             hash_to_value[pos_hash] = value
     
     # Phase 3: Compute TD targets for each position
-    training_examples = []
+    # Collect all (pos_hash, td_target) pairs to handle duplicates
+    position_targets = {}  # pos_hash -> list of TD targets
+    position_data = {}     # pos_hash -> (node_features, edge_index)
     
-    for game_idx, (game_data, final_result) in enumerate(games):
+    for game_idx, (game_data, final_result, branch_id) in enumerate(games):
         if len(game_data) == 0:
             continue
         
@@ -212,6 +230,10 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
             # Skip empty boards
             if len(node_features) == 0:
                 continue
+            
+            # Store position data if not seen
+            if pos_hash not in position_data:
+                position_data[pos_hash] = (node_features, edge_index)
             
             # Get position hash
             current_hash = position_refs.get((game_idx, position_idx))
@@ -251,8 +273,17 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
                 # TD target: gamma * V(s_{t+1})
                 td_target = gamma * next_value
             
-            # Store training example
-            training_examples.append((node_features, edge_index, td_target))
+            # Collect target for this position
+            if pos_hash not in position_targets:
+                position_targets[pos_hash] = []
+            position_targets[pos_hash].append(td_target)
+    
+    # Phase 4: Average targets for positions with multiple outcomes
+    training_examples = []
+    for pos_hash, (node_features, edge_index) in position_data.items():
+        targets = position_targets[pos_hash]
+        avg_target = sum(targets) / len(targets)
+        training_examples.append((node_features, edge_index, avg_target))
     
     return training_examples
 
@@ -276,7 +307,7 @@ def evaluate_model(model, num_games=50, device="cpu", max_moves=400):
     total_moves = 0
 
     for _ in range(num_games):
-        game_data, result = player.play_game()
+        game_data, result, _ = player.play_game()
         total_moves += len(game_data)
 
         if result > 0.5:
@@ -352,7 +383,7 @@ def main():
     parser.add_argument(
         "--use-td",
         action="store_true",
-        help="Use temporal difference learning instead of Monte Carlo returns",
+        help="Use semi-gradient TD(0) learning instead of Monte Carlo returns (defaults to 1 game, 1 epoch per iteration)",
     )
     parser.add_argument(
         "--enable-branching",
@@ -412,6 +443,22 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # When using TD learning, default to 1 game and 1 epoch per iteration
+    # unless explicitly overridden by user
+    if args.use_td:
+        # Check if user explicitly set these values
+        import sys
+        games_explicitly_set = '--games' in sys.argv
+        epochs_explicitly_set = '--epochs' in sys.argv
+        
+        if not games_explicitly_set and args.games == 100:  # 100 is the default
+            args.games = 1
+            print("TD learning mode: defaulting to 1 game per iteration")
+        
+        if not epochs_explicitly_set and args.epochs == 10:  # 10 is the default
+            args.epochs = 1
+            print("TD learning mode: defaulting to 1 epoch per iteration")
 
     # Create checkpoint directory
     Path(args.model_path).mkdir(parents=True, exist_ok=True)
@@ -598,7 +645,7 @@ def main():
         # Prepare training data
         print("Preparing training data...")
         if args.use_td:
-            print(f"Using TD learning with gamma={args.gamma}")
+            print(f"Using semi-gradient TD(0) with gamma={args.gamma}")
             training_data = prepare_td_training_data(
                 games, model, device=args.device, gamma=args.gamma, batch_size=args.batch_size
             )
@@ -625,23 +672,31 @@ def main():
             global_step = iteration * args.epochs + epoch
             writer.add_scalar("Loss/train", loss, global_step)
 
-        # Evaluate model (self-play)
-        print("\nEvaluating model (self-play)...")
-        eval_stats = evaluate_model(model, num_games=20, device=args.device, max_moves=args.max_moves)
-        print(f"Self-play evaluation results: {eval_stats}")
+        # Initialize eval_stats for checkpoint saving
+        eval_stats = {}
 
-        writer.add_scalar(
-            "Eval/avg_game_length", eval_stats["avg_game_length"], iteration
-        )
-        writer.add_scalar("Eval/wins", eval_stats["wins"], iteration)
-        writer.add_scalar("Eval/draws", eval_stats["draws"], iteration)
-
-        # Periodic evaluation against engine
+        # Periodic evaluation against engine and previous models
         model_name = f"model_iter_{iteration}"
-        if (iteration + 1) % args.eval_interval == 0 or iteration == 0:
+        if (iteration + 1) % args.eval_interval == 0:
             print("\n" + "=" * 60)
-            print("EVALUATING AGAINST ENGINE")
+            print("EVALUATION AT ITERATION {}".format(iteration))
             print("=" * 60)
+            
+            # Evaluate self-play performance
+            print("\nEvaluating model (self-play)...")
+            selfplay_stats = evaluate_model(model, num_games=args.eval_games, device=args.device, max_moves=args.max_moves)
+            print(f"Self-play evaluation results: {selfplay_stats}")
+            
+            writer.add_scalar(
+                "Eval/avg_game_length", selfplay_stats["avg_game_length"], iteration
+            )
+            writer.add_scalar("Eval/wins", selfplay_stats["wins"], iteration)
+            writer.add_scalar("Eval/draws", selfplay_stats["draws"], iteration)
+            
+            # Evaluate against engine
+            print("\n" + "-" * 60)
+            print("EVALUATING AGAINST ENGINE")
+            print("-" * 60)
             
             engine_eval_results = evaluate_and_update_elo(
                 model=model,
@@ -667,18 +722,124 @@ def main():
                     iteration,
                 )
             
+            # Evaluate against previous model versions (if they exist)
+            print("\n" + "-" * 60)
+            print("EVALUATING AGAINST PREVIOUS MODELS")
+            print("-" * 60)
+            
+            # Get all previous model iterations from ratings
+            previous_models = [
+                name for name in elo_tracker.ratings.keys()
+                if name.startswith("model_iter_") and name != model_name
+            ]
+            
+            if previous_models:
+                # Sort by iteration number and take the most recent ones
+                previous_models.sort(key=lambda x: int(x.split("_")[-1]))
+                
+                # Evaluate against up to 3 most recent models
+                recent_models = previous_models[-3:] if len(previous_models) > 3 else previous_models
+                
+                for prev_model_name in recent_models:
+                    prev_iteration = int(prev_model_name.split("_")[-1])
+                    prev_checkpoint = os.path.join(args.model_path, f"{prev_model_name}.pt")
+                    
+                    if os.path.exists(prev_checkpoint):
+                        print(f"\nEvaluating against {prev_model_name} (iteration {prev_iteration})...")
+                        
+                        # Load previous model
+                        prev_checkpoint_data = torch.load(prev_checkpoint)
+                        prev_model = create_model(prev_checkpoint_data["config"]).to(args.device)
+                        prev_model.load_state_dict(prev_checkpoint_data["model_state_dict"])
+                        
+                        # Play games between current and previous model
+                        wins = 0
+                        losses = 0
+                        draws = 0
+                        total_moves = 0
+                        
+                        from evaluate_vs_engine import MLPlayer, play_game
+                        
+                        current_player = MLPlayer(model, temperature=0.1, device=args.device)
+                        prev_player = MLPlayer(prev_model, temperature=0.1, device=args.device)
+                        
+                        games_per_side = args.eval_games // 2
+                        
+                        # Play as player1 (Black)
+                        for _ in range(games_per_side):
+                            winner, num_moves, _ = play_game(
+                                current_player, prev_player, max_moves=args.max_moves, verbose=False
+                            )
+                            total_moves += num_moves
+                            
+                            if winner == "player1":
+                                wins += 1
+                            elif winner == "player2":
+                                losses += 1
+                            else:
+                                draws += 1
+                        
+                        # Play as player2 (White)
+                        for _ in range(games_per_side):
+                            winner, num_moves, _ = play_game(
+                                prev_player, current_player, max_moves=args.max_moves, verbose=False
+                            )
+                            total_moves += num_moves
+                            
+                            if winner == "player2":
+                                wins += 1
+                            elif winner == "player1":
+                                losses += 1
+                            else:
+                                draws += 1
+                        
+                        # Update ELO based on match results
+                        total_games = wins + losses + draws
+                        score = (wins + 0.5 * draws) / total_games
+                        
+                        elo_tracker.update_ratings(
+                            model_name,
+                            prev_model_name,
+                            score,
+                            game_metadata={
+                                "wins": wins,
+                                "losses": losses,
+                                "draws": draws,
+                                "avg_moves": total_moves / total_games,
+                            },
+                        )
+                        
+                        print(f"  vs {prev_model_name}: W={wins} L={losses} D={draws} "
+                              f"(win rate: {wins/total_games:.1%})")
+                        
+                        # Log to tensorboard
+                        writer.add_scalar(
+                            f"PrevModelEval/vs_iter_{prev_iteration}_win_rate",
+                            wins / total_games,
+                            iteration,
+                        )
+                        writer.add_scalar(
+                            f"PrevModelEval/vs_iter_{prev_iteration}_avg_moves",
+                            total_moves / total_games,
+                            iteration,
+                        )
+            else:
+                print("No previous models to evaluate against.")
+            
             # Log current ELO rating
             current_elo = elo_tracker.get_rating(model_name)
             writer.add_scalar("ELO/model_rating", current_elo, iteration)
             
-            print(f"\nCurrent ELO: {current_elo:.1f}")
+            print("\n" + "-" * 60)
+            print(f"Current ELO: {current_elo:.1f}")
             
             # Print leaderboard
             print("\nTop 10 Leaderboard:")
             for rank, (player, rating) in enumerate(elo_tracker.get_leaderboard(10), 1):
                 print(f"  {rank}. {player}: {rating:.1f}")
             
-            # Update eval_stats with engine results
+            # Update eval_stats with results
+            eval_stats["selfplay"] = selfplay_stats
             eval_stats["engine_eval"] = engine_eval_results
             eval_stats["elo_rating"] = current_elo
 
