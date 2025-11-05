@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 import nokamute
 from torch_geometric.data import Batch, Data
+from torch_geometric.loader import DataLoader
 from typing import List, Tuple, Optional
 
 import sys
@@ -263,50 +264,44 @@ def pretrain_eval_matching(
     model.train()
     epoch_losses = []
     
-    for epoch in range(num_epochs):
-        # Shuffle training data
-        shuffled_data = training_data.copy()
-        random.shuffle(shuffled_data)
+    # Pre-convert all training data to PyG Data objects with targets
+    data_list = []
+    for node_features, edge_index, eval_score in training_data:
+        # Skip empty graphs
+        if len(node_features) == 0:
+            continue
+            
+        # Convert to tensors
+        x = torch.tensor(node_features, dtype=torch.float32)
+        edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
+        data = Data(x=x, edge_index=edge_index_tensor)
         
+        # Normalize evaluation score and store as target
+        normalized_score = normalize_evaluation(eval_score, scale)
+        data.y = torch.tensor([normalized_score], dtype=torch.float32)
+        data_list.append(data)
+    
+    if len(data_list) == 0:
+        return []
+    
+    for epoch in range(num_epochs):
         total_loss = 0
         num_batches = 0
         
-        # Train in batches
-        for i in range(0, len(shuffled_data), batch_size):
-            batch_data = shuffled_data[i : i + batch_size]
-            
-            # Convert to PyG Data objects
-            data_list = []
-            targets = []
-            
-            for node_features, edge_index, eval_score in batch_data:
-                # Skip empty graphs
-                if len(node_features) == 0:
-                    continue
-                    
-                # Convert to tensors
-                x = torch.tensor(node_features, dtype=torch.float32)
-                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
-                data = Data(x=x, edge_index=edge_index_tensor)
-                data_list.append(data)
-                
-                # Normalize evaluation score
-                normalized_score = normalize_evaluation(eval_score, scale)
-                targets.append(normalized_score)
-            
-            if len(data_list) == 0:
-                continue
-            
-            # Create batch
-            batch = Batch.from_data_list(data_list).to(device)
-            targets = torch.tensor(targets, dtype=torch.float32).to(device).unsqueeze(1)
+        # Use DataLoader for efficient batching and shuffling
+        loader = DataLoader(data_list, batch_size=batch_size, shuffle=True)
+        
+        for batch in loader:
+            batch = batch.to(device)
             
             # Forward pass
             optimizer.zero_grad()
             predictions, _ = model(batch.x, batch.edge_index, batch.batch)
             
+            # Extract targets from batch
+            targets = batch.y.unsqueeze(1) if batch.y.dim() == 1 else batch.y
+            
             # Ensure predictions and targets have the same shape
-            # This handles cases where the batch might be smaller than batch_size
             assert predictions.shape == targets.shape, f"Shape mismatch: predictions {predictions.shape} vs targets {targets.shape}"
             
             # Compute MSE loss

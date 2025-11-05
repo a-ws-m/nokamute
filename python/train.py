@@ -15,6 +15,7 @@ from self_play import SelfPlayGame, prepare_training_data
 from torch.utils.tensorboard import SummaryWriter
 import nokamute
 from torch_geometric.data import Batch, Data
+from torch_geometric.loader import DataLoader
 from elo_tracker import EloTracker
 from evaluate_vs_engine import evaluate_and_update_elo
 from graph_utils import networkx_to_pyg, graph_hash
@@ -52,40 +53,35 @@ def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu", ga
     total_loss = 0
     num_batches = 0
 
-    # Shuffle training data
-    import random
-
-    random.shuffle(training_data)
-
-    # Create batches
-    for i in range(0, len(training_data), batch_size):
-        batch_data = training_data[i : i + batch_size]
-
-        # Convert to PyG Data objects
-        data_list = []
-        targets = []
-
-        for node_features, edge_index, td_target in batch_data:
-            if len(node_features) == 0:
-                continue
-
-            x = torch.tensor(node_features, dtype=torch.float32)
-            edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
-
-            data = Data(x=x, edge_index=edge_index_tensor)
-            data_list.append(data)
-            targets.append(td_target)
-
-        if len(data_list) == 0:
+    # Convert training data to PyG Data objects with targets
+    data_list = []
+    for node_features, edge_index, td_target in training_data:
+        if len(node_features) == 0:
             continue
 
-        # Create batch
-        batch = Batch.from_data_list(data_list).to(device)
-        targets = torch.tensor(targets, dtype=torch.float32).to(device).unsqueeze(1)
+        x = torch.tensor(node_features, dtype=torch.float32)
+        edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
+
+        data = Data(x=x, edge_index=edge_index_tensor)
+        # Store target as a graph-level attribute
+        data.y = torch.tensor([td_target], dtype=torch.float32)
+        data_list.append(data)
+
+    if len(data_list) == 0:
+        return 0.0
+
+    # Use DataLoader for efficient batching and shuffling
+    loader = DataLoader(data_list, batch_size=batch_size, shuffle=True)
+
+    for batch in loader:
+        batch = batch.to(device)
 
         # Forward pass
         optimizer.zero_grad()
         predictions, _ = model(batch.x, batch.edge_index, batch.batch)
+
+        # Extract targets from batch
+        targets = batch.y.unsqueeze(1) if batch.y.dim() == 1 else batch.y
 
         # Compute TD loss (MSE between predicted value and TD target)
         loss = F.mse_loss(predictions, targets)

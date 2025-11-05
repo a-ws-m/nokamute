@@ -15,7 +15,6 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from torch_geometric.data import Data, Batch
-from torch_geometric.loader import DataLoader
 
 import nokamute
 from graph_utils import graph_hash, board_to_networkx
@@ -190,7 +189,7 @@ class SelfPlayGame:
 
     def _batch_evaluate_moves(self, board, legal_moves):
         """
-        Evaluate all legal moves in a single batch using DataLoader.
+        Evaluate all legal moves in a single batch.
         Deduplicates positions with identical graph hashes to avoid redundant evaluations.
 
         Args:
@@ -225,9 +224,6 @@ class SelfPlayGame:
                     hash_to_data[pos_hash] = None
             
             hash_to_moves[pos_hash].append((move_idx, move))
-
-            # Undo the move
-            board_copy.undo(move)
 
         # Prepare batch for unique positions only
         unique_hashes = []
