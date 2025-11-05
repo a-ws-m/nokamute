@@ -74,13 +74,14 @@ class SelfPlayGame:
         node_features, edge_index = board.to_graph()
         return graph_hash(node_features, edge_index)
 
-    def _compute_move_probabilities(self, board, legal_moves):
+    def _compute_move_probabilities(self, board, legal_moves, move_values=None):
         """
         Compute probability distribution over legal moves.
         
         Args:
             board: Current board state
             legal_moves: List of legal moves
+            move_values: Optional pre-computed move values (to avoid redundant evaluation)
             
         Returns:
             Dictionary mapping move string to probability
@@ -106,8 +107,9 @@ class SelfPlayGame:
             prob = 1.0 / len(legal_moves)
             return {str(move): prob for move in legal_moves}
         
-        # Batch evaluate all moves
-        move_values = self._batch_evaluate_moves(board, legal_moves)
+        # Batch evaluate all moves if not already provided
+        if move_values is None:
+            move_values = self._batch_evaluate_moves(board, legal_moves)
         
         # Compute softmax probabilities
         if self.temperature == 0:
@@ -123,7 +125,7 @@ class SelfPlayGame:
         
         return {str(legal_moves[i]): float(probs[i]) for i in range(len(legal_moves))}
 
-    def select_move(self, board, legal_moves, return_probs=False):
+    def select_move(self, board, legal_moves, return_probs=False, return_value=False):
         """
         Select a move based on model evaluation or random selection.
         Checks for immediate winning moves first.
@@ -133,34 +135,58 @@ class SelfPlayGame:
             board: Current board state
             legal_moves: List of legal moves
             return_probs: If True, also return move probabilities
+            return_value: If True, also return the evaluated value of the resulting position
 
         Returns:
-            Selected move (and optionally move probabilities dict)
+            Selected move (and optionally move probabilities dict and/or move value)
         """
         if len(legal_moves) == 1:
             move = legal_moves[0]
+            result = [move]
             if return_probs:
-                return move, {str(move): 1.0}
-            return move
+                result.append({str(move): 1.0})
+            if return_value:
+                # Need to evaluate the single move if requested
+                if self.model is not None:
+                    move_values = self._batch_evaluate_moves(board, legal_moves)
+                    result.append(move_values[0])
+                else:
+                    result.append(0.0)
+            return tuple(result) if len(result) > 1 else result[0]
 
-        # Compute probabilities for all moves
-        move_probs = self._compute_move_probabilities(board, legal_moves)
+        # Evaluate all moves once if model is available (and we need the values)
+        move_values = None
+        if self.model is not None and (return_value or return_probs):
+            move_values = self._batch_evaluate_moves(board, legal_moves)
+        
+        # Compute probabilities for all moves (reusing move_values if available)
+        move_probs = self._compute_move_probabilities(board, legal_moves, move_values=move_values)
         
         # Sample move according to probabilities
         move_strs = list(move_probs.keys())
         probs = list(move_probs.values())
         selected_move_str = np.random.choice(move_strs, p=probs)
         
-        # Find the actual move object
+        # Find the actual move object and its index
         selected_move = None
-        for move in legal_moves:
+        selected_idx = None
+        for idx, move in enumerate(legal_moves):
             if str(move) == selected_move_str:
                 selected_move = move
+                selected_idx = idx
                 break
         
+        # Build return value
+        result = [selected_move]
         if return_probs:
-            return selected_move, move_probs
-        return selected_move
+            result.append(move_probs)
+        if return_value:
+            if move_values is not None and selected_idx is not None:
+                result.append(move_values[selected_idx])
+            else:
+                result.append(0.0)
+        
+        return tuple(result) if len(result) > 1 else result[0]
 
     def _batch_evaluate_moves(self, board, legal_moves):
         """
@@ -280,7 +306,8 @@ class SelfPlayGame:
             branch_id: Identifier for the branch point (for tracking which games share early positions)
 
         Returns:
-            game_data: List of (board_state, legal_moves, selected_move)
+            game_data: List of (nx_graph, legal_moves, selected_move, player, pos_hash, move_value)
+                      where move_value is the model's evaluation of the position after the move
             result: Game result (1.0 for player 1 win, -1.0 for player 2 win, 0.0 for draw)
             branch_id: The branch identifier (for tracking related games)
         """
@@ -314,9 +341,11 @@ class SelfPlayGame:
             nx_graph = board_to_networkx(node_features, edge_index)
             pos_hash = graph_hash(node_features, edge_index)
 
-            # Select move and get probabilities
+            # Select move and get probabilities and value
             if self.enable_branching:
-                selected_move, move_probs = self.select_move(board, legal_moves, return_probs=True)
+                selected_move, move_probs, move_value = self.select_move(
+                    board, legal_moves, return_probs=True, return_value=True
+                )
                 
                 # Track this position in the game tree
                 current_depth = start_depth + move_num
@@ -341,11 +370,19 @@ class SelfPlayGame:
                     if branch_id is not None:
                         self.branch_points.append((board.clone(), node, current_depth, branch_id))
                 
-                game_data.append((nx_graph, legal_moves, selected_move, current_player, pos_hash))
+                # Store with move value for TD learning
+                game_data.append((nx_graph, legal_moves, selected_move, current_player, pos_hash, move_value))
             else:
-                # Standard play without branching
-                selected_move = self.select_move(board, legal_moves)
-                game_data.append((nx_graph, legal_moves, selected_move, current_player, pos_hash))
+                # Standard play without branching - also get move value for TD learning
+                if self.model is not None:
+                    selected_move, move_value = self.select_move(
+                        board, legal_moves, return_value=True
+                    )
+                    game_data.append((nx_graph, legal_moves, selected_move, current_player, pos_hash, move_value))
+                else:
+                    selected_move = self.select_move(board, legal_moves)
+                    # No model, so no value - use 0.0 as placeholder
+                    game_data.append((nx_graph, legal_moves, selected_move, current_player, pos_hash, 0.0))
 
             board.apply(selected_move)
 
@@ -497,7 +534,7 @@ def prepare_training_data(games):
 
     Args:
         games: List of (game_data, result, branch_id) tuples from self-play
-              Each game_data contains (nx_graph, legal_moves, selected_move, player, pos_hash)
+              Each game_data contains (nx_graph, legal_moves, selected_move, player, pos_hash, move_value)
 
     Returns:
         training_examples: List of (node_features, edge_index, target_value)
@@ -511,14 +548,17 @@ def prepare_training_data(games):
     for game_data, final_result, branch_id in games:
         # Assign values to each position based on final result
         for item in game_data:
-            # Handle both old format and new format with NetworkX graphs
-            if len(item) == 5:
+            # New format with move_value: (nx_graph, legal_moves, selected_move, player, pos_hash, move_value)
+            if len(item) == 6:
+                nx_graph, legal_moves, selected_move, player, pos_hash, move_value = item
+            elif len(item) == 5:
+                # Old format without move_value (for backward compatibility)
                 nx_graph, legal_moves, selected_move, player, pos_hash = item
             else:
-                # Old format - shouldn't happen but handle gracefully
+                # Unknown format - skip
                 continue
             
-            # Convert NetworkX graph back to PyG format (once per unique position)
+            # Convert NetworkX graph to PyG format (once per unique position)
             if pos_hash not in position_data:
                 node_features, edge_index = networkx_to_pyg(nx_graph)
                 
@@ -564,17 +604,18 @@ if __name__ == "__main__":
     if len(game_data) > 0:
         from graph_utils import networkx_to_pyg
         
-        # New format with NetworkX graphs
+        # New format with NetworkX graphs and move values
         first_item = game_data[0]
-        if len(first_item) == 5:
-            nx_graph, legal_moves, selected_move, player_color, pos_hash = first_item
+        if len(first_item) == 6:
+            nx_graph, legal_moves, selected_move, player_color, pos_hash, move_value = first_item
             print(f"Position hash: {pos_hash}")
+            print(f"Move value: {move_value}")
             
             # Convert back to PyG format for inspection
             node_features, edge_index = networkx_to_pyg(nx_graph)
             print(f"First position: {len(node_features)} nodes, {len(edge_index[0])} edges")
         else:
-            print("Unexpected format")
+            print(f"Unexpected format: {len(first_item)} elements")
 
 
     print("Self-play test passed!")

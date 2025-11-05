@@ -110,31 +110,34 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
     Where:
     - V(s_t) is the value of current state (trainable)
     - r_t is the immediate reward (0 for non-terminal states)
-    - V(s_{t+1}) is the value of next state (computed from model, held constant)
+    - V(s_{t+1}) is the value of next state (from stored move evaluation or model)
     
     The "semi-gradient" aspect means we do NOT backpropagate through V(s_{t+1}),
     treating it as a fixed target. This is the standard approach in TD learning.
     
     For terminal states: V(s_terminal) = final_result
     
-    This implementation uses batch evaluation with deduplication for efficiency:
-    1. Group games by branch_id to share early position evaluations
-    2. Collect all unique positions (by graph hash)
-    3. Batch evaluate all unique positions
-    4. Compute TD targets using cached evaluations
-    5. Handle multiple results for the same position by averaging
+    This implementation uses stored move evaluations from self-play to avoid
+    redundant computation. During self-play, we already evaluated the position
+    resulting from each selected move. We reuse those cached values here.
+    
+    Optimization steps:
+    1. Extract stored move values from game data
+    2. Use stored values for TD target computation (no re-evaluation needed)
+    3. Handle multiple results for the same position by averaging
     
     Args:
         games: List of (game_data, result, branch_id) tuples from self-play
-        model: Current model to estimate future values
-        device: Device to run model on
+               Each game_data contains (nx_graph, legal_moves, selected_move, player, pos_hash, move_value)
+        model: Current model (kept for compatibility, may be used for fallback)
+        device: Device to run model on (kept for compatibility)
         gamma: Discount factor for future rewards
-        batch_size: Batch size for evaluating positions
+        batch_size: Batch size (kept for compatibility)
         
     Returns:
         training_examples: List of (node_features, edge_index, td_target)
     """
-    model.eval()
+    from graph_utils import networkx_to_pyg
     
     # Group games by branch_id for efficient processing
     branch_groups = {}  # branch_id -> list of (game_data, result)
@@ -145,16 +148,23 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
     
     print(f"  Games grouped into {len(branch_groups)} branches")
     
-    # Phase 1: Collect all unique positions and build index
-    # Map graph hash -> (node_features, edge_index, player_name)
-    hash_to_position = {}
-    # Track all position references: (game_idx, position_idx) -> graph_hash
-    position_refs = {}
+    # Phase 1: Extract stored move values and build index
+    # Map (game_idx, position_idx) -> stored move_value (evaluation of position AFTER move)
+    position_move_values = {}
+    # Track all position data: pos_hash -> (node_features, edge_index)
+    position_data = {}
     
     for game_idx, (game_data, final_result, branch_id) in enumerate(games):
         for position_idx, item in enumerate(game_data):
-            # New format: (nx_graph, legal_moves, selected_move, player, pos_hash)
-            nx_graph, legal_moves, selected_move, player, pos_hash = item
+            # New format with move_value: (nx_graph, legal_moves, selected_move, player, pos_hash, move_value)
+            if len(item) == 6:
+                nx_graph, legal_moves, selected_move, player, pos_hash, move_value = item
+            elif len(item) == 5:
+                # Old format without move_value (fallback to None)
+                nx_graph, legal_moves, selected_move, player, pos_hash = item
+                move_value = None
+            else:
+                continue
             
             # Convert NetworkX graph to PyG format
             node_features, edge_index = networkx_to_pyg(nx_graph)
@@ -164,56 +174,17 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
                 continue
             
             # Store position data if not seen before
-            if pos_hash not in hash_to_position:
-                hash_to_position[pos_hash] = (node_features, edge_index, player.name)
+            if pos_hash not in position_data:
+                position_data[pos_hash] = (node_features, edge_index)
             
-            # Track this position reference
-            position_refs[(game_idx, position_idx)] = pos_hash
+            # Store the move value for this specific game position
+            position_move_values[(game_idx, position_idx)] = move_value
     
-    # Phase 2: Batch evaluate all unique positions
-    print(f"  Evaluating {len(hash_to_position)} unique positions (from {len(position_refs)} total)...")
+    print(f"  Using {len(position_move_values)} stored move evaluations (no re-evaluation needed)")
     
-    # Prepare all data
-    hash_list = []
-    data_list = []
-    
-    for pos_hash, (node_features, edge_index, _) in hash_to_position.items():
-        hash_list.append(pos_hash)
-        
-        x = torch.tensor(node_features, dtype=torch.float32)
-        edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
-        data = Data(x=x, edge_index=edge_index_tensor)
-        data_list.append(data)
-    
-    # Evaluate positions in batches
-    hash_to_value = {}
-    
-    if len(data_list) > 0:
-        all_values = []
-        
-        # Process in batches
-        for i in range(0, len(data_list), batch_size):
-            batch_data = data_list[i:i + batch_size]
-            batch = Batch.from_data_list(batch_data).to(device)
-            
-            with torch.no_grad():
-                predictions, _ = model(batch.x, batch.edge_index, batch.batch)
-                values = predictions.squeeze().cpu().numpy()
-            
-            # Handle single value case
-            if len(batch_data) == 1:
-                all_values.append(values.item())
-            else:
-                all_values.extend(values.tolist())
-        
-        # Map values to hashes
-        for pos_hash, value in zip(hash_list, all_values):
-            hash_to_value[pos_hash] = value
-    
-    # Phase 3: Compute TD targets for each position
+    # Phase 2: Compute TD targets using stored move values
     # Collect all (pos_hash, td_target) pairs to handle duplicates
     position_targets = {}  # pos_hash -> list of TD targets
-    position_data = {}     # pos_hash -> (node_features, edge_index)
     
     for game_idx, (game_data, final_result, branch_id) in enumerate(games):
         if len(game_data) == 0:
@@ -221,23 +192,13 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
         
         # Process each position in the game
         for position_idx, item in enumerate(game_data):
-            # New format: (nx_graph, legal_moves, selected_move, player, pos_hash)
-            nx_graph, legal_moves, selected_move, player, pos_hash = item
-            
-            # Convert NetworkX graph to PyG format
-            node_features, edge_index = networkx_to_pyg(nx_graph)
-            
-            # Skip empty boards
-            if len(node_features) == 0:
-                continue
-            
-            # Store position data if not seen
-            if pos_hash not in position_data:
-                position_data[pos_hash] = (node_features, edge_index)
-            
-            # Get position hash
-            current_hash = position_refs.get((game_idx, position_idx))
-            if current_hash is None:
+            # Extract position info
+            if len(item) == 6:
+                nx_graph, legal_moves, selected_move, player, pos_hash, move_value = item
+            elif len(item) == 5:
+                nx_graph, legal_moves, selected_move, player, pos_hash = item
+                move_value = None
+            else:
                 continue
             
             # Determine if this is the last position
@@ -250,24 +211,18 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
                 else:
                     td_target = -final_result
             else:
-                # Non-terminal state: compute TD target
-                # Get next position info
-                next_ref = (game_idx, position_idx + 1)
-                next_hash = position_refs.get(next_ref)
+                # Non-terminal state: compute TD target using stored move value
+                # The move_value is the model's evaluation of the position AFTER applying the move
+                # This is equivalent to V(s_{t+1}) from the next position's perspective
                 
-                if next_hash is not None and next_hash in hash_to_value:
-                    next_item = game_data[position_idx + 1]
-                    # Extract player from next position
-                    _, _, _, next_player, _ = next_item
-                    
-                    next_value_raw = hash_to_value[next_hash]
-                    
-                    # Flip sign if different player (opponent's perspective)
-                    if player.name != next_player.name:
-                        next_value = -next_value_raw
-                    else:
-                        next_value = next_value_raw
+                next_move_value = position_move_values.get((game_idx, position_idx))
+                
+                if next_move_value is not None:
+                    # move_value is from opponent's perspective (they evaluate the position they see)
+                    # We need it from current player's perspective, so negate it
+                    next_value = -next_move_value
                 else:
+                    # Fallback: no stored value available
                     next_value = 0.0
                 
                 # TD target: gamma * V(s_{t+1})
@@ -278,12 +233,13 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
                 position_targets[pos_hash] = []
             position_targets[pos_hash].append(td_target)
     
-    # Phase 4: Average targets for positions with multiple outcomes
+    # Phase 3: Average targets for positions with multiple outcomes
     training_examples = []
     for pos_hash, (node_features, edge_index) in position_data.items():
-        targets = position_targets[pos_hash]
-        avg_target = sum(targets) / len(targets)
-        training_examples.append((node_features, edge_index, avg_target))
+        if pos_hash in position_targets:
+            targets = position_targets[pos_hash]
+            avg_target = sum(targets) / len(targets)
+            training_examples.append((node_features, edge_index, avg_target))
     
     return training_examples
 
