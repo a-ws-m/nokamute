@@ -312,6 +312,12 @@ def main():
         help="Evaluate against engine every N iterations",
     )
     parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=100,
+        help="Save model checkpoint every N iterations (default: 100)",
+    )
+    parser.add_argument(
         "--eval-games",
         type=int,
         default=20,
@@ -632,8 +638,11 @@ def main():
         eval_stats = {}
 
         # Periodic evaluation against engine and previous models
+        # Only save named checkpoints and evaluate at eval_interval
         model_name = f"model_iter_{iteration}"
-        if (iteration + 1) % args.eval_interval == 0:
+        should_evaluate = (iteration + 1) % args.eval_interval == 0
+        
+        if should_evaluate:
             print("\n" + "=" * 60)
             print("EVALUATION AT ITERATION {}".format(iteration))
             print("=" * 60)
@@ -684,10 +693,14 @@ def main():
             print("-" * 60)
             
             # Get all previous model iterations from ratings
-            previous_models = [
-                name for name in elo_tracker.ratings.keys()
-                if name.startswith("model_iter_") and name != model_name
-            ]
+            # Only include models that were saved at eval intervals (have named checkpoints)
+            previous_models = []
+            for name in elo_tracker.ratings.keys():
+                if name.startswith("model_iter_") and name != model_name:
+                    prev_iteration = int(name.split("_")[-1])
+                    # Only include if it was saved at an eval interval
+                    if (prev_iteration + 1) % args.eval_interval == 0:
+                        previous_models.append(name)
             
             if previous_models:
                 # Sort by iteration number and take the most recent ones
@@ -798,33 +811,35 @@ def main():
             eval_stats["selfplay"] = selfplay_stats
             eval_stats["engine_eval"] = engine_eval_results
             eval_stats["elo_rating"] = current_elo
+            
+            # Save named checkpoint (only at eval intervals)
+            checkpoint_path = os.path.join(args.model_path, f"model_iter_{iteration}.pt")
+            torch.save(
+                {
+                    "iteration": iteration + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "config": model_config,
+                    "eval_stats": eval_stats,
+                },
+                checkpoint_path,
+            )
+            print(f"Saved checkpoint: {checkpoint_path}")
 
-        # Save checkpoint
-        checkpoint_path = os.path.join(args.model_path, f"model_iter_{iteration}.pt")
-        torch.save(
-            {
-                "iteration": iteration + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "config": model_config,
-                "eval_stats": eval_stats,
-            },
-            checkpoint_path,
-        )
-        print(f"Saved checkpoint: {checkpoint_path}")
-
-        # Save latest model
-        latest_path = os.path.join(args.model_path, "model_latest.pt")
-        torch.save(
-            {
-                "iteration": iteration + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "config": model_config,
-                "eval_stats": eval_stats,
-            },
-            latest_path,
-        )
+        # Save latest model at specified intervals (overwriting each time)
+        if (iteration + 1) % args.save_interval == 0:
+            latest_path = os.path.join(args.model_path, "model_latest.pt")
+            torch.save(
+                {
+                    "iteration": iteration + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "config": model_config,
+                    "eval_stats": eval_stats,
+                },
+                latest_path,
+            )
+            print(f"Saved latest model: {latest_path}")
 
     writer.close()
     
