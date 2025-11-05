@@ -1583,6 +1583,10 @@ name = "nokamute-py"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "networkx", version = "3.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
+    { name = "networkx", version = "3.2.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.9.*'" },
+    { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
+    { name = "networkx", version = "3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "numpy", version = "1.24.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.9.*'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
@@ -1598,6 +1602,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "networkx", specifier = ">=3.1" },
     { name = "numpy", specifier = ">=1.20.0" },
     { name = "tensorboard", specifier = ">=2.14.0" },
     { name = "torch", specifier = ">=2.0.0" },

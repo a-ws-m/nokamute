@@ -18,6 +18,7 @@ from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 
 import nokamute
+from graph_utils import graph_hash, board_to_networkx
 
 
 @dataclass
@@ -68,9 +69,10 @@ class SelfPlayGame:
     def _get_board_state_key(self, board):
         """
         Get a hashable representation of the board state.
-        Uses the zobrist hash for deduplication.
+        Uses Weisfeiler-Lehman graph hashing for structural equivalence.
         """
-        return str(board.zobrist_hash())
+        node_features, edge_index = board.to_graph()
+        return graph_hash(node_features, edge_index)
 
     def _compute_move_probabilities(self, board, legal_moves):
         """
@@ -163,7 +165,7 @@ class SelfPlayGame:
     def _batch_evaluate_moves(self, board, legal_moves):
         """
         Evaluate all legal moves in a single batch using DataLoader.
-        Deduplicates positions with identical zobrist hashes to avoid redundant evaluations.
+        Deduplicates positions with identical graph hashes to avoid redundant evaluations.
 
         Args:
             board: Current board state
@@ -172,32 +174,31 @@ class SelfPlayGame:
         Returns:
             List of values for each move (from current player's perspective)
         """
-        # Group moves by resulting zobrist hash to deduplicate equivalent positions
-        hash_to_moves = {}  # zobrist_hash -> list of (move_idx, move)
-        hash_to_data = {}   # zobrist_hash -> (node_features, edge_index) or None
+        # Group moves by resulting graph hash to deduplicate equivalent positions
+        hash_to_moves = {}  # graph_hash -> list of (move_idx, move)
+        hash_to_data = {}   # graph_hash -> (node_features, edge_index) or None
         
         for move_idx, move in enumerate(legal_moves):
             # Create a copy and apply the move
             board_copy = board.clone()
             board_copy.apply(move)
 
-            # Get zobrist hash for deduplication
-            zobrist = board_copy.zobrist_hash()
+            # Convert to graph
+            node_features, edge_index = board_copy.to_graph()
+            
+            # Get graph hash for deduplication
+            pos_hash = graph_hash(node_features, edge_index)
             
             # Track this move
-            if zobrist not in hash_to_moves:
-                hash_to_moves[zobrist] = []
-                
-                # Convert to graph (only once per unique position)
-                node_features, edge_index = board_copy.to_graph()
+            if pos_hash not in hash_to_moves:
+                hash_to_moves[pos_hash] = []
+                hash_to_data[pos_hash] = (node_features, edge_index)
 
-                # Store graph data
+                # Check for empty boards (shouldn't happen but handle gracefully)
                 if len(node_features) == 0:
-                    hash_to_data[zobrist] = None
-                else:
-                    hash_to_data[zobrist] = (node_features, edge_index)
+                    hash_to_data[pos_hash] = None
             
-            hash_to_moves[zobrist].append((move_idx, move))
+            hash_to_moves[pos_hash].append((move_idx, move))
 
             # Undo the move
             board_copy.undo(move)
@@ -206,8 +207,8 @@ class SelfPlayGame:
         unique_hashes = []
         data_list = []
         
-        for zobrist_hash, graph_data in hash_to_data.items():
-            unique_hashes.append(zobrist_hash)
+        for graph_hash_val, graph_data in hash_to_data.items():
+            unique_hashes.append(graph_hash_val)
             
             if graph_data is not None:
                 node_features, edge_index = graph_data
@@ -244,20 +245,20 @@ class SelfPlayGame:
         else:
             values = values.tolist()
 
-        # Map values to zobrist hashes
-        for zobrist_hash, value in zip(valid_hashes, values):
+        # Map values to graph hashes
+        for graph_hash_val, value in zip(valid_hashes, values):
             # Negate value (we want opponent's perspective after our move)
-            hash_to_value[zobrist_hash] = -value
+            hash_to_value[graph_hash_val] = -value
         
         # Handle None positions
-        for zobrist_hash, graph_data in hash_to_data.items():
+        for graph_hash_val, graph_data in hash_to_data.items():
             if graph_data is None:
-                hash_to_value[zobrist_hash] = 0.0
+                hash_to_value[graph_hash_val] = 0.0
 
         # Map values back to all moves (including duplicates)
         move_values = [0.0] * len(legal_moves)
-        for zobrist_hash, move_list in hash_to_moves.items():
-            value = hash_to_value[zobrist_hash]
+        for graph_hash_val, move_list in hash_to_moves.items():
+            value = hash_to_value[graph_hash_val]
             for move_idx, _ in move_list:
                 move_values[move_idx] = value
 
@@ -306,7 +307,10 @@ class SelfPlayGame:
             # Store board state before move
             current_player = board.to_move()
             board_graph = board.to_graph()
-            zobrist_hash = board.zobrist_hash()
+            # Convert to NetworkX graph for storage
+            node_features, edge_index = board_graph
+            nx_graph = board_to_networkx(node_features, edge_index)
+            pos_hash = graph_hash(node_features, edge_index)
 
             # Select move and get probabilities
             if self.enable_branching:
@@ -333,11 +337,11 @@ class SelfPlayGame:
                     # Only keep branch points from early/mid game
                     self.branch_points.append((board.clone(), node, current_depth))
                 
-                game_data.append((board_graph, legal_moves, selected_move, current_player, zobrist_hash))
+                game_data.append((nx_graph, legal_moves, selected_move, current_player, pos_hash))
             else:
                 # Standard play without branching
                 selected_move = self.select_move(board, legal_moves)
-                game_data.append((board_graph, legal_moves, selected_move, current_player, zobrist_hash))
+                game_data.append((nx_graph, legal_moves, selected_move, current_player, pos_hash))
 
             board.apply(selected_move)
 
@@ -484,22 +488,27 @@ def prepare_training_data(games):
 
     Args:
         games: List of (game_data, result) tuples from self-play
+              Each game_data contains (nx_graph, legal_moves, selected_move, player, pos_hash)
 
     Returns:
         training_examples: List of (node_features, edge_index, target_value)
     """
+    from graph_utils import networkx_to_pyg
+    
     training_examples = []
 
     for game_data, final_result in games:
         # Assign values to each position based on final result
         for item in game_data:
-            # Handle both old format (4 items) and new format (5 items with zobrist)
+            # Handle both old format and new format with NetworkX graphs
             if len(item) == 5:
-                board_graph, legal_moves, selected_move, player, zobrist_hash = item
+                nx_graph, legal_moves, selected_move, player, pos_hash = item
             else:
-                board_graph, legal_moves, selected_move, player = item
+                # Old format - shouldn't happen but handle gracefully
+                continue
             
-            node_features, edge_index = board_graph
+            # Convert NetworkX graph back to PyG format
+            node_features, edge_index = networkx_to_pyg(nx_graph)
 
             # Skip empty boards
             if len(node_features) == 0:
@@ -528,15 +537,19 @@ if __name__ == "__main__":
     print(f"Number of positions: {len(game_data)}")
 
     if len(game_data) > 0:
-        # Handle both old (4-item) and new (5-item with zobrist) formats
+        from graph_utils import networkx_to_pyg
+        
+        # New format with NetworkX graphs
         first_item = game_data[0]
         if len(first_item) == 5:
-            board_graph, legal_moves, selected_move, player_color, zobrist_hash = first_item
-            print(f"Zobrist hash: {zobrist_hash}")
+            nx_graph, legal_moves, selected_move, player_color, pos_hash = first_item
+            print(f"Position hash: {pos_hash}")
+            
+            # Convert back to PyG format for inspection
+            node_features, edge_index = networkx_to_pyg(nx_graph)
+            print(f"First position: {len(node_features)} nodes, {len(edge_index[0])} edges")
         else:
-            board_graph, legal_moves, selected_move, player_color = first_item
-        
-        node_features, edge_index = board_graph
-        print(f"First position: {len(node_features)} nodes, {len(edge_index[0])} edges")
+            print("Unexpected format")
+
 
     print("Self-play test passed!")

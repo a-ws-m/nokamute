@@ -17,6 +17,7 @@ import nokamute
 from torch_geometric.data import Batch, Data
 from elo_tracker import EloTracker
 from evaluate_vs_engine import evaluate_and_update_elo
+from graph_utils import networkx_to_pyg, graph_hash
 
 # Import pre-training modules
 try:
@@ -129,28 +130,29 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
     model.eval()
     
     # Phase 1: Collect all unique positions and build index
-    # Map zobrist hash -> (node_features, edge_index, player_name)
+    # Map graph hash -> (node_features, edge_index, player_name)
     hash_to_position = {}
-    # Track all position references: (game_idx, position_idx) -> zobrist_hash
+    # Track all position references: (game_idx, position_idx) -> graph_hash
     position_refs = {}
     
     for game_idx, (game_data, final_result) in enumerate(games):
         for position_idx, item in enumerate(game_data):
-            # Handle both old format (4 items) and new format (5 items with zobrist)
-            board_graph, legal_moves, selected_move, player, zobrist_hash = item
+            # New format: (nx_graph, legal_moves, selected_move, player, pos_hash)
+            nx_graph, legal_moves, selected_move, player, pos_hash = item
             
-            node_features, edge_index = board_graph
+            # Convert NetworkX graph to PyG format
+            node_features, edge_index = networkx_to_pyg(nx_graph)
             
             # Skip empty boards
             if len(node_features) == 0:
                 continue
             
             # Store position data if not seen before
-            if zobrist_hash not in hash_to_position:
-                hash_to_position[zobrist_hash] = (node_features, edge_index, player.name)
+            if pos_hash not in hash_to_position:
+                hash_to_position[pos_hash] = (node_features, edge_index, player.name)
             
             # Track this position reference
-            position_refs[(game_idx, position_idx)] = zobrist_hash
+            position_refs[(game_idx, position_idx)] = pos_hash
     
     # Phase 2: Batch evaluate all unique positions
     print(f"  Evaluating {len(hash_to_position)} unique positions (from {len(position_refs)} total)...")
@@ -159,8 +161,8 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
     hash_list = []
     data_list = []
     
-    for zobrist_hash, (node_features, edge_index, _) in hash_to_position.items():
-        hash_list.append(zobrist_hash)
+    for pos_hash, (node_features, edge_index, _) in hash_to_position.items():
+        hash_list.append(pos_hash)
         
         x = torch.tensor(node_features, dtype=torch.float32)
         edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
@@ -189,8 +191,8 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
                 all_values.extend(values.tolist())
         
         # Map values to hashes
-        for zobrist_hash, value in zip(hash_list, all_values):
-            hash_to_value[zobrist_hash] = value
+        for pos_hash, value in zip(hash_list, all_values):
+            hash_to_value[pos_hash] = value
     
     # Phase 3: Compute TD targets for each position
     training_examples = []
@@ -201,18 +203,19 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
         
         # Process each position in the game
         for position_idx, item in enumerate(game_data):
-            # Handle both old format (4 items) and new format (5 items with zobrist)
-            board_graph, legal_moves, selected_move, player, zobrist_hash = item
+            # New format: (nx_graph, legal_moves, selected_move, player, pos_hash)
+            nx_graph, legal_moves, selected_move, player, pos_hash = item
             
-            node_features, edge_index = board_graph
+            # Convert NetworkX graph to PyG format
+            node_features, edge_index = networkx_to_pyg(nx_graph)
             
             # Skip empty boards
             if len(node_features) == 0:
                 continue
             
             # Get position hash
-            zobrist_hash = position_refs.get((game_idx, position_idx))
-            if zobrist_hash is None:
+            current_hash = position_refs.get((game_idx, position_idx))
+            if current_hash is None:
                 continue
             
             # Determine if this is the last position

@@ -201,7 +201,13 @@ impl Board {
     }
 
     /// Convert board state to a graph representation
-    /// Returns (node_features, edge_index, edge_features)
+    /// 
+    /// Returns (node_features, edge_index) as Python lists.
+    /// The returned graph should be converted to NetworkX format in Python
+    /// using the graph_utils.board_to_networkx() function.
+    /// 
+    /// For position equivalence checking, use graph_utils.graph_hash()
+    /// which implements Weisfeiler-Lehman graph hashing instead of zobrist_hash().
     fn to_graph(&self, py: Python) -> PyResult<PyObject> {
         use crate::hex_grid::adjacent;
         use std::collections::{HashMap, HashSet};

@@ -10,11 +10,18 @@ before transitioning to self-play training.
 """
 
 import random
+import pickle
 import torch
 import torch.nn.functional as F
-from torch_geometric.data import Batch, Data
 import nokamute
+from torch_geometric.data import Batch, Data
 from typing import List, Tuple, Optional
+
+import sys
+import os
+# Add parent directory to path to import graph_utils
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from graph_utils import graph_hash
 
 
 def generate_eval_matching_data(
@@ -51,8 +58,8 @@ def generate_eval_matching_data(
         List of (node_features, edge_index, eval_score) tuples
         eval_score is normalized to [-1, 1] range for training
     """
-    # Use a dictionary to deduplicate positions by zobrist hash
-    # Map: zobrist_hash -> (node_features, edge_index, eval_score)
+    # Use a dictionary to deduplicate positions by graph hash
+    # Map: graph_hash -> (node_features, edge_index, eval_score)
     unique_positions = {}
     position_repetitions = {}  # Track how many times each position was seen
     
@@ -76,7 +83,8 @@ def generate_eval_matching_data(
                 break
             
             # Track position for repetition detection within the game
-            pos_hash = board.zobrist_hash()
+            node_features, edge_index = board.to_graph()
+            pos_hash = graph_hash(node_features, edge_index)
             game_position_hashes[pos_hash] = game_position_hashes.get(pos_hash, 0) + 1
             
             # Check for three-fold repetition
@@ -155,14 +163,15 @@ def _add_position_if_unique(board, aggression, unique_positions, position_repeti
         unique_positions: Dictionary of unique positions (modified in-place)
         position_repetitions: Dictionary tracking repetition counts (modified in-place)
     """
-    pos_hash = board.zobrist_hash()
+    # Get graph representation and hash
+    node_features, edge_index = board.to_graph()
+    pos_hash = graph_hash(node_features, edge_index)
     
     # Track how many times we've seen this position
     position_repetitions[pos_hash] = position_repetitions.get(pos_hash, 0) + 1
     
     # Only add if we haven't seen it before
     if pos_hash not in unique_positions:
-        node_features, edge_index = board.to_graph()
         eval_score = board.get_evaluation(aggression)
         unique_positions[pos_hash] = (node_features, edge_index, eval_score)
 
