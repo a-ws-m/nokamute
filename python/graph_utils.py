@@ -28,8 +28,15 @@ def board_to_networkx(node_features, edge_index):
     # Create PyG Data object
     data = Data(x=x, edge_index=edge_index_tensor)
     
-    # Convert to NetworkX
+    # Convert to NetworkX - store node features individually per node
     G = to_networkx(data, node_attrs=['x'], to_undirected=True)
+    
+    # Ensure each node has its feature vector stored correctly
+    # to_networkx stores the feature for each node separately
+    for node_id in G.nodes():
+        if 'x' not in G.nodes[node_id]:
+            # Fallback: manually assign features if not present
+            G.nodes[node_id]['x'] = x[node_id]
     
     return G
 
@@ -83,7 +90,49 @@ def networkx_to_pyg(G):
     Returns:
         Tuple of (node_features, edge_index) as Python lists
     """
-    data = from_networkx(G, group_node_attrs=['x'])
+    # Check if the graph has the 'x' attribute on nodes
+    if len(G.nodes()) == 0:
+        return [], [[], []]
+    
+    # Verify that nodes have the 'x' attribute
+    first_node = list(G.nodes())[0]
+    if 'x' not in G.nodes[first_node]:
+        raise ValueError(f"NetworkX graph nodes missing 'x' attribute. Node {first_node} has attributes: {list(G.nodes[first_node].keys())}")
+    
+    try:
+        data = from_networkx(G, group_node_attrs=['x'])
+    except KeyError as e:
+        # If 'x' attribute is not found, try to extract features manually
+        print(f"Warning: Failed to convert NetworkX graph using from_networkx: {e}")
+        print(f"Attempting manual conversion...")
+        
+        # Manual conversion
+        node_features = []
+        node_mapping = {node: i for i, node in enumerate(G.nodes())}
+        
+        for node in sorted(G.nodes()):
+            node_data = G.nodes[node]
+            if 'x' in node_data:
+                x = node_data['x']
+                # Convert tensor to list if needed
+                if hasattr(x, 'numpy'):
+                    x = x.numpy().tolist()
+                elif hasattr(x, 'tolist'):
+                    x = x.tolist()
+                node_features.append(x)
+            else:
+                raise ValueError(f"Node {node} missing 'x' attribute")
+        
+        # Extract edges
+        edge_index = [[], []]
+        for u, v in G.edges():
+            edge_index[0].append(node_mapping[u])
+            edge_index[1].append(node_mapping[v])
+            # Add reverse edge for undirected graph
+            edge_index[0].append(node_mapping[v])
+            edge_index[1].append(node_mapping[u])
+        
+        return node_features, edge_index
     
     node_features = data.x.numpy().tolist()
     edge_index = data.edge_index.numpy().tolist()
