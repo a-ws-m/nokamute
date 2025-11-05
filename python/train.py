@@ -201,27 +201,25 @@ def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=
             is_terminal = (position_idx == len(game_data) - 1)
             
             if is_terminal:
-                # Terminal state: use final game result
-                if player.name == "White":
-                    td_target = final_result
-                else:
-                    td_target = -final_result
+                # Terminal state: use final game result (already absolute)
+                # final_result: White win = +1, Black win = -1, Draw = 0
+                td_target = final_result
             else:
                 # Non-terminal state: compute TD target using stored move value
                 # The move_value is the model's evaluation of the position AFTER applying the move
-                # This is equivalent to V(s_{t+1}) from the next position's perspective
+                # This is V(s_{t+1}) in absolute terms (positive = White winning)
                 
                 next_move_value = position_move_values.get((game_idx, position_idx))
                 
                 if next_move_value is not None:
-                    # move_value is from opponent's perspective (they evaluate the position they see)
-                    # We need it from current player's perspective, so negate it
-                    next_value = -next_move_value
+                    # move_value is already in absolute terms
+                    next_value = next_move_value
                 else:
                     # Fallback: no stored value available
                     next_value = 0.0
                 
                 # TD target: gamma * V(s_{t+1})
+                # Both current position and next position use absolute scale
                 td_target = gamma * next_value
             
             # Collect target for this position

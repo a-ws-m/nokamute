@@ -18,8 +18,9 @@ class HiveGNN(nn.Module):
     - Global pooling (mean + max)
     - MLP head for position evaluation
 
-    Output: Single scalar value representing position evaluation
-            Positive values favor the current player, negative favor opponent
+    Output: Single scalar value representing position evaluation on absolute scale:
+            Positive values favor White, negative values favor Black
+            +1.0 = White is winning, -1.0 = Black is winning, 0.0 = neutral/drawn
     """
 
     def __init__(
@@ -88,7 +89,7 @@ class HiveGNN(nn.Module):
             batch: Batch assignment for each node [num_nodes] (optional)
 
         Returns:
-            value: Position evaluation [-1, 1]
+            value: Position evaluation in [-1, 1] (absolute scale: +1 = White winning, -1 = Black winning)
             node_embeddings: Node-level embeddings for policy head
         """
         # Initial embedding

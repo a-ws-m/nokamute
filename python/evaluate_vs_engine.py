@@ -101,12 +101,21 @@ class MLPlayer:
         # Batch evaluate all moves using DataLoader
         move_values = self._batch_evaluate_moves(board, legal_moves)
 
+        # Values are absolute (positive = White winning, negative = Black winning)
+        # White wants to maximize, Black wants to minimize
+        # For move selection, we convert to player-relative utilities
+        current_player = board.to_move().name
+        if current_player == "White":
+            utilities = move_values  # White maximizes
+        else:
+            utilities = [-v for v in move_values]  # Black minimizes (so negate)
+
         # Select move based on temperature
         if self.temperature == 0:
-            best_idx = np.argmax(move_values)
+            best_idx = np.argmax(utilities)
             return legal_moves[best_idx]
         else:
-            values_array = np.array(move_values)
+            values_array = np.array(utilities)
             exp_values = np.exp(values_array / self.temperature)
             probs = exp_values / np.sum(exp_values)
             selected_idx = np.random.choice(len(legal_moves), p=probs)
@@ -122,7 +131,7 @@ class MLPlayer:
             legal_moves: List of legal moves
 
         Returns:
-            List of values for each move (from current player's perspective)
+            List of values for each move (absolute scale: +1 = White winning, -1 = Black winning)
         """
         from torch_geometric.data import Data, Batch
         
@@ -199,9 +208,9 @@ class MLPlayer:
             values = values.tolist()
 
         # Map values to zobrist hashes
+        # Values are absolute (positive = White winning, negative = Black winning)
         for zobrist_hash, value in zip(valid_hashes, values):
-            # Negate value (we want opponent's perspective after our move)
-            hash_to_value[zobrist_hash] = -value
+            hash_to_value[zobrist_hash] = value
         
         # Handle None positions
         for zobrist_hash, graph_data in hash_to_data.items():

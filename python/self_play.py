@@ -110,15 +110,23 @@ class SelfPlayGame:
         if move_values is None:
             move_values = self._batch_evaluate_moves(board, legal_moves)
         
-        # Compute softmax probabilities
+        # Values are absolute (positive = White winning, negative = Black winning)
+        # White wants to maximize, Black wants to minimize
+        # For move selection, we convert to player-relative utilities
+        if current_player == "White":
+            utilities = move_values  # White maximizes
+        else:
+            utilities = [-v for v in move_values]  # Black minimizes (so negate)
+        
+        # Compute softmax probabilities over utilities
         if self.temperature == 0:
             # Greedy: assign probability 1 to best move
-            best_idx = np.argmax(move_values)
+            best_idx = np.argmax(utilities)
             probs = np.zeros(len(legal_moves))
             probs[best_idx] = 1.0
         else:
             # Softmax with temperature
-            values_array = np.array(move_values)
+            values_array = np.array(utilities)
             exp_values = np.exp(values_array / self.temperature)
             probs = exp_values / np.sum(exp_values)
         
@@ -197,7 +205,7 @@ class SelfPlayGame:
             legal_moves: List of legal moves
 
         Returns:
-            List of values for each move (from current player's perspective)
+            List of values for each move (absolute scale: +1 = White winning, -1 = Black winning)
         """
         # Group moves by resulting graph hash to deduplicate equivalent positions
         hash_to_moves = {}  # graph_hash -> list of (move_idx, move)
@@ -268,9 +276,9 @@ class SelfPlayGame:
             values = values.tolist()
 
         # Map values to graph hashes
+        # Values are absolute (positive = White winning, negative = Black winning)
         for graph_hash_val, value in zip(valid_hashes, values):
-            # Negate value (we want opponent's perspective after our move)
-            hash_to_value[graph_hash_val] = -value
+            hash_to_value[graph_hash_val] = value
         
         # Handle None positions
         for graph_hash_val, graph_data in hash_to_data.items():
@@ -564,12 +572,9 @@ def prepare_training_data(games):
                 
                 position_data[pos_hash] = (node_features, edge_index)
 
-            # Flip result based on player perspective
-            # White = positive, Black = negative
-            if player.name == "White":
-                target_value = final_result
-            else:
-                target_value = -final_result
+            # Use absolute result (no player-based flipping)
+            # final_result is already absolute: White win = +1, Black win = -1, Draw = 0
+            target_value = final_result
 
             # Collect target for this position
             if pos_hash not in position_targets:
