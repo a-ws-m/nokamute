@@ -423,12 +423,12 @@ def main():
     parser = argparse.ArgumentParser(description="Train Hive GNN with self-play")
     parser.add_argument("--games", type=int, default=1, help="Games per iteration (default: 1 for TD learning)")
     parser.add_argument(
-        "--iterations", type=int, default=1000, help="Training iterations"
+        "--iterations", type=int, default=10000, help="Training iterations"
     )
-    parser.add_argument("--epochs", type=int, default=1, help="Epochs per iteration (default: 1 for TD learning)")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    parser.add_argument("--epochs", type=int, default=10, help="Epochs per iteration (default: 1 for TD learning)")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--hidden-dim", type=int, default=64, help="Hidden dimension")
+    parser.add_argument("--hidden-dim", type=int, default=32, help="Hidden dimension")
     parser.add_argument(
         "--num-layers", type=int, default=3, help="Number of GNN layers"
     )
@@ -450,26 +450,26 @@ def main():
     parser.add_argument(
         "--eval-interval",
         type=int,
-        default=100,
+        default=1000,
         help="Evaluate against engine every N iterations",
     )
     parser.add_argument(
         "--save-interval",
         type=int,
-        default=100,
+        default=10,
         help="Save model checkpoint every N iterations (default: 100)",
     )
     parser.add_argument(
         "--eval-games",
         type=int,
-        default=20,
+        default=10,
         help="Number of games per evaluation",
     )
     parser.add_argument(
         "--eval-depths",
         type=int,
         nargs="+",
-        default=[3],
+        default=[1, 2, 3],
         help="Engine depths to evaluate against",
     )
     parser.add_argument(
