@@ -161,30 +161,35 @@ def _add_position_if_unique(board, aggression, eval_depth, unique_positions):
         unique_positions[pos_hash] = (node_features, edge_index, eval_score)
 
 
-def _generate_positions_worker(args):
+def _generate_position_batch_worker(args):
     """
-    Worker function for multiprocessing position generation.
+    Worker function for generating a batch of positions.
+    
+    This generates positions in small batches (e.g., 10 at a time) to allow
+    frequent progress bar updates while preserving the branching behavior.
     
     Args:
-        args: Tuple of (positions_per_worker, aggression, max_depth, branch_probability, eval_depth, seed)
+        args: Tuple of (batch_size, aggression, max_depth, branch_probability, eval_depth, seed)
         
     Returns:
         List of (node_features, edge_index, eval_score) tuples
     """
-    positions_per_worker, aggression, max_depth, branch_probability, eval_depth, seed = args
+    batch_size, aggression, max_depth, branch_probability, eval_depth, seed = args
     
-    # Set random seed for this worker
+    # Set random seed for this batch
     random.seed(seed)
     
-    # Generate positions
-    return generate_random_positions_branching(
-        num_positions=positions_per_worker,
+    # Generate a batch of positions using the branching process
+    result = generate_random_positions_branching(
+        num_positions=batch_size,
         aggression=aggression,
         max_depth=max_depth,
         branch_probability=branch_probability,
         eval_depth=eval_depth,
-        verbose=False,  # Disable verbose in workers
+        verbose=False,
     )
+    
+    return result
 
 
 def _get_cache_key(num_positions: int, aggression: int, max_depth: int, 
@@ -225,7 +230,7 @@ def _get_cache_path(cache_dir: str, cache_key: str) -> Path:
 def generate_and_save_positions(
     num_positions: int = 1000,
     aggression: int = 3,
-    max_depth: int = 50,
+    max_depth: int = 200,
     branch_probability: float = 0.3,
     eval_depth: int = 0,
     cache_dir: str = "pretrain_cache",
@@ -242,7 +247,7 @@ def generate_and_save_positions(
     Args:
         num_positions: Total number of unique positions to generate
         aggression: Aggression level 1-5 for BasicEvaluator (default: 3)
-        max_depth: Maximum number of moves from start position (default: 50)
+        max_depth: Maximum number of moves from start position (default: 200)
         branch_probability: Probability of creating a branch point (default: 0.3)
         eval_depth: Search depth for minimax evaluation (default: 0 for static eval)
         cache_dir: Directory to store cached data (default: "pretrain_cache")
@@ -291,53 +296,58 @@ def generate_and_save_positions(
     # Create cache directory
     cache_data_dir.mkdir(parents=True, exist_ok=True)
     
-    # Divide work among workers
-    positions_per_worker = num_positions // num_workers
-    remainder = num_positions % num_workers
+    # Create work items - batch positions into groups for progress updates
+    batch_size = 10  # Generate this many positions per worker task
+    num_batches = (num_positions + batch_size - 1) // batch_size  # Ceiling division
     
-    # Create worker arguments
-    worker_args = []
-    for i in range(num_workers):
-        # Distribute remainder positions across first few workers
-        worker_positions = positions_per_worker + (1 if i < remainder else 0)
+    work_items = []
+    remaining = num_positions
+    for i in range(num_batches):
+        # Last batch might be smaller
+        current_batch_size = min(batch_size, remaining)
+        remaining -= current_batch_size
         seed = random.randint(0, 2**32 - 1)
-        worker_args.append((worker_positions, aggression, max_depth, branch_probability, eval_depth, seed))
+        work_items.append((current_batch_size, aggression, max_depth, branch_probability, eval_depth, seed))
     
     # Run workers in parallel
     if verbose:
-        print(f"\nRunning {num_workers} parallel workers...")
+        print(f"\nGenerating {num_positions} positions using {num_workers} workers...")
+        print(f"Processing in batches of {batch_size} positions for progress updates...")
+    
+    positions_list = []
     
     with Pool(num_workers) as pool:
         if verbose:
-            results = list(tqdm(
-                pool.imap(_generate_positions_worker, worker_args),
-                total=num_workers,
-                desc="Workers completed"
-            ))
+            # Use imap to process batches, updating progress bar for each batch
+            pbar = tqdm(total=num_positions, desc="Positions generated", unit="pos")
+            for batch in pool.imap(_generate_position_batch_worker, work_items):
+                positions_list.extend(batch)
+                pbar.update(len(batch))
+            pbar.close()
         else:
-            results = pool.map(_generate_positions_worker, worker_args)
+            for batch in pool.map(_generate_position_batch_worker, work_items):
+                positions_list.extend(batch)
     
-    # Combine results and save to disk
+    # Save positions to disk
     if verbose:
-        print("\nCombining results and saving to disk...")
+        print("\nSaving positions to disk...")
     
     total_positions = 0
     positions_per_file = 1000  # Save every 1000 positions to a file
     file_index = 0
     current_batch = []
     
-    for worker_result in results:
-        for position in worker_result:
-            current_batch.append(position)
-            total_positions += 1
-            
-            # Save batch when it reaches the target size
-            if len(current_batch) >= positions_per_file:
-                batch_file = cache_data_dir / f"positions_{file_index:06d}.pkl"
-                with open(batch_file, 'wb') as f:
-                    pickle.dump(current_batch, f)
-                file_index += 1
-                current_batch = []
+    for position in positions_list:
+        current_batch.append(position)
+        total_positions += 1
+        
+        # Save batch when it reaches the target size
+        if len(current_batch) >= positions_per_file:
+            batch_file = cache_data_dir / f"positions_{file_index:06d}.pkl"
+            with open(batch_file, 'wb') as f:
+                pickle.dump(current_batch, f)
+            file_index += 1
+            current_batch = []
     
     # Save any remaining positions
     if len(current_batch) > 0:
@@ -369,10 +379,7 @@ def generate_and_save_positions(
         
         # Show evaluation statistics
         if total_positions > 0:
-            all_evals = []
-            for worker_result in results:
-                for _, _, eval_score in worker_result:
-                    all_evals.append(eval_score)
+            all_evals = [eval_score for _, _, eval_score in positions_list]
             
             print(f"\nEvaluation statistics:")
             print(f"  Min: {min(all_evals):.2f}")
@@ -799,8 +806,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-depth",
         type=int,
-        default=50,
-        help="Maximum number of moves from start position (default: 50)"
+        default=200,
+        help="Maximum number of moves from start position (default: 200)"
     )
     parser.add_argument(
         "--branch-probability",
