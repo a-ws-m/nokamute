@@ -89,7 +89,10 @@ class HiveGNN(nn.Module):
             batch: Batch assignment for each node [num_nodes] (optional)
 
         Returns:
-            value: Position evaluation in [-1, 1] (absolute scale: +1 = White winning, -1 = Black winning)
+            value: Position evaluation in [-1, 1] on ABSOLUTE scale:
+                   +1 = White is winning (regardless of whose turn it is)
+                   -1 = Black is winning (regardless of whose turn it is)
+                    0 = neutral/drawn position
             node_embeddings: Node-level embeddings for policy head
         """
         # Initial embedding

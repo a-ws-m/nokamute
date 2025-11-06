@@ -264,21 +264,16 @@ def parse_game_log(
             # Determine if terminal
             is_terminal = (i == len(moves) - 1)
             
-            # Compute final result from perspective of player who just moved
-            # (the player who made the move that led to next_features)
-            current_player = board.to_move()  # This is the NEXT player to move
-            
-            # The player who just moved is the opposite color
-            if current_player.name == "Black":
-                player_who_moved = "White"
-            else:
-                player_who_moved = "Black"
-            
-            # Result from perspective of player who moved
-            if winner == player_who_moved:
+            # Compute final result on ABSOLUTE scale:
+            # Positive = White won, Negative = Black won, Zero = Draw
+            # This is independent of whose turn it is
+            if winner == "White":
                 final_result = 1.0
-            else:
+            elif winner == "Black":
                 final_result = -1.0
+            else:
+                # Draw (shouldn't happen in this data, but handle it)
+                final_result = 0.0
             
             transitions.append((
                 curr_features,
@@ -640,7 +635,7 @@ def train_epoch_streaming(
             
             # Compute TD target
             if is_terminal:
-                # Terminal state: target is the final result
+                # Terminal state: target is the final result (absolute scale)
                 td_target = final_result
             else:
                 # Non-terminal: compute V(s_{t+1}) using current model
@@ -655,8 +650,8 @@ def train_epoch_streaming(
                         next_value = next_value.item()
                     
                     # TD target: gamma * V(s_{t+1})
-                    # Note: We use final_result as the sign/direction since the value
-                    # estimate from the model is from the perspective of the player to move
+                    # Both next_value and final_result are on absolute scale
+                    # (positive = White advantage, negative = Black advantage)
                     td_target = gamma * next_value
                 else:
                     # Empty next state (shouldn't happen but handle gracefully)

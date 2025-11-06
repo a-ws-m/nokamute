@@ -219,14 +219,15 @@ def normalize_evaluation(eval_score: float, scale: float = 0.001) -> float:
     Normalize evaluation scores to [-1, 1] range using tanh-like scaling.
     
     Args:
-        eval_score: Raw evaluation score from BasicEvaluator
+        eval_score: Raw evaluation score from BasicEvaluator (absolute scale:
+                   positive = White advantage, negative = Black advantage)
         scale: Scaling factor (default: 0.001, which maps 1000 -> ~0.76)
         
     Returns:
-        Normalized score in approximately [-1, 1] range
+        Normalized score in approximately [-1, 1] range (absolute scale preserved)
     """
     # Use tanh to smoothly map to [-1, 1]
-    # This handles extreme values gracefully
+    # This handles extreme values gracefully while preserving the sign
     import torch
     return torch.tanh(torch.tensor(eval_score * scale)).item()
 

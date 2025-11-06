@@ -467,15 +467,25 @@ impl Board {
     ///     aggression: Aggression level 1-5 for the evaluator (default: 3)
     /// 
     /// Returns:
-    ///     i16: Evaluation score from the perspective of the player to move.
-    ///          Positive values favor the current player, negative favor opponent.
+    ///     i16: Evaluation score on absolute scale.
+    ///          Positive values favor White, negative values favor Black.
     fn get_evaluation(&self, aggression: Option<u8>) -> PyResult<i16> {
         use minimax::Evaluator;
         use crate::BasicEvaluator;
 
         let eval = BasicEvaluator::new(aggression.unwrap_or(3));
         let score = eval.evaluate(&self.inner);
-        Ok(score)
+        
+        // Convert from player-relative to absolute scale
+        // BasicEvaluator returns score from perspective of player to move
+        // We need to flip the sign if Black is to move
+        let absolute_score = if self.inner.to_move() == RustColor::Black {
+            -score
+        } else {
+            score
+        };
+        
+        Ok(absolute_score)
     }
 
     fn __repr__(&self) -> String {
