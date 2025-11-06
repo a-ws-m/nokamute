@@ -5,6 +5,7 @@ Main training script for self-play learning with GNN.
 import argparse
 import os
 import time
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -238,6 +239,153 @@ def prepare_td_training_data(games):
     return training_examples
 
 
+class ReplayBuffer:
+    """
+    Stores self-play games on disk for experience replay.
+    
+    For TD learning, we store raw game trajectories and recompute TD targets
+    on-the-fly during training, so that earlier games benefit from the improved
+    model's value estimates.
+    """
+    
+    def __init__(self, save_dir, max_size=None, use_mc=False):
+        """
+        Args:
+            save_dir: Directory to save replay buffer files
+            max_size: Maximum number of games to store (None = unlimited)
+            use_mc: Whether using Monte Carlo returns (affects data format)
+        """
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.max_size = max_size
+        self.use_mc = use_mc
+        
+        # Track stored games
+        self.game_files = []
+        self.total_games = 0
+        
+        # Load existing buffer state if available
+        self._load_buffer_state()
+    
+    def _get_buffer_state_path(self):
+        """Path to buffer metadata file."""
+        return self.save_dir / "buffer_state.pkl"
+    
+    def _load_buffer_state(self):
+        """Load buffer state from disk."""
+        state_path = self._get_buffer_state_path()
+        if state_path.exists():
+            with open(state_path, "rb") as f:
+                state = pickle.load(f)
+                self.game_files = state.get("game_files", [])
+                self.total_games = state.get("total_games", 0)
+                self.use_mc = state.get("use_mc", self.use_mc)
+    
+    def _save_buffer_state(self):
+        """Save buffer state to disk."""
+        state = {
+            "game_files": self.game_files,
+            "total_games": self.total_games,
+            "use_mc": self.use_mc,
+        }
+        with open(self._get_buffer_state_path(), "wb") as f:
+            pickle.dump(state, f)
+    
+    def add_games(self, games, iteration):
+        """
+        Add new games to the replay buffer.
+        
+        Args:
+            games: List of game tuples from self-play
+            iteration: Current training iteration (used for filename)
+        """
+        if len(games) == 0:
+            return
+        
+        # Save games to disk
+        filename = f"games_iter_{iteration}.pkl"
+        filepath = self.save_dir / filename
+        
+        with open(filepath, "wb") as f:
+            pickle.dump(games, f)
+        
+        self.game_files.append(str(filepath))
+        self.total_games += len(games)
+        
+        # Enforce max size if specified
+        if self.max_size is not None:
+            while self.total_games > self.max_size and len(self.game_files) > 0:
+                # Remove oldest file
+                old_file = Path(self.game_files[0])
+                if old_file.exists():
+                    # Load to count games before deleting
+                    with open(old_file, "rb") as f:
+                        old_games = pickle.load(f)
+                    self.total_games -= len(old_games)
+                    old_file.unlink()
+                
+                self.game_files.pop(0)
+        
+        # Save updated state
+        self._save_buffer_state()
+    
+    def load_all_games(self):
+        """
+        Load all games from the replay buffer.
+        
+        Returns:
+            List of all game tuples
+        """
+        all_games = []
+        
+        for filepath in self.game_files:
+            path = Path(filepath)
+            if path.exists():
+                with open(path, "rb") as f:
+                    games = pickle.load(f)
+                    all_games.extend(games)
+        
+        return all_games
+    
+    def sample_games(self, num_games):
+        """
+        Sample a random subset of games from the buffer.
+        
+        Args:
+            num_games: Number of games to sample
+            
+        Returns:
+            List of sampled game tuples
+        """
+        all_games = self.load_all_games()
+        
+        if len(all_games) <= num_games:
+            return all_games
+        
+        # Random sampling without replacement
+        import random
+        return random.sample(all_games, num_games)
+    
+    def get_stats(self):
+        """Get buffer statistics."""
+        return {
+            "total_games": self.total_games,
+            "num_files": len(self.game_files),
+            "use_mc": self.use_mc,
+        }
+    
+    def clear(self):
+        """Clear all games from the buffer."""
+        for filepath in self.game_files:
+            path = Path(filepath)
+            if path.exists():
+                path.unlink()
+        
+        self.game_files = []
+        self.total_games = 0
+        self._save_buffer_state()
+
+
 def evaluate_model(model, num_games=50, device="cpu", max_moves=400):
     """
     Evaluate model performance through self-play.
@@ -357,6 +505,31 @@ def main():
         type=int,
         default=400,
         help="Maximum number of moves per game before declaring a draw (default: 400)",
+    )
+    
+    # Replay buffer arguments
+    parser.add_argument(
+        "--replay-buffer",
+        action="store_true",
+        help="Enable experience replay: store games on disk and train on all accumulated games",
+    )
+    parser.add_argument(
+        "--replay-buffer-dir",
+        type=str,
+        default=None,
+        help="Directory to store replay buffer (default: <model-path>/replay_buffer)",
+    )
+    parser.add_argument(
+        "--replay-buffer-size",
+        type=int,
+        default=10000,
+        help="Maximum number of games to keep in replay buffer (default: 10000)",
+    )
+    parser.add_argument(
+        "--replay-sample-size",
+        type=int,
+        default=5000,
+        help="Number of games to sample from buffer for training each iteration (default: 5000, or all if fewer)",
     )
     
     # Pre-training arguments
@@ -560,6 +733,25 @@ def main():
         writer.close()
         return  # Exit after pre-training
 
+    # Initialize replay buffer if enabled
+    replay_buffer = None
+    if args.replay_buffer:
+        buffer_dir = args.replay_buffer_dir or os.path.join(args.model_path, "replay_buffer")
+        replay_buffer = ReplayBuffer(
+            save_dir=buffer_dir,
+            max_size=args.replay_buffer_size,
+            use_mc=args.use_mc,
+        )
+        print(f"\nReplay buffer enabled:")
+        print(f"  Directory: {buffer_dir}")
+        print(f"  Max size: {args.replay_buffer_size:,} games")
+        print(f"  Sample size: {args.replay_sample_size:,} games per iteration")
+        
+        # Load existing buffer stats
+        stats = replay_buffer.get_stats()
+        if stats["total_games"] > 0:
+            print(f"  Loaded existing buffer: {stats['total_games']:,} games in {stats['num_files']} files")
+
     # Training loop
     for iteration in range(start_iteration, args.iterations):
         print(f"\n{'='*60}")
@@ -598,14 +790,39 @@ def main():
             print(f"Collected {num_branches} branch points from {num_nodes} unique positions")
             player.clear_branch_cache()
 
+        # Add games to replay buffer if enabled
+        if replay_buffer is not None:
+            replay_buffer.add_games(games, iteration)
+            buffer_stats = replay_buffer.get_stats()
+            print(f"Replay buffer: {buffer_stats['total_games']} total games stored")
+
         # Prepare training data
         print("Preparing training data...")
+        
+        # Determine which games to use for training
+        if replay_buffer is not None:
+            # Use games from replay buffer
+            buffer_stats = replay_buffer.get_stats()
+            total_available = buffer_stats['total_games']
+            
+            # Sample if we have more games than sample size, otherwise use all
+            if total_available > args.replay_sample_size:
+                training_games = replay_buffer.sample_games(args.replay_sample_size)
+                print(f"Sampled {len(training_games)} games from replay buffer ({total_available} available)")
+            else:
+                training_games = replay_buffer.load_all_games()
+                print(f"Using all {len(training_games)} games from replay buffer")
+        else:
+            # Use only current iteration's games (original behavior)
+            training_games = games
+        
+        # Convert games to training data
         if args.use_mc:
             print("Using Monte Carlo returns")
-            training_data = prepare_training_data(games)
+            training_data = prepare_training_data(training_games)
         else:
             print(f"Using on-the-fly TD learning with gamma={args.gamma}")
-            training_data = prepare_td_training_data(games)
+            training_data = prepare_td_training_data(training_games)
         print(f"Training examples: {len(training_data)}")
 
         # Train for multiple epochs
@@ -626,6 +843,12 @@ def main():
             # Log to tensorboard
             global_step = iteration * args.epochs + epoch
             writer.add_scalar("Loss/train", loss, global_step)
+        
+        # Log replay buffer stats if enabled
+        if replay_buffer is not None:
+            buffer_stats = replay_buffer.get_stats()
+            writer.add_scalar("ReplayBuffer/total_games", buffer_stats["total_games"], iteration)
+            writer.add_scalar("ReplayBuffer/num_files", buffer_stats["num_files"], iteration)
 
         # Initialize eval_stats for checkpoint saving
         eval_stats = {}
@@ -807,31 +1030,33 @@ def main():
             
             # Save named checkpoint (only at eval intervals)
             checkpoint_path = os.path.join(args.model_path, f"model_iter_{iteration}.pt")
-            torch.save(
-                {
-                    "iteration": iteration + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "config": model_config,
-                    "eval_stats": eval_stats,
-                },
-                checkpoint_path,
-            )
+            checkpoint_data = {
+                "iteration": iteration + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "config": model_config,
+                "eval_stats": eval_stats,
+            }
+            if replay_buffer is not None:
+                checkpoint_data["replay_buffer_stats"] = replay_buffer.get_stats()
+            
+            torch.save(checkpoint_data, checkpoint_path)
             print(f"Saved checkpoint: {checkpoint_path}")
 
         # Save latest model at specified intervals (overwriting each time)
         if (iteration + 1) % args.save_interval == 0:
             latest_path = os.path.join(args.model_path, "model_latest.pt")
-            torch.save(
-                {
-                    "iteration": iteration + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "config": model_config,
-                    "eval_stats": eval_stats,
-                },
-                latest_path,
-            )
+            latest_data = {
+                "iteration": iteration + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "config": model_config,
+                "eval_stats": eval_stats,
+            }
+            if replay_buffer is not None:
+                latest_data["replay_buffer_stats"] = replay_buffer.get_stats()
+            
+            torch.save(latest_data, latest_path)
             print(f"Saved latest model: {latest_path}")
 
     writer.close()
