@@ -162,7 +162,8 @@ def evaluate_model(
         Dictionary with evaluation statistics
     """
     # Use SelfPlayGame instead of MLPlayer (same functionality, optimized batch eval)
-    ml_player = SelfPlayGame(model=model, temperature=0.1, device=device)
+    # Temperature=0 ensures greedy (best) move selection during evaluation
+    ml_player = SelfPlayGame(model=model, temperature=0, device=device)
     engine_player = EngineOpponent(depth=engine_depth)
     
     results = {

@@ -21,7 +21,8 @@ def play_interactive_game(model, device="cpu", human_first=True):
         human_first: Whether human plays first
     """
     board = nokamute.Board()
-    ai_player = SelfPlayGame(model=model, temperature=0.1, device=device)
+    # Temperature=0 ensures greedy (best) move selection during evaluation
+    ai_player = SelfPlayGame(model=model, temperature=0, device=device)
 
     print("\n" + "=" * 60)
     print("Interactive Game vs AI")
@@ -93,7 +94,8 @@ def evaluate_vs_random(model, num_games=100, device="cpu"):
     Returns:
         Win rate statistics
     """
-    ai_player = SelfPlayGame(model=model, temperature=0.1, device=device)
+    # Temperature=0 ensures greedy (best) move selection during evaluation
+    ai_player = SelfPlayGame(model=model, temperature=0, device=device)
     random_player = SelfPlayGame(model=None, temperature=1.0, device=device)
 
     results = {

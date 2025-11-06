@@ -404,7 +404,8 @@ def evaluate_model(model, num_games=50, device="cpu", max_moves=400):
     Returns:
         Statistics dictionary
     """
-    player = SelfPlayGame(model=model, temperature=0.1, device=device, max_moves=max_moves)
+    # Temperature=0 ensures greedy (best) move selection during evaluation
+    player = SelfPlayGame(model=model, temperature=0, device=device, max_moves=max_moves)
 
     results = {"wins": 0, "losses": 0, "draws": 0, "avg_game_length": 0}
     total_moves = 0
@@ -549,7 +550,13 @@ def main():
         "--pretrain-games",
         type=int,
         default=5,
-        help="Number of games to generate for pre-training (default: 10)",
+        help="Number of games to generate for human-games pre-training (default: 5)",
+    )
+    parser.add_argument(
+        "--pretrain-positions",
+        type=int,
+        default=100,
+        help="Number of positions to generate per epoch for eval-matching pre-training (default: 100)",
     )
     parser.add_argument(
         "--pretrain-depth",
@@ -595,6 +602,12 @@ def main():
         "--pretrain-stream-from-disk",
         action="store_true",
         help="Stream pre-training data from disk instead of loading into memory (memory-efficient for large datasets)",
+    )
+    parser.add_argument(
+        "--pretrain-eval-depth",
+        type=int,
+        default=0,
+        help="Search depth for minimax evaluation during eval-matching pre-training (default: 0 for static eval). Higher values use minimax to evaluate N moves ahead.",
     )
 
     args = parser.parse_args()
@@ -662,71 +675,72 @@ def main():
         if args.pretrain == "eval-matching":
             print(f"\nPre-training method: Evaluation Matching")
             print(f"Target: Match analytical BasicEvaluator scores")
+            print(f"Method: Branching Markov chain random position generation")
             
-            # Determine data file path
-            if args.pretrain_data_path:
-                data_file_path = args.pretrain_data_path
-            else:
-                # Auto-generate path based on settings
-                data_filename = f"pretrain_eval_d{args.pretrain_depth}_g{args.pretrain_games}_r{int(args.pretrain_randomness*100)}.pkl"
-                data_file_path = os.path.join(args.model_path, data_filename)
-            
-            # Load or generate pre-training data
-            if os.path.exists(data_file_path):
-                print(f"\nLoading existing pre-training data from: {data_file_path}")
-                pretrain_data = load_eval_data(data_file_path)
-            else:
-                print(f"\nGenerating new pre-training data...")
-                print(f"  Games: {args.pretrain_games}")
-                print(f"  Engine depth: {args.pretrain_depth}")
-                print(f"  Randomness rate: {args.pretrain_randomness}")
-                print(f"  Max moves per game: {args.max_moves}")
-                
-                pretrain_data = generate_eval_matching_data(
-                    num_games=args.pretrain_games,
-                    depth=args.pretrain_depth,
-                    aggression=3,
-                    randomness_rate=args.pretrain_randomness,
-                    max_moves=args.max_moves,
-                    verbose=True,
-                )
-                
-                # Always save generated data for future use
-                print(f"\nSaving pre-training data to: {data_file_path}")
-                save_eval_data(pretrain_data, data_file_path)
-            
-            # Pre-train the model
+            # Pre-train the model using the new branching approach
+            # This generates fresh random positions each epoch
             print(f"\nPre-training for {args.epochs} epochs...")
+            print(f"Positions per epoch: {args.pretrain_positions}")
             print(f"Batch size: {args.batch_size}")
             print(f"Learning rate: {args.lr}")
+            print(f"Max depth for random walks: {min(args.max_moves, 50)}")
+            print(f"Branch probability: 0.3")
+            print(f"Evaluation depth: {args.pretrain_eval_depth} (0=static, >0=minimax)")
+            print(f"Saving checkpoints every {args.save_interval} epochs")
+            
+            # Define checkpoint save path
+            pretrain_model_path = os.path.join(args.model_path, "model_eval_matching_latest.pt")
+            
+            # Define epoch callback for tensorboard logging and checkpoint saving
+            def epoch_callback(epoch, loss):
+                # Log to tensorboard
+                writer.add_scalar("Pretrain/Loss", loss, epoch)
+                
+                # Save checkpoint at intervals
+                if (epoch + 1) % args.save_interval == 0:
+                    torch.save({
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "pretrain_method": args.pretrain,
+                        "pretrain_loss": loss,
+                        "config": model_config,
+                        "pretrain_positions": args.pretrain_positions,
+                        "pretrain_eval_depth": args.pretrain_eval_depth,
+                        "epoch": epoch + 1,
+                        "total_epochs": args.epochs,
+                    }, pretrain_model_path)
+                    print(f"  Checkpoint saved at epoch {epoch + 1}: {pretrain_model_path}")
             
             pretrain_losses = pretrain_eval_matching(
                 model=model,
-                training_data=pretrain_data,
+                num_positions_per_epoch=args.pretrain_positions,
                 optimizer=optimizer,
                 num_epochs=args.epochs,
                 batch_size=args.batch_size,
                 device=args.device,
+                aggression=3,
+                max_depth=min(args.max_moves, 50),
+                branch_probability=0.3,
+                eval_depth=args.pretrain_eval_depth,
+                scale=0.001,
+                regenerate_each_epoch=True,  # Fresh positions each epoch
                 verbose=True,
+                epoch_callback=epoch_callback,
             )
             
-            # Log to tensorboard
-            for epoch, loss in enumerate(pretrain_losses):
-                writer.add_scalar("Pretrain/Loss", loss, epoch)
-            
-            # Save pre-trained model
-            pretrain_model_path = os.path.join(args.model_path, "model_pretrained.pt")
+            # Save final pre-trained model
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "pretrain_method": args.pretrain,
                 "pretrain_loss": pretrain_losses[-1],
                 "config": model_config,
-                "pretrain_games": args.pretrain_games,
-                "pretrain_depth": args.pretrain_depth,
-                "epochs": args.epochs,
+                "pretrain_positions": args.pretrain_positions,
+                "pretrain_eval_depth": args.pretrain_eval_depth,
+                "epoch": args.epochs,
+                "total_epochs": args.epochs,
             }, pretrain_model_path)
-            print(f"\nPre-trained model saved to: {pretrain_model_path}")
+            print(f"\nFinal pre-trained model saved to: {pretrain_model_path}")
             print(f"Final pre-training loss: {pretrain_losses[-1]:.6f}")
             
             # Evaluate pre-trained model against engine
@@ -794,6 +808,10 @@ def main():
             print(f"Batch size: {args.batch_size}")
             print(f"Learning rate: {args.lr}")
             print(f"Gamma (TD discount): {args.gamma}")
+            print(f"Saving checkpoints every {args.save_interval} epochs")
+            
+            # Define checkpoint save path
+            pretrain_model_path = os.path.join(args.model_path, "model_human_games_latest.pt")
             
             epoch_losses = []
             for epoch in range(args.epochs):
@@ -815,9 +833,23 @@ def main():
                 
                 # Log to tensorboard
                 writer.add_scalar("Pretrain/Loss", epoch_loss, epoch)
+                
+                # Save checkpoint at intervals
+                if (epoch + 1) % args.save_interval == 0:
+                    torch.save({
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "pretrain_method": args.pretrain,
+                        "pretrain_loss": epoch_loss,
+                        "config": model_config,
+                        "pretrain_num_transitions": len(dataset),
+                        "epoch": epoch + 1,
+                        "total_epochs": args.epochs,
+                        "pretrain_streaming": args.pretrain_stream_from_disk,
+                    }, pretrain_model_path)
+                    print(f"  Checkpoint saved at epoch {epoch + 1}: {pretrain_model_path}")
             
-            # Save pre-trained model
-            pretrain_model_path = os.path.join(args.model_path, "model_pretrained.pt")
+            # Save final pre-trained model
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -825,10 +857,11 @@ def main():
                 "pretrain_loss": epoch_losses[-1],
                 "config": model_config,
                 "pretrain_num_transitions": len(dataset),
-                "epochs": args.epochs,
+                "epoch": args.epochs,
+                "total_epochs": args.epochs,
                 "pretrain_streaming": args.pretrain_stream_from_disk,
             }, pretrain_model_path)
-            print(f"\nPre-trained model saved to: {pretrain_model_path}")
+            print(f"\nFinal pre-trained model saved to: {pretrain_model_path}")
             print(f"Final pre-training loss: {epoch_losses[-1]:.6f}")
             
             # Evaluate pre-trained model against engine

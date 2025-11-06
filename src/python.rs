@@ -201,11 +201,11 @@ impl Board {
     }
 
     /// Convert board state to a graph representation
-    /// 
+    ///
     /// Returns (node_features, edge_index) as Python lists.
     /// The returned graph should be converted to NetworkX format in Python
     /// using the graph_utils.board_to_networkx() function.
-    /// 
+    ///
     /// For position equivalence checking, use graph_utils.graph_hash()
     /// which implements Weisfeiler-Lehman graph hashing instead of zobrist_hash().
     fn to_graph(&self, py: Python) -> PyResult<PyObject> {
@@ -350,62 +350,58 @@ impl Board {
     }
 
     /// Parse a game string in UHP format and create a board
-    /// 
+    ///
     /// Format: "GameType;GameState;Turn;MoveString1;MoveString2;..."
     /// Example: "Base+MLP;InProgress;White[1];wQ;bQ wQ-;wA1 bQ-;..."
-    /// 
+    ///
     /// Args:
     ///     game_string: UHP format game string
-    /// 
+    ///
     /// Returns:
     ///     Board: New board with moves applied, or error if invalid
     #[staticmethod]
     fn from_game_string(game_string: &str) -> PyResult<Self> {
-        RustBoard::from_game_string(game_string)
-            .map(|inner| Board { inner })
-            .map_err(|e| match e {
-                crate::notation::UhpError::InvalidGameString(s) => {
-                    pyo3::exceptions::PyValueError::new_err(format!("Invalid game string: {}", s))
-                }
-                crate::notation::UhpError::InvalidMove(s) => {
-                    pyo3::exceptions::PyValueError::new_err(format!("Invalid move: {}", s))
-                }
-                crate::notation::UhpError::InvalidGameType(s) => {
-                    pyo3::exceptions::PyValueError::new_err(format!("Invalid game type: {}", s))
-                }
-                e => pyo3::exceptions::PyValueError::new_err(format!("Parse error: {:?}", e))
-            })
+        RustBoard::from_game_string(game_string).map(|inner| Board { inner }).map_err(|e| match e {
+            crate::notation::UhpError::InvalidGameString(s) => {
+                pyo3::exceptions::PyValueError::new_err(format!("Invalid game string: {}", s))
+            }
+            crate::notation::UhpError::InvalidMove(s) => {
+                pyo3::exceptions::PyValueError::new_err(format!("Invalid move: {}", s))
+            }
+            crate::notation::UhpError::InvalidGameType(s) => {
+                pyo3::exceptions::PyValueError::new_err(format!("Invalid game type: {}", s))
+            }
+            e => pyo3::exceptions::PyValueError::new_err(format!("Parse error: {:?}", e)),
+        })
     }
 
     /// Parse a single move string in UHP format
-    /// 
+    ///
     /// Examples:
     ///   - "wQ" (place white queen on first move)
     ///   - "bQ wQ-" (place black queen east of white queen)
     ///   - "wA1 bQ/" (move white ant to northeast of black queen)
     ///   - "pass" (pass turn)
-    /// 
+    ///
     /// Args:
     ///     move_string: UHP format move string
-    /// 
+    ///
     /// Returns:
     ///     Turn: Parsed turn, or error if invalid
     fn parse_move(&self, move_string: &str) -> PyResult<Turn> {
-        self.inner.from_move_string(move_string)
-            .map(|inner| Turn { inner })
-            .map_err(|e| match e {
-                crate::notation::UhpError::InvalidMove(s) => {
-                    pyo3::exceptions::PyValueError::new_err(format!("Invalid move: {}", s))
-                }
-                e => pyo3::exceptions::PyValueError::new_err(format!("Parse error: {:?}", e))
-            })
+        self.inner.from_move_string(move_string).map(|inner| Turn { inner }).map_err(|e| match e {
+            crate::notation::UhpError::InvalidMove(s) => {
+                pyo3::exceptions::PyValueError::new_err(format!("Invalid move: {}", s))
+            }
+            e => pyo3::exceptions::PyValueError::new_err(format!("Parse error: {:?}", e)),
+        })
     }
 
     /// Convert a turn to UHP move string format
-    /// 
+    ///
     /// Args:
     ///     turn: The turn to convert
-    /// 
+    ///
     /// Returns:
     ///     str: Move string in UHP format
     fn to_move_string(&self, turn: &Turn) -> String {
@@ -413,7 +409,7 @@ impl Board {
     }
 
     /// Get the game log (move history) as a semicolon-separated string
-    /// 
+    ///
     /// Returns:
     ///     str: Game log in UHP format (e.g., "wQ;bQ wQ-;wA1 bQ/")
     fn get_game_log(&self) -> String {
@@ -426,17 +422,19 @@ impl Board {
     }
 
     /// Get the best move according to the minimax engine
-    /// 
+    ///
     /// Args:
     ///     depth: Search depth for minimax (default: 3)
     ///     time_limit_ms: Time limit in milliseconds (optional, overrides depth)
     ///     aggression: Aggression level 1-5 for the evaluator (default: 3)
-    /// 
+    ///
     /// Returns:
     ///     Turn: Best move according to the engine, or None if game is over
-    fn get_engine_move(&self, depth: Option<u8>, time_limit_ms: Option<u64>, aggression: Option<u8>) -> PyResult<Option<Turn>> {
-        use minimax::{Game, Strategy};
+    fn get_engine_move(
+        &self, depth: Option<u8>, time_limit_ms: Option<u64>, aggression: Option<u8>,
+    ) -> PyResult<Option<Turn>> {
         use crate::BasicEvaluator;
+        use minimax::{Game, Strategy};
         use std::time::Duration;
 
         // Check if game is over
@@ -445,12 +443,10 @@ impl Board {
         }
 
         let eval = BasicEvaluator::new(aggression.unwrap_or(3));
-        let opts = minimax::IterativeOptions::new()
-            .verbose()
-            .with_table_byte_size(100 << 20);
-        
+        let opts = minimax::IterativeOptions::new().verbose().with_table_byte_size(100 << 20);
+
         let mut strategy = minimax::IterativeSearch::new(eval, opts);
-        
+
         if let Some(time_ms) = time_limit_ms {
             strategy.set_timeout(Duration::from_millis(time_ms));
         } else {
@@ -462,29 +458,71 @@ impl Board {
     }
 
     /// Get the analytical evaluation of the current position
-    /// 
+    ///
     /// Args:
     ///     aggression: Aggression level 1-5 for the evaluator (default: 3)
-    /// 
+    ///     depth: Search depth for minimax evaluation (default: 0 for static eval)
+    ///            If depth > 0, returns the minimax evaluation after N moves
+    ///
     /// Returns:
     ///     i16: Evaluation score on absolute scale.
     ///          Positive values favor White, negative values favor Black.
-    fn get_evaluation(&self, aggression: Option<u8>) -> PyResult<i16> {
-        use minimax::Evaluator;
+    fn get_evaluation(&self, aggression: Option<u8>, depth: Option<u8>) -> PyResult<i16> {
         use crate::BasicEvaluator;
+        use minimax::{Evaluator, Strategy};
 
         let eval = BasicEvaluator::new(aggression.unwrap_or(3));
-        let score = eval.evaluate(&self.inner);
-        
+        let depth = depth.unwrap_or(0);
+
+        let score = if depth == 0 {
+            // Static evaluation
+            eval.evaluate(&self.inner)
+        } else {
+            // Minimax evaluation at given depth
+            // Use principal_variation to get the sequence of best moves
+            use minimax::Negamax;
+            let mut strategy = Negamax::new(eval, depth);
+            let mut board_copy = self.inner.clone();
+
+            // Run the search first (this populates the principal variation)
+            let best_move = strategy.choose_move(&board_copy);
+
+            if best_move.is_none() {
+                // No moves available (game over or no legal moves)
+                return Ok(eval.evaluate(&self.inner) as i16);
+            }
+
+            // Get the principal variation (best line of play for both sides)
+            let pv = strategy.principal_variation();
+
+            if pv.is_empty() {
+                // Fallback to static eval if PV is empty
+                eval.evaluate(&self.inner)
+            } else {
+                // Apply all moves in the principal variation
+                for &mv in &pv {
+                    board_copy.apply(mv);
+                }
+
+                // Evaluate the resulting position
+                // We need to account for whose turn it is after the PV
+                let mut pv_score = eval.evaluate(&board_copy);
+
+                // If the PV has an odd number of moves, the evaluation is from the opponent's perspective
+                // and we need to negate it
+                if pv.len() % 2 == 1 {
+                    pv_score = -pv_score;
+                }
+
+                pv_score
+            }
+        };
+
         // Convert from player-relative to absolute scale
         // BasicEvaluator returns score from perspective of player to move
         // We need to flip the sign if Black is to move
-        let absolute_score = if self.inner.to_move() == RustColor::Black {
-            -score
-        } else {
-            score
-        };
-        
+        let absolute_score = if self.inner.to_move() == RustColor::Black { -score } else { score };
+
         Ok(absolute_score)
     }
 
