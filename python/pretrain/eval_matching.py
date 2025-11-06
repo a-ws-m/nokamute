@@ -314,40 +314,91 @@ def generate_and_save_positions(
         print(f"\nGenerating {num_positions} positions using {num_workers} workers...")
         print(f"Processing in batches of {batch_size} positions for progress updates...")
     
-    positions_list = []
+    # Initialize counters for incremental saving
+    total_positions = 0
+    positions_per_file = 1000  # Save every 1000 positions to a file
+    file_index = 0
+    current_batch = []
+    
+    # Track statistics without keeping all positions in memory
+    eval_min = float('inf')
+    eval_max = float('-inf')
+    eval_sum = 0.0
+    eval_count = 0
+    # For median, we use a sampling approach to avoid storing all values
+    # Sample up to 10,000 values for median calculation
+    eval_samples_for_median = []
+    median_sample_size = 10000
+    median_sampling_probability = 1.0  # Start at 100%, will decrease as we get more samples
     
     with Pool(num_workers) as pool:
         if verbose:
             # Use imap to process batches, updating progress bar for each batch
             pbar = tqdm(total=num_positions, desc="Positions generated", unit="pos")
             for batch in pool.imap(_generate_position_batch_worker, work_items):
-                positions_list.extend(batch)
+                # Process each position in the batch
+                for position in batch:
+                    current_batch.append(position)
+                    total_positions += 1
+                    
+                    # Update statistics
+                    _, _, eval_score = position
+                    eval_min = min(eval_min, eval_score)
+                    eval_max = max(eval_max, eval_score)
+                    eval_sum += eval_score
+                    eval_count += 1
+                    
+                    # Reservoir sampling for median approximation
+                    if len(eval_samples_for_median) < median_sample_size:
+                        eval_samples_for_median.append(eval_score)
+                    else:
+                        # Dynamically adjust sampling probability
+                        median_sampling_probability = median_sample_size / eval_count
+                        if random.random() < median_sampling_probability:
+                            # Replace a random sample
+                            eval_samples_for_median[random.randint(0, median_sample_size - 1)] = eval_score
+                    
+                    # Save batch when it reaches the target size
+                    if len(current_batch) >= positions_per_file:
+                        batch_file = cache_data_dir / f"positions_{file_index:06d}.pkl"
+                        with open(batch_file, 'wb') as f:
+                            pickle.dump(current_batch, f)
+                        file_index += 1
+                        current_batch = []
+                
                 pbar.update(len(batch))
             pbar.close()
         else:
             for batch in pool.map(_generate_position_batch_worker, work_items):
-                positions_list.extend(batch)
-    
-    # Save positions to disk
-    if verbose:
-        print("\nSaving positions to disk...")
-    
-    total_positions = 0
-    positions_per_file = 1000  # Save every 1000 positions to a file
-    file_index = 0
-    current_batch = []
-    
-    for position in positions_list:
-        current_batch.append(position)
-        total_positions += 1
-        
-        # Save batch when it reaches the target size
-        if len(current_batch) >= positions_per_file:
-            batch_file = cache_data_dir / f"positions_{file_index:06d}.pkl"
-            with open(batch_file, 'wb') as f:
-                pickle.dump(current_batch, f)
-            file_index += 1
-            current_batch = []
+                # Process each position in the batch
+                for position in batch:
+                    current_batch.append(position)
+                    total_positions += 1
+                    
+                    # Update statistics
+                    _, _, eval_score = position
+                    eval_min = min(eval_min, eval_score)
+                    eval_max = max(eval_max, eval_score)
+                    eval_sum += eval_score
+                    eval_count += 1
+                    
+                    # Reservoir sampling for median approximation
+                    if len(eval_samples_for_median) < median_sample_size:
+                        eval_samples_for_median.append(eval_score)
+                    else:
+                        # Dynamically adjust sampling probability
+                        median_sampling_probability = median_sample_size / eval_count
+                        if random.random() < median_sampling_probability:
+                            # Replace a random sample
+                            eval_samples_for_median[random.randint(0, median_sample_size - 1)] = eval_score
+                    
+                    # Save batch when it reaches the target size
+                    if len(current_batch) >= positions_per_file:
+                        batch_file = cache_data_dir / f"positions_{file_index:06d}.pkl"
+                        with open(batch_file, 'wb') as f:
+                            pickle.dump(current_batch, f)
+                        file_index += 1
+                        current_batch = []
     
     # Save any remaining positions
     if len(current_batch) > 0:
@@ -379,13 +430,13 @@ def generate_and_save_positions(
         
         # Show evaluation statistics
         if total_positions > 0:
-            all_evals = [eval_score for _, _, eval_score in positions_list]
-            
             print(f"\nEvaluation statistics:")
-            print(f"  Min: {min(all_evals):.2f}")
-            print(f"  Max: {max(all_evals):.2f}")
-            print(f"  Mean: {sum(all_evals) / len(all_evals):.2f}")
-            print(f"  Median: {sorted(all_evals)[len(all_evals) // 2]:.2f}")
+            print(f"  Min: {eval_min:.2f}")
+            print(f"  Max: {eval_max:.2f}")
+            print(f"  Mean: {eval_sum / eval_count:.2f}")
+            if eval_samples_for_median:
+                median_val = sorted(eval_samples_for_median)[len(eval_samples_for_median) // 2]
+                print(f"  Median (approx): {median_val:.2f}")
     
     return str(cache_data_dir)
 
