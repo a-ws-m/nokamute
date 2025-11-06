@@ -34,17 +34,20 @@ except ImportError:
     print("Warning: Pre-training modules not available")
 
 
-def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu", gamma=0.99):
+def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu", gamma=0.99, use_mc=False):
     """
-    Train the model for one epoch using temporal difference learning.
+    Train the model for one epoch using temporal difference learning or Monte Carlo returns.
 
     Args:
         model: GNN model
-        training_data: List of (node_features, edge_index, td_target)
+        training_data: List of tuples:
+            - For TD: (node_features, edge_index, next_node_features, next_edge_index, is_terminal, final_result)
+            - For MC: (node_features, edge_index, mc_return)
         optimizer: Optimizer
         batch_size: Batch size
         device: Device to train on
         gamma: TD discount factor (default: 0.99)
+        use_mc: If True, use Monte Carlo returns; if False, use TD learning (default: False)
 
     Returns:
         Average loss for the epoch
@@ -53,187 +56,184 @@ def train_epoch(model, training_data, optimizer, batch_size=32, device="cpu", ga
     total_loss = 0
     num_batches = 0
 
-    # Convert training data to PyG Data objects with targets
-    data_list = []
-    for node_features, edge_index, td_target in training_data:
-        if len(node_features) == 0:
-            continue
+    if use_mc:
+        # Monte Carlo mode: training_data = [(node_features, edge_index, mc_return), ...]
+        data_list = []
+        for node_features, edge_index, mc_return in training_data:
+            if len(node_features) == 0:
+                continue
 
-        x = torch.tensor(node_features, dtype=torch.float32)
-        edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
+            x = torch.tensor(node_features, dtype=torch.float32)
+            edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
 
-        data = Data(x=x, edge_index=edge_index_tensor)
-        # Store target as a graph-level attribute
-        data.y = torch.tensor([td_target], dtype=torch.float32)
-        data_list.append(data)
+            data = Data(x=x, edge_index=edge_index_tensor)
+            data.y = torch.tensor([mc_return], dtype=torch.float32)
+            data_list.append(data)
 
-    if len(data_list) == 0:
-        return 0.0
+        if len(data_list) == 0:
+            return 0.0
 
-    # Use DataLoader for efficient batching and shuffling
-    loader = DataLoader(data_list, batch_size=batch_size, shuffle=True)
+        loader = DataLoader(data_list, batch_size=batch_size, shuffle=True)
 
-    for batch in loader:
-        batch = batch.to(device)
+        for batch in loader:
+            batch = batch.to(device)
 
-        # Forward pass
-        optimizer.zero_grad()
-        predictions, _ = model(batch.x, batch.edge_index, batch.batch)
+            optimizer.zero_grad()
+            predictions, _ = model(batch.x, batch.edge_index, batch.batch)
 
-        # Extract targets from batch
-        targets = batch.y.unsqueeze(1) if batch.y.dim() == 1 else batch.y
+            targets = batch.y.unsqueeze(1) if batch.y.dim() == 1 else batch.y
+            loss = F.mse_loss(predictions, targets)
 
-        # Compute TD loss (MSE between predicted value and TD target)
-        loss = F.mse_loss(predictions, targets)
+            loss.backward()
+            optimizer.step()
 
-        # Backward pass
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-        num_batches += 1
+            total_loss += loss.item()
+            num_batches += 1
+    else:
+        # TD mode: compute targets on-the-fly using current model
+        # training_data = [(curr_features, curr_edge_index, next_features, next_edge_index, is_terminal, final_result), ...]
+        
+        # We can't easily batch this with DataLoader since we need to evaluate next states
+        # Instead, we'll process in mini-batches manually
+        
+        # Shuffle the data
+        indices = list(range(len(training_data)))
+        import random
+        random.shuffle(indices)
+        
+        for batch_start in range(0, len(training_data), batch_size):
+            batch_end = min(batch_start + batch_size, len(training_data))
+            batch_indices = indices[batch_start:batch_end]
+            
+            curr_states = []
+            td_targets_list = []
+            
+            for idx in batch_indices:
+                item = training_data[idx]
+                if len(item) != 6:
+                    continue
+                    
+                curr_features, curr_edge_index, next_features, next_edge_index, is_terminal, final_result = item
+                
+                if len(curr_features) == 0:
+                    continue
+                
+                # Add current state
+                x_curr = torch.tensor(curr_features, dtype=torch.float32, device=device)
+                edge_index_curr = torch.tensor(curr_edge_index, dtype=torch.long, device=device)
+                curr_states.append(Data(x=x_curr, edge_index=edge_index_curr))
+                
+                # Compute TD target
+                if is_terminal:
+                    # Terminal state: use final result
+                    td_targets_list.append(final_result)
+                else:
+                    # Non-terminal: evaluate next state with current model (no grad)
+                    if next_features is not None and len(next_features) > 0:
+                        with torch.no_grad():
+                            x_next = torch.tensor(next_features, dtype=torch.float32, device=device)
+                            edge_index_next = torch.tensor(next_edge_index, dtype=torch.long, device=device)
+                            next_batch = torch.zeros(len(x_next), dtype=torch.long, device=device)
+                            
+                            next_value, _ = model(x_next, edge_index_next, next_batch)
+                            td_targets_list.append(gamma * next_value[0].item())
+                    else:
+                        td_targets_list.append(0.0)
+            
+            if len(curr_states) == 0:
+                continue
+            
+            # Batch current states
+            batch = Batch.from_data_list(curr_states).to(device)
+            td_targets = torch.tensor(td_targets_list, dtype=torch.float32, device=device).unsqueeze(1)
+            
+            # Forward pass on current states
+            optimizer.zero_grad()
+            curr_values, _ = model(batch.x, batch.edge_index, batch.batch)
+            
+            # Compute TD loss
+            loss = F.mse_loss(curr_values, td_targets)
+            
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
 
     return total_loss / max(num_batches, 1)
 
 
-def prepare_td_training_data(games, model, device="cpu", gamma=0.99, batch_size=32):
+def prepare_td_training_data(games):
     """
-    Prepare training data using semi-gradient TD(0) learning.
+    Prepare training data for on-the-fly TD learning.
     
-    This implements the semi-gradient form where we update parameters based on:
-    TD target: V(s_t) = r_t + gamma * V(s_{t+1})
+    This function extracts state transitions from self-play games. During training,
+    the TD targets will be computed on-the-fly using the current model's evaluation
+    of the next state: TD_target = gamma * V(s_{t+1}) for non-terminal states.
     
-    Where:
-    - V(s_t) is the value of current state (trainable)
-    - r_t is the immediate reward (0 for non-terminal states)
-    - V(s_{t+1}) is the value of next state (from stored move evaluation or model)
-    
-    The "semi-gradient" aspect means we do NOT backpropagate through V(s_{t+1}),
-    treating it as a fixed target. This is the standard approach in TD learning.
-    
-    For terminal states: V(s_terminal) = final_result
-    
-    This implementation uses stored move evaluations from self-play to avoid
-    redundant computation. During self-play, we already evaluated the position
-    resulting from each selected move. We reuse those cached values here.
-    
-    Optimization steps:
-    1. Extract stored move values from game data
-    2. Use stored values for TD target computation (no re-evaluation needed)
-    3. Handle multiple results for the same position by averaging
+    This allows the model to continuously update its value estimates based on its
+    current understanding, implementing true temporal difference learning.
     
     Args:
         games: List of (game_data, result, branch_id) tuples from self-play
-               Each game_data contains (nx_graph, legal_moves, selected_move, player, pos_hash, move_value)
-        model: Current model (kept for compatibility, may be used for fallback)
-        device: Device to run model on (kept for compatibility)
-        gamma: Discount factor for future rewards
-        batch_size: Batch size (kept for compatibility)
+               Each game_data contains (nx_graph, legal_moves, selected_move, player, pos_hash, [move_value])
         
     Returns:
-        training_examples: List of (node_features, edge_index, td_target)
+        training_examples: List of (curr_features, curr_edge_index, next_features, next_edge_index, is_terminal, final_result)
     """
     from graph_utils import networkx_to_pyg
     
-    # Group games by branch_id for efficient processing
-    branch_groups = {}  # branch_id -> list of (game_data, result)
+    training_examples = []
+    
     for game_data, final_result, branch_id in games:
-        if branch_id not in branch_groups:
-            branch_groups[branch_id] = []
-        branch_groups[branch_id].append((game_data, final_result))
-    
-    print(f"  Games grouped into {len(branch_groups)} branches")
-    
-    # Phase 1: Extract stored move values and build index
-    # Map (game_idx, position_idx) -> stored move_value (evaluation of position AFTER move)
-    position_move_values = {}
-    # Track all position data: pos_hash -> (node_features, edge_index)
-    position_data = {}
-    
-    for game_idx, (game_data, final_result, branch_id) in enumerate(games):
-        for position_idx, item in enumerate(game_data):
-            # New format with move_value: (nx_graph, legal_moves, selected_move, player, pos_hash, move_value)
-            if len(item) == 6:
-                nx_graph, legal_moves, selected_move, player, pos_hash, move_value = item
-            elif len(item) == 5:
-                # Old format without move_value (fallback to None)
-                nx_graph, legal_moves, selected_move, player, pos_hash = item
-                move_value = None
-            else:
-                continue
-            
-            # Convert NetworkX graph to PyG format
-            node_features, edge_index = networkx_to_pyg(nx_graph)
-            
-            # Skip empty boards
-            if len(node_features) == 0:
-                continue
-            
-            # Store position data if not seen before
-            if pos_hash not in position_data:
-                position_data[pos_hash] = (node_features, edge_index)
-            
-            # Store the move value for this specific game position
-            position_move_values[(game_idx, position_idx)] = move_value
-    
-    print(f"  Using {len(position_move_values)} stored move evaluations (no re-evaluation needed)")
-    
-    # Phase 2: Compute TD targets using stored move values
-    # Collect all (pos_hash, td_target) pairs to handle duplicates
-    position_targets = {}  # pos_hash -> list of TD targets
-    
-    for game_idx, (game_data, final_result, branch_id) in enumerate(games):
         if len(game_data) == 0:
             continue
         
         # Process each position in the game
         for position_idx, item in enumerate(game_data):
-            # Extract position info
-            if len(item) == 6:
-                nx_graph, legal_moves, selected_move, player, pos_hash, move_value = item
-            elif len(item) == 5:
-                nx_graph, legal_moves, selected_move, player, pos_hash = item
-                move_value = None
+            # Extract position info (handle both old and new formats)
+            if len(item) >= 5:
+                nx_graph = item[0]
+                pos_hash = item[4]
             else:
                 continue
             
-            # Determine if this is the last position
+            # Convert NetworkX graph to PyG format
+            curr_features, curr_edge_index = networkx_to_pyg(nx_graph)
+            
+            # Skip empty boards
+            if len(curr_features) == 0:
+                continue
+            
+            # Determine if this is the last position (terminal state)
             is_terminal = (position_idx == len(game_data) - 1)
             
             if is_terminal:
-                # Terminal state: use final game result (already absolute)
-                # final_result: White win = +1, Black win = -1, Draw = 0
-                td_target = final_result
+                # Terminal state: no next state
+                training_examples.append((
+                    curr_features,
+                    curr_edge_index,
+                    None,  # next_features
+                    None,  # next_edge_index
+                    True,  # is_terminal
+                    final_result  # final game result
+                ))
             else:
-                # Non-terminal state: compute TD target using stored move value
-                # The move_value is the model's evaluation of the position AFTER applying the move
-                # This is V(s_{t+1}) in absolute terms (positive = White winning)
-                
-                next_move_value = position_move_values.get((game_idx, position_idx))
-                
-                if next_move_value is not None:
-                    # move_value is already in absolute terms
-                    next_value = next_move_value
-                else:
-                    # Fallback: no stored value available
-                    next_value = 0.0
-                
-                # TD target: gamma * V(s_{t+1})
-                # Both current position and next position use absolute scale
-                td_target = gamma * next_value
-            
-            # Collect target for this position
-            if pos_hash not in position_targets:
-                position_targets[pos_hash] = []
-            position_targets[pos_hash].append(td_target)
-    
-    # Phase 3: Average targets for positions with multiple outcomes
-    training_examples = []
-    for pos_hash, (node_features, edge_index) in position_data.items():
-        if pos_hash in position_targets:
-            targets = position_targets[pos_hash]
-            avg_target = sum(targets) / len(targets)
-            training_examples.append((node_features, edge_index, avg_target))
+                # Non-terminal state: get next state
+                next_item = game_data[position_idx + 1]
+                if len(next_item) >= 5:
+                    next_nx_graph = next_item[0]
+                    next_features, next_edge_index = networkx_to_pyg(next_nx_graph)
+                    
+                    training_examples.append((
+                        curr_features,
+                        curr_edge_index,
+                        next_features,
+                        next_edge_index,
+                        False,  # is_terminal
+                        final_result  # for reference (not used in non-terminal TD)
+                    ))
     
     return training_examples
 
@@ -273,11 +273,11 @@ def evaluate_model(model, num_games=50, device="cpu", max_moves=400):
 
 def main():
     parser = argparse.ArgumentParser(description="Train Hive GNN with self-play")
-    parser.add_argument("--games", type=int, default=100, help="Games per iteration")
+    parser.add_argument("--games", type=int, default=1, help="Games per iteration (default: 1 for TD learning)")
     parser.add_argument(
         "--iterations", type=int, default=1000, help="Training iterations"
     )
-    parser.add_argument("--epochs", type=int, default=10, help="Epochs per iteration")
+    parser.add_argument("--epochs", type=int, default=1, help="Epochs per iteration (default: 1 for TD learning)")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--hidden-dim", type=int, default=64, help="Hidden dimension")
@@ -337,9 +337,9 @@ def main():
         help="TD learning discount factor (default: 0.99)",
     )
     parser.add_argument(
-        "--use-td",
+        "--use-mc",
         action="store_true",
-        help="Use semi-gradient TD(0) learning instead of Monte Carlo returns (defaults to 1 game, 1 epoch per iteration)",
+        help="Use Monte Carlo returns instead of TD learning (all moves in a game get same final result)",
     )
     parser.add_argument(
         "--enable-branching",
@@ -400,21 +400,21 @@ def main():
 
     args = parser.parse_args()
 
-    # When using TD learning, default to 1 game and 1 epoch per iteration
+    # When using Monte Carlo, suggest more games and epochs per iteration
     # unless explicitly overridden by user
-    if args.use_td:
+    if args.use_mc:
         # Check if user explicitly set these values
         import sys
         games_explicitly_set = '--games' in sys.argv
         epochs_explicitly_set = '--epochs' in sys.argv
         
-        if not games_explicitly_set and args.games == 100:  # 100 is the default
-            args.games = 1
-            print("TD learning mode: defaulting to 1 game per iteration")
+        if not games_explicitly_set and args.games == 1:  # 1 is the default
+            args.games = 100
+            print("Monte Carlo mode: defaulting to 100 games per iteration")
         
-        if not epochs_explicitly_set and args.epochs == 10:  # 10 is the default
-            args.epochs = 1
-            print("TD learning mode: defaulting to 1 epoch per iteration")
+        if not epochs_explicitly_set and args.epochs == 1:  # 1 is the default
+            args.epochs = 10
+            print("Monte Carlo mode: defaulting to 10 epochs per iteration")
 
     # Create checkpoint directory
     Path(args.model_path).mkdir(parents=True, exist_ok=True)
@@ -600,14 +600,12 @@ def main():
 
         # Prepare training data
         print("Preparing training data...")
-        if args.use_td:
-            print(f"Using semi-gradient TD(0) with gamma={args.gamma}")
-            training_data = prepare_td_training_data(
-                games, model, device=args.device, gamma=args.gamma, batch_size=args.batch_size
-            )
-        else:
+        if args.use_mc:
             print("Using Monte Carlo returns")
             training_data = prepare_training_data(games)
+        else:
+            print(f"Using on-the-fly TD learning with gamma={args.gamma}")
+            training_data = prepare_td_training_data(games)
         print(f"Training examples: {len(training_data)}")
 
         # Train for multiple epochs
@@ -620,6 +618,7 @@ def main():
                 batch_size=args.batch_size,
                 device=args.device,
                 gamma=args.gamma,
+                use_mc=args.use_mc,
             )
 
             print(f"Epoch {epoch + 1}/{args.epochs}, Loss: {loss:.6f}")
