@@ -349,6 +349,77 @@ impl Board {
         pieces
     }
 
+    /// Parse a game string in UHP format and create a board
+    /// 
+    /// Format: "GameType;GameState;Turn;MoveString1;MoveString2;..."
+    /// Example: "Base+MLP;InProgress;White[1];wQ;bQ wQ-;wA1 bQ-;..."
+    /// 
+    /// Args:
+    ///     game_string: UHP format game string
+    /// 
+    /// Returns:
+    ///     Board: New board with moves applied, or error if invalid
+    #[staticmethod]
+    fn from_game_string(game_string: &str) -> PyResult<Self> {
+        RustBoard::from_game_string(game_string)
+            .map(|inner| Board { inner })
+            .map_err(|e| match e {
+                crate::notation::UhpError::InvalidGameString(s) => {
+                    pyo3::exceptions::PyValueError::new_err(format!("Invalid game string: {}", s))
+                }
+                crate::notation::UhpError::InvalidMove(s) => {
+                    pyo3::exceptions::PyValueError::new_err(format!("Invalid move: {}", s))
+                }
+                crate::notation::UhpError::InvalidGameType(s) => {
+                    pyo3::exceptions::PyValueError::new_err(format!("Invalid game type: {}", s))
+                }
+                e => pyo3::exceptions::PyValueError::new_err(format!("Parse error: {:?}", e))
+            })
+    }
+
+    /// Parse a single move string in UHP format
+    /// 
+    /// Examples:
+    ///   - "wQ" (place white queen on first move)
+    ///   - "bQ wQ-" (place black queen east of white queen)
+    ///   - "wA1 bQ/" (move white ant to northeast of black queen)
+    ///   - "pass" (pass turn)
+    /// 
+    /// Args:
+    ///     move_string: UHP format move string
+    /// 
+    /// Returns:
+    ///     Turn: Parsed turn, or error if invalid
+    fn parse_move(&self, move_string: &str) -> PyResult<Turn> {
+        self.inner.from_move_string(move_string)
+            .map(|inner| Turn { inner })
+            .map_err(|e| match e {
+                crate::notation::UhpError::InvalidMove(s) => {
+                    pyo3::exceptions::PyValueError::new_err(format!("Invalid move: {}", s))
+                }
+                e => pyo3::exceptions::PyValueError::new_err(format!("Parse error: {:?}", e))
+            })
+    }
+
+    /// Convert a turn to UHP move string format
+    /// 
+    /// Args:
+    ///     turn: The turn to convert
+    /// 
+    /// Returns:
+    ///     str: Move string in UHP format
+    fn to_move_string(&self, turn: &Turn) -> String {
+        self.inner.to_move_string(turn.inner)
+    }
+
+    /// Get the game log (move history) as a semicolon-separated string
+    /// 
+    /// Returns:
+    ///     str: Game log in UHP format (e.g., "wQ;bQ wQ-;wA1 bQ/")
+    fn get_game_log(&self) -> String {
+        self.inner.game_log()
+    }
+
     /// Get the hash of the board position
     fn zobrist_hash(&self) -> u64 {
         Rules::zobrist_hash(&self.inner)

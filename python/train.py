@@ -29,6 +29,11 @@ try:
         save_eval_data,
         load_eval_data,
     )
+    from pretrain.human_games import (
+        generate_human_games_data,
+        save_human_games_data,
+        load_human_games_data,
+    )
     PRETRAIN_AVAILABLE = True
 except ImportError:
     PRETRAIN_AVAILABLE = False
@@ -536,7 +541,7 @@ def main():
     parser.add_argument(
         "--pretrain",
         type=str,
-        choices=["eval-matching", "none"],
+        choices=["eval-matching", "human-games", "none"],
         default="none",
         help="Pre-training method to use (runs pre-training only, then exits)",
     )
@@ -569,6 +574,23 @@ def main():
         type=str,
         default=None,
         help="Path to saved pre-training data (auto-generated if not provided)",
+    )
+    parser.add_argument(
+        "--pretrain-sheet-urls",
+        type=str,
+        nargs="+",
+        default=[
+            "https://docs.google.com/spreadsheets/d/1d4YW6PDdYYSH8sGDQ-FB1zmdNJhNU-f2811o5JxMqsc/edit?gid=1437601135#gid=1437601135",
+            # Note: Second spreadsheet has poor data quality (~26% parseable)
+            "https://docs.google.com/spreadsheets/d/1JGc6hbmQITjqF-MLiW4AGZ24VpAFgN802EY179RrPII/edit?gid=194203898#gid=194203898",
+        ],
+        help="Google Sheets URLs for human games pre-training (default: high-quality tournament games)",
+    )
+    parser.add_argument(
+        "--pretrain-max-games",
+        type=int,
+        default=None,
+        help="Maximum number of human games to use for pre-training (default: all available)",
     )
 
     args = parser.parse_args()
@@ -715,6 +737,109 @@ def main():
                 verbose=True,
             )
             
+            print("\nPre-training evaluation results:")
+            for depth, results in pretrain_eval_results.items():
+                print(f"  vs Depth {depth}: {results}")
+        
+        elif args.pretrain == "human-games":
+            print(f"\nPre-training method: Human Games TD Learning")
+            print(f"Target: Learn from human game positions using TD learning")
+            
+            # Determine data file path
+            if args.pretrain_data_path:
+                data_file_path = args.pretrain_data_path
+            else:
+                # Auto-generate path based on settings
+                max_games_str = f"_max{args.pretrain_max_games}" if args.pretrain_max_games else "_all"
+                data_filename = f"pretrain_human{max_games_str}.pkl"
+                data_file_path = os.path.join(args.model_path, data_filename)
+            
+            # Load or generate pre-training data
+            if os.path.exists(data_file_path):
+                print(f"\nLoading existing pre-training data from: {data_file_path}")
+                pretrain_data = load_human_games_data(data_file_path)
+            else:
+                print(f"\nDownloading and parsing human games...")
+                print(f"  Sheet URLs: {len(args.pretrain_sheet_urls)} sheets")
+                if args.pretrain_max_games:
+                    print(f"  Max games: {args.pretrain_max_games}")
+                else:
+                    print(f"  Max games: all available")
+                
+                pretrain_data = generate_human_games_data(
+                    sheet_urls=args.pretrain_sheet_urls,
+                    game_type="Base+MLP",
+                    max_games=args.pretrain_max_games,
+                    verbose=True,
+                )
+                
+                if len(pretrain_data) == 0:
+                    print("\nError: No valid training data generated from human games.")
+                    print("Please check the sheet URLs and game log format.")
+                    return
+                
+                # Save generated data for future use
+                print(f"\nSaving pre-training data to: {data_file_path}")
+                save_human_games_data(pretrain_data, data_file_path)
+            
+            # Pre-train the model using TD learning
+            # We use the same train_epoch function with use_mc=False
+            print(f"\nPre-training with TD learning for {args.pretrain_epochs} epochs...")
+            print(f"Training transitions: {len(pretrain_data)}")
+            print(f"Batch size: {args.batch_size}")
+            print(f"Learning rate: {args.lr}")
+            print(f"Gamma (TD discount): {args.gamma}")
+            
+            epoch_losses = []
+            for epoch in range(args.pretrain_epochs):
+                epoch_loss = train_epoch(
+                    model=model,
+                    training_data=pretrain_data,
+                    optimizer=optimizer,
+                    batch_size=args.batch_size,
+                    device=args.device,
+                    gamma=args.gamma,
+                    use_mc=False,  # Use TD learning
+                )
+                
+                epoch_losses.append(epoch_loss)
+                
+                if (epoch + 1) % 10 == 0 or epoch == 0:
+                    print(f"Epoch {epoch + 1}/{args.pretrain_epochs}: Loss = {epoch_loss:.6f}")
+                
+                # Log to tensorboard
+                writer.add_scalar("Pretrain/Loss", epoch_loss, epoch)
+            
+            # Save pre-trained model
+            pretrain_model_path = os.path.join(args.model_path, "model_pretrained.pt")
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "pretrain_method": args.pretrain,
+                "pretrain_loss": epoch_losses[-1],
+                "config": model_config,
+                "pretrain_num_transitions": len(pretrain_data),
+                "pretrain_epochs": args.pretrain_epochs,
+            }, pretrain_model_path)
+            print(f"\nPre-trained model saved to: {pretrain_model_path}")
+            print(f"Final pre-training loss: {epoch_losses[-1]:.6f}")
+            
+            # Evaluate pre-trained model against engine
+            print("\nEvaluating pre-trained model against engine...")
+            pretrain_eval_results = evaluate_and_update_elo(
+                model=model,
+                elo_tracker=elo_tracker,
+                model_name="model_pretrained",
+                engine_depths=args.eval_depths,
+                games_per_depth=args.eval_games,
+                device=args.device,
+                verbose=True,
+            )
+            
+            print("\nPre-training evaluation results:")
+            for depth, results in pretrain_eval_results.items():
+                print(f"  vs Depth {depth}: {results}")
+            
             current_elo = elo_tracker.get_rating("model_pretrained")
             print(f"\nPre-trained model ELO: {current_elo:.1f}")
             writer.add_scalar("Pretrain/ELO", current_elo, 0)
@@ -725,7 +850,7 @@ def main():
             print("=" * 60)
             print(f"\nPre-trained model: {pretrain_model_path}")
             print(f"Training data: {data_file_path}")
-            print(f"Final loss: {pretrain_losses[-1]:.6f}")
+            print(f"Final loss: {epoch_losses[-1]:.6f}")
             print(f"ELO rating: {current_elo:.1f}")
             print("\nTo continue with self-play training, run:")
             print(f"  python train.py --resume {pretrain_model_path} --iterations N")
