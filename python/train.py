@@ -797,13 +797,7 @@ def main():
             
             epoch_losses = []
             for epoch in range(args.epochs):
-                # Always show progress bar for first epoch, then every 10 epochs
-                show_progress = (epoch == 0 or (epoch + 1) % 10 == 0)
-                
-                # Print epoch start for non-verbose epochs so user knows it's working
-                if not show_progress:
-                    print(f"Epoch {epoch + 1}/{args.epochs}...", end='', flush=True)
-                
+                # Always show progress bar for every epoch
                 epoch_loss = train_epoch_streaming(
                     model=model,
                     dataset=dataset,
@@ -811,16 +805,13 @@ def main():
                     batch_size=args.batch_size,
                     device=args.device,
                     gamma=args.gamma,
-                    verbose=show_progress,
+                    verbose=True,  # Always show progress bar
                 )
                 
                 epoch_losses.append(epoch_loss)
                 
-                # Print loss (always, to show progress)
-                if show_progress:
-                    print(f"Epoch {epoch + 1}/{args.epochs}: Loss = {epoch_loss:.6f}")
-                else:
-                    print(f" Loss = {epoch_loss:.6f}")
+                # Print epoch summary
+                print(f"Epoch {epoch + 1}/{args.epochs}: Loss = {epoch_loss:.6f}")
                 
                 # Log to tensorboard
                 writer.add_scalar("Pretrain/Loss", epoch_loss, epoch)

@@ -541,15 +541,15 @@ def load_human_games_data(filepath: str) -> List[Tuple]:
     return data
 
 
-class HumanGamesDataset:
+class HumanGamesDataset(torch.utils.data.IterableDataset):
     """
-    Dataset class for human games transitions.
+    Dataset class for human games transitions compatible with PyTorch Geometric DataLoader.
     
     Supports two modes:
     1. In-memory mode: All transitions are stored in memory (default, faster)
     2. Streaming mode: Transitions are loaded from disk on-demand (memory-efficient)
     
-    This class can be used with PyTorch DataLoader or iterated directly.
+    This class is compatible with PyTorch Geometric's DataLoader for efficient mini-batching.
     """
     
     def __init__(
@@ -558,6 +558,8 @@ class HumanGamesDataset:
         shuffle: bool = True, 
         verbose: bool = True,
         streaming: Optional[bool] = None,  # Auto-detect if None
+        gamma: float = 0.99,  # TD discount factor
+        device: str = "cpu",  # Device for next-state value computation
     ):
         """
         Initialize the dataset.
@@ -569,9 +571,15 @@ class HumanGamesDataset:
             verbose: Print loading information
             streaming: Force streaming mode (True) or in-memory mode (False).
                       If None (default), auto-detect based on data_source type.
+            gamma: TD learning discount factor (used when converting transitions to PyG Data)
+            device: Device for next-state value computation during TD target calculation
         """
+        super().__init__()
         self.shuffle = shuffle
         self.verbose = verbose
+        self.gamma = gamma
+        self.device = device
+        self.model = None  # Will be set externally before training
         
         # Auto-detect mode if not specified
         if streaming is None:
@@ -632,13 +640,70 @@ class HumanGamesDataset:
         """Return total number of transitions."""
         return self.metadata['total_transitions']
     
+    def set_model(self, model):
+        """
+        Set the model for TD target computation.
+        
+        Args:
+            model: GNN model to use for computing V(s_{t+1}) in non-terminal states
+        """
+        self.model = model
+    
+    def _transition_to_pyg_data(self, transition):
+        """
+        Convert a transition tuple to a PyG Data object with TD target.
+        
+        Args:
+            transition: Tuple of (curr_features, curr_edge_index, next_features, 
+                                 next_edge_index, is_terminal, final_result)
+        
+        Returns:
+            PyG Data object with current state features and TD target as label
+        """
+        curr_features, curr_edge_index, next_features, next_edge_index, is_terminal, final_result = transition
+        
+        # Skip empty states
+        if len(curr_features) == 0:
+            return None
+        
+        # Create PyG Data object for current state
+        curr_x = torch.tensor(curr_features, dtype=torch.float32)
+        curr_edge_index_tensor = torch.tensor(curr_edge_index, dtype=torch.long)
+        
+        # Compute TD target
+        if is_terminal:
+            # Terminal state: target is the final result (absolute scale)
+            td_target = final_result
+        else:
+            # Non-terminal: compute V(s_{t+1}) using current model
+            if len(next_features) > 0 and self.model is not None:
+                next_x = torch.tensor(next_features, dtype=torch.float32, device=self.device)
+                next_edge_index_tensor = torch.tensor(next_edge_index, dtype=torch.long, device=self.device)
+                
+                with torch.no_grad():
+                    # Create batch with single item for next state
+                    next_batch = torch.zeros(len(next_features), dtype=torch.long, device=self.device)
+                    next_value, _ = self.model(next_x, next_edge_index_tensor, next_batch)
+                    next_value = next_value.item()
+                
+                # TD target: gamma * V(s_{t+1})
+                td_target = self.gamma * next_value
+            else:
+                # Empty next state or no model available - use final result
+                td_target = final_result
+        
+        # Create PyG Data object with TD target as label
+        data = Data(x=curr_x, edge_index=curr_edge_index_tensor)
+        data.y = torch.tensor([td_target], dtype=torch.float32)
+        
+        return data
+    
     def __iter__(self):
         """
-        Iterate over all transitions.
+        Iterate over all transitions as PyG Data objects.
         
         Yields:
-            Transition tuples: (curr_features, curr_edge_index, next_features, 
-                               next_edge_index, is_terminal, final_result)
+            PyG Data objects with current state and TD target
         """
         if self.streaming:
             # Streaming mode: read from disk
@@ -655,9 +720,11 @@ class HumanGamesDataset:
                 if self.shuffle:
                     random.shuffle(transitions)
                 
-                # Yield each transition
+                # Yield each transition as PyG Data
                 for transition in transitions:
-                    yield transition
+                    data = self._transition_to_pyg_data(transition)
+                    if data is not None:
+                        yield data
         else:
             # In-memory mode: iterate over transitions in memory
             transitions_to_yield = list(self.transitions_memory or [])
@@ -665,28 +732,9 @@ class HumanGamesDataset:
                 random.shuffle(transitions_to_yield)
             
             for transition in transitions_to_yield:
-                yield transition
-    
-    def iter_batches(self, batch_size: int):
-        """
-        Iterate over transitions in batches, streaming from disk.
-        
-        Args:
-            batch_size: Number of transitions per batch
-            
-        Yields:
-            List of transition tuples (batch)
-        """
-        batch = []
-        for transition in self:
-            batch.append(transition)
-            if len(batch) >= batch_size:
-                yield batch
-                batch = []
-        
-        # Yield remaining items
-        if len(batch) > 0:
-            yield batch
+                data = self._transition_to_pyg_data(transition)
+                if data is not None:
+                    yield data
     
     def get_metadata(self):
         """Return dataset metadata."""
@@ -703,92 +751,58 @@ def train_epoch_streaming(
     verbose: bool = True,
 ):
     """
-    Train the model for one epoch using TD learning.
+    Train the model for one epoch using TD learning with PyTorch Geometric DataLoader.
     
-    This function works with HumanGamesDataset in both streaming and in-memory modes.
+    This function uses PyTorch Geometric's DataLoader for efficient mini-batching
+    of graph data. The dataset should be a HumanGamesDataset instance (streaming or in-memory).
     
     Args:
         model: GNN model
         dataset: HumanGamesDataset instance (streaming or in-memory)
         optimizer: Optimizer
-        batch_size: Batch size
+        batch_size: Batch size for mini-batching
         device: Device to train on
-        gamma: TD discount factor
+        gamma: TD discount factor (should match dataset's gamma)
         verbose: Print progress
         
     Returns:
         Average loss for the epoch
     """
     model.train()
+    
+    # Set model in dataset for TD target computation
+    dataset.set_model(model)
+    dataset.gamma = gamma
+    dataset.device = device
+    
+    # Create PyTorch Geometric DataLoader for efficient batching
+    # Note: For IterableDataset, we don't shuffle in DataLoader (dataset handles it)
+    loader = DataLoader(
+        dataset, 
+        batch_size=batch_size,
+        shuffle=False,  # Dataset handles shuffling internally
+    )
+    
     total_loss = 0.0
     num_batches = 0
     
     # Create progress bar if verbose
-    batch_iter = dataset.iter_batches(batch_size)
     if verbose:
         try:
-            from tqdm import tqdm
-            batch_iter = tqdm(
-                batch_iter,
-                desc="Training",
-                total=len(dataset) // batch_size
-            )
+            loader = tqdm(loader, desc="Training")
         except ImportError:
             pass  # tqdm not available, continue without progress bar
     
-    for batch_transitions in batch_iter:
-        curr_states = []
-        td_targets_list = []
+    for batch in loader:
+        # Move batch to device
+        batch = batch.to(device)
         
-        for transition in batch_transitions:
-            curr_features, curr_edge_index, next_features, next_edge_index, is_terminal, final_result = transition
-            
-            # Skip empty states
-            if len(curr_features) == 0:
-                continue
-            
-            # Create PyG Data object for current state
-            curr_x = torch.tensor(curr_features, dtype=torch.float32)
-            curr_edge_index_tensor = torch.tensor(curr_edge_index, dtype=torch.long)
-            curr_data = Data(x=curr_x, edge_index=curr_edge_index_tensor)
-            curr_states.append(curr_data)
-            
-            # Compute TD target
-            if is_terminal:
-                # Terminal state: target is the final result (absolute scale)
-                td_target = final_result
-            else:
-                # Non-terminal: compute V(s_{t+1}) using current model
-                if len(next_features) > 0:
-                    next_x = torch.tensor(next_features, dtype=torch.float32, device=device)
-                    next_edge_index_tensor = torch.tensor(next_edge_index, dtype=torch.long, device=device)
-                    
-                    with torch.no_grad():
-                        # Create batch with single item for next state
-                        next_batch = torch.zeros(len(next_features), dtype=torch.long, device=device)
-                        next_value, _ = model(next_x, next_edge_index_tensor, next_batch)
-                        next_value = next_value.item()
-                    
-                    # TD target: gamma * V(s_{t+1})
-                    # Both next_value and final_result are on absolute scale
-                    # (positive = White advantage, negative = Black advantage)
-                    td_target = gamma * next_value
-                else:
-                    # Empty next state (shouldn't happen but handle gracefully)
-                    td_target = final_result
-            
-            td_targets_list.append(td_target)
-        
-        if len(curr_states) == 0:
-            continue
-        
-        # Batch current states
-        batch = Batch.from_data_list(curr_states).to(device)
-        td_targets = torch.tensor(td_targets_list, dtype=torch.float32, device=device).unsqueeze(1)
-        
-        # Forward pass on current states
+        # Forward pass
         optimizer.zero_grad()
         curr_values, _ = model(batch.x, batch.edge_index, batch.batch)
+        
+        # TD targets are already computed in the dataset
+        td_targets = batch.y.unsqueeze(1) if batch.y.dim() == 1 else batch.y
         
         # Compute TD loss
         loss = F.mse_loss(curr_values, td_targets)
@@ -801,8 +815,8 @@ def train_epoch_streaming(
         num_batches += 1
         
         # Update progress bar (if tqdm is available)
-        if verbose and hasattr(batch_iter, 'set_postfix'):
-            batch_iter.set_postfix({"loss": f"{loss.item():.6f}"})
+        if verbose and hasattr(loader, 'set_postfix'):
+            loader.set_postfix({"loss": f"{loss.item():.6f}"})
     
     return total_loss / max(num_batches, 1)
 
@@ -837,24 +851,19 @@ if __name__ == "__main__":
     print(f"\nDataset contains {len(dataset_memory)} transitions")
     print(f"Metadata: {dataset_memory.get_metadata()}")
     
-    # Test iteration
-    print("\nTesting iteration (first 3 transitions):")
-    for i, transition in enumerate(dataset_memory):
+    # Test iteration with PyG DataLoader
+    print("\nTesting PyG DataLoader iteration (batch_size=2, first 3 batches):")
+    loader = DataLoader(dataset_memory, batch_size=2)
+    for i, batch in enumerate(loader):
         if i >= 3:
             break
-        curr_features, curr_edge_index, next_features, next_edge_index, is_terminal, final_result = transition
-        print(f"\nTransition {i+1}:")
-        print(f"  Current state nodes: {len(curr_features)}")
-        print(f"  Next state nodes: {len(next_features)}")
-        print(f"  Is terminal: {is_terminal}")
-        print(f"  Final result: {final_result}")
-    
-    # Test batch iteration
-    print("\nTesting batch iteration (batch_size=2):")
-    for i, batch in enumerate(dataset_memory.iter_batches(batch_size=2)):
-        if i >= 2:
-            break
-        print(f"Batch {i+1}: {len(batch)} transitions")
+        print(f"\nBatch {i+1}:")
+        print(f"  Batch size: {batch.num_graphs}")
+        print(f"  Total nodes: {batch.num_nodes}")
+        print(f"  Total edges: {batch.num_edges}")
+        print(f"  Node features shape: {batch.x.shape}")
+        print(f"  Edge index shape: {batch.edge_index.shape}")
+        print(f"  TD targets: {batch.y}")
     
     # Test 2: Generate small dataset with streaming
     print("\n" + "="*60)
@@ -876,14 +885,16 @@ if __name__ == "__main__":
     print(f"\nDataset contains {len(dataset_streaming)} transitions")
     print(f"Metadata: {dataset_streaming.get_metadata()}")
     
-    # Test iteration
-    print("\nTesting iteration (first 3 transitions):")
-    for i, transition in enumerate(dataset_streaming):
+    # Test PyG DataLoader with streaming
+    print("\nTesting PyG DataLoader with streaming (batch_size=2, first 3 batches):")
+    loader = DataLoader(dataset_streaming, batch_size=2)
+    for i, batch in enumerate(loader):
         if i >= 3:
             break
-        curr_features, curr_edge_index, next_features, next_edge_index, is_terminal, final_result = transition
-        print(f"\nTransition {i+1}:")
-        print(f"  Current state nodes: {len(curr_features)}")
-        print(f"  Next state nodes: {len(next_features)}")
-        print(f"  Is terminal: {is_terminal}")
-        print(f"  Final result: {final_result}")
+        print(f"\nBatch {i+1}:")
+        print(f"  Batch size: {batch.num_graphs}")
+        print(f"  Total nodes: {batch.num_nodes}")
+        print(f"  Total edges: {batch.num_edges}")
+        print(f"  Node features shape: {batch.x.shape}")
+        print(f"  Edge index shape: {batch.edge_index.shape}")
+        print(f"  TD targets: {batch.y}")
