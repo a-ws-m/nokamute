@@ -10,6 +10,7 @@ import torch
 import nokamute
 from elo_tracker import EloTracker
 from model import HiveGNN
+from self_play import SelfPlayGame
 
 
 class EngineOpponent:
@@ -44,187 +45,6 @@ class EngineOpponent:
             time_limit_ms=self.time_limit_ms,
             aggression=self.aggression,
         )
-
-
-class MLPlayer:
-    """
-    Player that uses the trained GNN model.
-    """
-
-    def __init__(self, model: HiveGNN, temperature: float = 0.1, device: str = "cpu"):
-        """
-        Args:
-            model: Trained GNN model
-            temperature: Temperature for move selection (0 = greedy)
-            device: Device to run model on
-        """
-        self.model = model
-        self.temperature = temperature
-        self.device = device
-        self.model.eval()
-
-    def select_move(self, board: nokamute.Board) -> Optional[nokamute.Turn]:
-        """
-        Select a move using the model with batch evaluation.
-        
-        Args:
-            board: Current board state
-            
-        Returns:
-            Selected move or None if no legal moves
-        """
-        import numpy as np
-        from torch_geometric.data import Data, Batch
-
-        legal_moves = board.legal_moves()
-        
-        if len(legal_moves) == 0:
-            return None
-        
-        if len(legal_moves) == 1:
-            return legal_moves[0]
-
-        # Check for immediate winning moves
-        current_player = board.to_move().name
-        for move in legal_moves:
-            board_copy = board.clone()
-            board_copy.apply(move)
-            winner = board_copy.get_winner()
-            
-            if winner == current_player:
-                # This move wins immediately - play it!
-                del board_copy
-                return move
-            
-            del board_copy
-
-        # Batch evaluate all moves using DataLoader
-        move_values = self._batch_evaluate_moves(board, legal_moves)
-
-        # Values are absolute (positive = White winning, negative = Black winning)
-        # White wants to maximize, Black wants to minimize
-        # For move selection, we convert to player-relative utilities
-        current_player = board.to_move().name
-        if current_player == "White":
-            utilities = move_values  # White maximizes
-        else:
-            utilities = [-v for v in move_values]  # Black minimizes (so negate)
-
-        # Select move based on temperature
-        if self.temperature == 0:
-            best_idx = np.argmax(utilities)
-            return legal_moves[best_idx]
-        else:
-            values_array = np.array(utilities)
-            exp_values = np.exp(values_array / self.temperature)
-            probs = exp_values / np.sum(exp_values)
-            selected_idx = np.random.choice(len(legal_moves), p=probs)
-            return legal_moves[selected_idx]
-
-    def _batch_evaluate_moves(self, board: nokamute.Board, legal_moves) -> list:
-        """
-        Evaluate all legal moves in a single batch.
-        Deduplicates positions with identical zobrist hashes to avoid redundant evaluations.
-
-        Args:
-            board: Current board state
-            legal_moves: List of legal moves
-
-        Returns:
-            List of values for each move (absolute scale: +1 = White winning, -1 = Black winning)
-        """
-        from torch_geometric.data import Data, Batch
-        
-        # Group moves by resulting zobrist hash to deduplicate equivalent positions
-        hash_to_moves = {}  # zobrist_hash -> list of (move_idx, move)
-        hash_to_data = {}   # zobrist_hash -> (node_features, edge_index) or None
-        
-        for move_idx, move in enumerate(legal_moves):
-            # Create a copy and apply the move
-            board_copy = board.clone()
-            board_copy.apply(move)
-
-            # Get zobrist hash for deduplication
-            zobrist = board_copy.zobrist_hash()
-            
-            # Track this move
-            if zobrist not in hash_to_moves:
-                hash_to_moves[zobrist] = []
-                
-                # Convert to graph (only once per unique position)
-                node_features, edge_index = board_copy.to_graph()
-
-                # Store graph data
-                if len(node_features) == 0:
-                    hash_to_data[zobrist] = None
-                else:
-                    hash_to_data[zobrist] = (node_features, edge_index)
-            
-            hash_to_moves[zobrist].append((move_idx, move))
-
-            # Undo the move
-            board_copy.undo(move)
-
-        # Prepare batch for unique positions only
-        unique_hashes = []
-        data_list = []
-        
-        for zobrist_hash, graph_data in hash_to_data.items():
-            unique_hashes.append(zobrist_hash)
-            
-            if graph_data is not None:
-                node_features, edge_index = graph_data
-                # Convert to PyG Data object
-                x = torch.tensor(node_features, dtype=torch.float32)
-                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
-                
-                data = Data(x=x, edge_index=edge_index_tensor)
-                data_list.append(data)
-            else:
-                data_list.append(None)
-
-        # Batch evaluate all unique valid positions
-        if len([d for d in data_list if d is not None]) == 0:
-            # All moves lead to empty boards (shouldn't happen in practice)
-            return [0.0] * len(legal_moves)
-
-        # Evaluate unique positions
-        hash_to_value = {}
-        valid_data = [d for d in data_list if d is not None]
-        valid_hashes = [h for h, d in zip(unique_hashes, data_list) if d is not None]
-        
-        # Create batch from all data
-        batch = Batch.from_data_list(valid_data).to(self.device)
-        
-        # Evaluate all positions in a single forward pass
-        with torch.no_grad():
-            predictions, _ = self.model(batch.x, batch.edge_index, batch.batch)
-            values = predictions.squeeze().cpu().numpy()
-        
-        # Handle single value case (only one valid move)
-        if len(valid_data) == 1:
-            values = [values.item()]
-        else:
-            values = values.tolist()
-
-        # Map values to zobrist hashes
-        # Values are absolute (positive = White winning, negative = Black winning)
-        for zobrist_hash, value in zip(valid_hashes, values):
-            hash_to_value[zobrist_hash] = value
-        
-        # Handle None positions
-        for zobrist_hash, graph_data in hash_to_data.items():
-            if graph_data is None:
-                hash_to_value[zobrist_hash] = 0.0
-
-        # Map values back to all moves (including duplicates)
-        move_values = [0.0] * len(legal_moves)
-        for zobrist_hash, move_list in hash_to_moves.items():
-            value = hash_to_value[zobrist_hash]
-            for move_idx, _ in move_list:
-                move_values[move_idx] = value
-
-        return move_values
 
 
 def play_game(
@@ -283,7 +103,13 @@ def play_game(
         current_player = player1 if board.to_move().name == "Black" else player2
         
         # Get move
-        move = current_player.select_move(board)
+        if isinstance(current_player, SelfPlayGame):
+            # SelfPlayGame needs legal_moves explicitly
+            legal_moves = board.legal_moves()
+            move = current_player.select_move(board, legal_moves)
+        else:
+            # EngineOpponent handles legal moves internally
+            move = current_player.select_move(board)
         
         if move is None:
             # No legal moves - this shouldn't happen as get_winner() should catch it
@@ -335,7 +161,8 @@ def evaluate_model(
     Returns:
         Dictionary with evaluation statistics
     """
-    ml_player = MLPlayer(model, temperature=0.1, device=device)
+    # Use SelfPlayGame instead of MLPlayer (same functionality, optimized batch eval)
+    ml_player = SelfPlayGame(model=model, temperature=0.1, device=device)
     engine_player = EngineOpponent(depth=engine_depth)
     
     results = {
