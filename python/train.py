@@ -31,8 +31,8 @@ try:
     )
     from pretrain.human_games import (
         generate_human_games_data,
-        save_human_games_data,
-        load_human_games_data,
+        HumanGamesDataset,
+        train_epoch_streaming,
     )
     PRETRAIN_AVAILABLE = True
 except ImportError:
@@ -592,6 +592,11 @@ def main():
         default=None,
         help="Maximum number of human games to use for pre-training (default: all available)",
     )
+    parser.add_argument(
+        "--force-refresh-pretrain",
+        action="store_true",
+        help="Force re-download and re-parse pre-training data, ignoring cache",
+    )
 
     args = parser.parse_args()
 
@@ -745,61 +750,55 @@ def main():
             print(f"\nPre-training method: Human Games TD Learning")
             print(f"Target: Learn from human game positions using TD learning")
             
-            # Determine data file path
-            if args.pretrain_data_path:
-                data_file_path = args.pretrain_data_path
-            else:
-                # Auto-generate path based on settings
-                max_games_str = f"_max{args.pretrain_max_games}" if args.pretrain_max_games else "_all"
-                data_filename = f"pretrain_human{max_games_str}.pkl"
-                data_file_path = os.path.join(args.model_path, data_filename)
+            # Set cache directory
+            cache_dir = os.path.join(args.model_path, "pretrain_cache")
             
-            # Load or generate pre-training data
-            if os.path.exists(data_file_path):
-                print(f"\nLoading existing pre-training data from: {data_file_path}")
-                pretrain_data = load_human_games_data(data_file_path)
-            else:
-                print(f"\nDownloading and parsing human games...")
-                print(f"  Sheet URLs: {len(args.pretrain_sheet_urls)} sheets")
-                if args.pretrain_max_games:
-                    print(f"  Max games: {args.pretrain_max_games}")
-                else:
-                    print(f"  Max games: all available")
-                
-                pretrain_data = generate_human_games_data(
-                    sheet_urls=args.pretrain_sheet_urls,
-                    game_type="Base+MLP",
-                    max_games=args.pretrain_max_games,
-                    verbose=True,
-                )
-                
-                if len(pretrain_data) == 0:
-                    print("\nError: No valid training data generated from human games.")
-                    print("Please check the sheet URLs and game log format.")
-                    return
-                
-                # Save generated data for future use
-                print(f"\nSaving pre-training data to: {data_file_path}")
-                save_human_games_data(pretrain_data, data_file_path)
+            if args.force_refresh_pretrain:
+                print(f"\nForce refresh enabled - will re-download and re-parse data")
             
-            # Pre-train the model using TD learning
-            # We use the same train_epoch function with use_mc=False
-            print(f"\nPre-training with TD learning for {args.pretrain_epochs} epochs...")
-            print(f"Training transitions: {len(pretrain_data)}")
+            print(f"\nDownloading and parsing human games (with streaming to disk)...")
+            print(f"  Cache directory: {cache_dir}")
+            print(f"  Sheet URLs: {len(args.pretrain_sheet_urls)} sheets")
+            if args.pretrain_max_games:
+                print(f"  Max games: {args.pretrain_max_games}")
+            else:
+                print(f"  Max games: all available")
+            
+            # Generate and save to disk - returns cache directory path
+            cache_data_dir = generate_human_games_data(
+                sheet_urls=args.pretrain_sheet_urls,
+                game_type="Base+MLP",
+                max_games=args.pretrain_max_games,
+                verbose=True,
+                cache_dir=cache_dir,
+                force_refresh=args.force_refresh_pretrain,
+            )
+            
+            # Create streaming dataset
+            dataset = HumanGamesDataset(cache_data_dir, shuffle=True, verbose=True)
+            
+            if len(dataset) == 0:
+                print("\nError: No valid training data generated from human games.")
+                print("Please check the sheet URLs and game log format.")
+                return
+            
+            # Pre-train the model using streaming TD learning
+            print(f"\nPre-training with streaming TD learning for {args.pretrain_epochs} epochs...")
+            print(f"Training transitions: {len(dataset)}")
             print(f"Batch size: {args.batch_size}")
             print(f"Learning rate: {args.lr}")
             print(f"Gamma (TD discount): {args.gamma}")
             
             epoch_losses = []
             for epoch in range(args.pretrain_epochs):
-                epoch_loss = train_epoch(
+                epoch_loss = train_epoch_streaming(
                     model=model,
-                    training_data=pretrain_data,
+                    dataset=dataset,
                     optimizer=optimizer,
                     batch_size=args.batch_size,
                     device=args.device,
                     gamma=args.gamma,
-                    use_mc=False,  # Use TD learning
+                    verbose=(epoch == 0 or (epoch + 1) % 10 == 0),  # Show progress every 10 epochs
                 )
                 
                 epoch_losses.append(epoch_loss)
@@ -818,7 +817,7 @@ def main():
                 "pretrain_method": args.pretrain,
                 "pretrain_loss": epoch_losses[-1],
                 "config": model_config,
-                "pretrain_num_transitions": len(pretrain_data),
+                "pretrain_num_transitions": len(dataset),
                 "pretrain_epochs": args.pretrain_epochs,
             }, pretrain_model_path)
             print(f"\nPre-trained model saved to: {pretrain_model_path}")
@@ -849,7 +848,7 @@ def main():
             print("PRE-TRAINING COMPLETE!")
             print("=" * 60)
             print(f"\nPre-trained model: {pretrain_model_path}")
-            print(f"Training data: {data_file_path}")
+            print(f"Training transitions: {len(dataset)}")
             print(f"Final loss: {epoch_losses[-1]:.6f}")
             print(f"ELO rating: {current_elo:.1f}")
             print("\nTo continue with self-play training, run:")

@@ -17,6 +17,7 @@ import nokamute
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
 from typing import List, Tuple, Optional
+from tqdm import tqdm
 
 import sys
 import os
@@ -64,10 +65,7 @@ def generate_eval_matching_data(
     unique_positions = {}
     position_repetitions = {}  # Track how many times each position was seen
     
-    for game_idx in range(num_games):
-        if verbose and (game_idx + 1) % 10 == 0:
-            print(f"Generating game {game_idx + 1}/{num_games}... ({len(unique_positions)} unique positions so far)")
-        
+    for game_idx in tqdm(range(num_games), desc="Generating games", disable=not verbose):
         board = nokamute.Board()
         game_position_hashes = {}  # Track positions for three-fold repetition within this game
         moves_in_game = 0
@@ -91,7 +89,7 @@ def generate_eval_matching_data(
             # Check for three-fold repetition
             if game_position_hashes[pos_hash] >= 3:
                 if verbose:
-                    print(f"  Game {game_idx + 1}: Draw by repetition after {move_num} moves")
+                    tqdm.write(f"  Game {game_idx + 1}: Draw by repetition after {move_num} moves")
                 break
             
             # Choose move: either random or from engine
@@ -123,12 +121,10 @@ def generate_eval_matching_data(
             board.apply(move)
             moves_in_game += 1
         
-        if verbose:
+        if verbose and (game_idx + 1) % 10 == 0:
             winner = board.get_winner()
-            if winner:
-                print(f"  Game {game_idx + 1}: {winner} after {moves_in_game} moves")
-            elif moves_in_game >= max_moves:
-                print(f"  Game {game_idx + 1}: Draw by move limit after {moves_in_game} moves")
+            result_str = f"{winner} wins" if winner else "Draw"
+            tqdm.write(f"  Game {game_idx + 1}: {result_str} after {moves_in_game} moves ({len(unique_positions)} unique positions)")
     
     # Convert dictionary to list
     training_data = list(unique_positions.values())
@@ -266,7 +262,10 @@ def pretrain_eval_matching(
     
     # Pre-convert all training data to PyG Data objects with targets
     data_list = []
-    for node_features, edge_index, eval_score in training_data:
+    if verbose:
+        print("Converting training data to PyG format...")
+    
+    for node_features, edge_index, eval_score in tqdm(training_data, desc="Converting data", disable=not verbose):
         # Skip empty graphs
         if len(node_features) == 0:
             continue
@@ -284,7 +283,10 @@ def pretrain_eval_matching(
     if len(data_list) == 0:
         return []
     
-    for epoch in range(num_epochs):
+    if verbose:
+        print(f"Training on {len(data_list)} positions...")
+    
+    for epoch in tqdm(range(num_epochs), desc="Training epochs", disable=not verbose):
         total_loss = 0
         num_batches = 0
         
@@ -317,8 +319,8 @@ def pretrain_eval_matching(
         avg_loss = total_loss / max(num_batches, 1)
         epoch_losses.append(avg_loss)
         
-        if verbose:
-            print(f"Epoch {epoch + 1}/{num_epochs}: Loss = {avg_loss:.6f}")
+        if verbose and (epoch + 1) % 10 == 0:
+            tqdm.write(f"Epoch {epoch + 1}/{num_epochs}: Loss = {avg_loss:.6f}")
     
     return epoch_losses
 
