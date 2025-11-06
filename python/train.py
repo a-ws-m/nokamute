@@ -430,7 +430,7 @@ def main():
     parser.add_argument(
         "--iterations", type=int, default=10000, help="Training iterations"
     )
-    parser.add_argument("--epochs", type=int, default=10, help="Epochs per iteration (default: 1 for TD learning)")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs (for self-play: epochs per iteration; for pre-training: total epochs)")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--hidden-dim", type=int, default=32, help="Hidden dimension")
@@ -558,12 +558,6 @@ def main():
         help="Engine search depth for pre-training data generation (default: 3)",
     )
     parser.add_argument(
-        "--pretrain-epochs",
-        type=int,
-        default=100,
-        help="Number of epochs for pre-training (default: 100)",
-    )
-    parser.add_argument(
         "--pretrain-randomness",
         type=float,
         default=0.1,
@@ -596,6 +590,11 @@ def main():
         "--force-refresh-pretrain",
         action="store_true",
         help="Force re-download and re-parse pre-training data, ignoring cache",
+    )
+    parser.add_argument(
+        "--pretrain-stream-from-disk",
+        action="store_true",
+        help="Stream pre-training data from disk instead of loading into memory (memory-efficient for large datasets)",
     )
 
     args = parser.parse_args()
@@ -697,7 +696,7 @@ def main():
                 save_eval_data(pretrain_data, data_file_path)
             
             # Pre-train the model
-            print(f"\nPre-training for {args.pretrain_epochs} epochs...")
+            print(f"\nPre-training for {args.epochs} epochs...")
             print(f"Batch size: {args.batch_size}")
             print(f"Learning rate: {args.lr}")
             
@@ -705,7 +704,7 @@ def main():
                 model=model,
                 training_data=pretrain_data,
                 optimizer=optimizer,
-                num_epochs=args.pretrain_epochs,
+                num_epochs=args.epochs,
                 batch_size=args.batch_size,
                 device=args.device,
                 verbose=True,
@@ -725,7 +724,7 @@ def main():
                 "config": model_config,
                 "pretrain_games": args.pretrain_games,
                 "pretrain_depth": args.pretrain_depth,
-                "pretrain_epochs": args.pretrain_epochs,
+                "epochs": args.epochs,
             }, pretrain_model_path)
             print(f"\nPre-trained model saved to: {pretrain_model_path}")
             print(f"Final pre-training loss: {pretrain_losses[-1]:.6f}")
@@ -756,7 +755,12 @@ def main():
             if args.force_refresh_pretrain:
                 print(f"\nForce refresh enabled - will re-download and re-parse data")
             
-            print(f"\nDownloading and parsing human games (with streaming to disk)...")
+            # Determine mode
+            if args.pretrain_stream_from_disk:
+                print(f"\nDownloading and parsing human games (streaming mode - will read from disk during training)...")
+            else:
+                print(f"\nDownloading and parsing human games (in-memory mode - will load all data into memory)...")
+            
             print(f"  Cache directory: {cache_dir}")
             print(f"  Sheet URLs: {len(args.pretrain_sheet_urls)} sheets")
             if args.pretrain_max_games:
@@ -764,33 +768,42 @@ def main():
             else:
                 print(f"  Max games: all available")
             
-            # Generate and save to disk - returns cache directory path
-            cache_data_dir = generate_human_games_data(
+            # Generate data - returns cache directory path (if streaming) or list of transitions (if in-memory)
+            data_source = generate_human_games_data(
                 sheet_urls=args.pretrain_sheet_urls,
                 game_type="Base+MLP",
                 max_games=args.pretrain_max_games,
                 verbose=True,
                 cache_dir=cache_dir,
                 force_refresh=args.force_refresh_pretrain,
+                stream_from_disk=args.pretrain_stream_from_disk,
             )
             
-            # Create streaming dataset
-            dataset = HumanGamesDataset(cache_data_dir, shuffle=True, verbose=True)
+            # Create dataset (automatically detects streaming vs in-memory based on data_source type)
+            dataset = HumanGamesDataset(data_source, shuffle=True, verbose=True)
             
             if len(dataset) == 0:
                 print("\nError: No valid training data generated from human games.")
                 print("Please check the sheet URLs and game log format.")
                 return
             
-            # Pre-train the model using streaming TD learning
-            print(f"\nPre-training with streaming TD learning for {args.pretrain_epochs} epochs...")
+            # Pre-train the model using TD learning
+            mode_str = "streaming" if args.pretrain_stream_from_disk else "in-memory"
+            print(f"\nPre-training with {mode_str} TD learning for {args.epochs} epochs...")
             print(f"Training transitions: {len(dataset)}")
             print(f"Batch size: {args.batch_size}")
             print(f"Learning rate: {args.lr}")
             print(f"Gamma (TD discount): {args.gamma}")
             
             epoch_losses = []
-            for epoch in range(args.pretrain_epochs):
+            for epoch in range(args.epochs):
+                # Always show progress bar for first epoch, then every 10 epochs
+                show_progress = (epoch == 0 or (epoch + 1) % 10 == 0)
+                
+                # Print epoch start for non-verbose epochs so user knows it's working
+                if not show_progress:
+                    print(f"Epoch {epoch + 1}/{args.epochs}...", end='', flush=True)
+                
                 epoch_loss = train_epoch_streaming(
                     model=model,
                     dataset=dataset,
@@ -798,13 +811,16 @@ def main():
                     batch_size=args.batch_size,
                     device=args.device,
                     gamma=args.gamma,
-                    verbose=(epoch == 0 or (epoch + 1) % 10 == 0),  # Show progress every 10 epochs
+                    verbose=show_progress,
                 )
                 
                 epoch_losses.append(epoch_loss)
                 
-                if (epoch + 1) % 10 == 0 or epoch == 0:
-                    print(f"Epoch {epoch + 1}/{args.pretrain_epochs}: Loss = {epoch_loss:.6f}")
+                # Print loss (always, to show progress)
+                if show_progress:
+                    print(f"Epoch {epoch + 1}/{args.epochs}: Loss = {epoch_loss:.6f}")
+                else:
+                    print(f" Loss = {epoch_loss:.6f}")
                 
                 # Log to tensorboard
                 writer.add_scalar("Pretrain/Loss", epoch_loss, epoch)
@@ -818,7 +834,8 @@ def main():
                 "pretrain_loss": epoch_losses[-1],
                 "config": model_config,
                 "pretrain_num_transitions": len(dataset),
-                "pretrain_epochs": args.pretrain_epochs,
+                "epochs": args.epochs,
+                "pretrain_streaming": args.pretrain_stream_from_disk,
             }, pretrain_model_path)
             print(f"\nPre-trained model saved to: {pretrain_model_path}")
             print(f"Final pre-training loss: {epoch_losses[-1]:.6f}")

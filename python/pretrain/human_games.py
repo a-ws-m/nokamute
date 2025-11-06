@@ -299,13 +299,13 @@ def generate_human_games_data(
     verbose: bool = True,
     cache_dir: Optional[str] = None,
     force_refresh: bool = False,
-) -> str:
+    stream_from_disk: bool = False,
+):
     """
     Download and parse human games from Google Sheets to create training data.
     
     This function downloads games from one or more Google Sheets, parses the
-    game logs, and extracts state transitions for TD learning. Transitions are
-    saved to disk immediately (streaming mode) to avoid memory issues.
+    game logs, and extracts state transitions for TD learning.
     
     Results are automatically cached to disk to avoid re-downloading and re-parsing.
     
@@ -316,9 +316,12 @@ def generate_human_games_data(
         verbose: Print progress information
         cache_dir: Directory to store cached data (default: ./pretrain_cache)
         force_refresh: If True, ignore cache and re-download data
+        stream_from_disk: If True, save to disk and return path to cache directory.
+                         If False (default), load all transitions into memory and return them.
         
     Returns:
-        Path to the cache directory containing transition files
+        If stream_from_disk=True: Path to the cache directory containing transition files
+        If stream_from_disk=False: List of all transition tuples in memory
     """
     # Set default cache directory
     if cache_dir is None:
@@ -332,6 +335,7 @@ def generate_human_games_data(
     cache_data_dir = cache_base_path.parent / f"human_games_{cache_key}"
     cache_metadata_path = cache_data_dir / "metadata.pkl"
     
+    # Check if we have cached data
     if not force_refresh and cache_metadata_path.exists():
         if verbose:
             print(f"Found cached data in {cache_data_dir}")
@@ -342,13 +346,63 @@ def generate_human_games_data(
         if verbose:
             print(f"Loaded metadata: {metadata['total_games']} games, {metadata['total_transitions']} transitions")
         
-        return str(cache_data_dir)
+        # Return cached data in requested format
+        if stream_from_disk:
+            return str(cache_data_dir)
+        else:
+            # Load transitions from disk into memory
+            # If max_games is specified, only load approximately that many games worth of transitions
+            avg_transitions_per_game = None
+            if max_games and metadata['total_games'] > 0:
+                # Calculate target number of transitions based on average
+                avg_transitions_per_game = metadata['total_transitions'] / metadata['total_games']
+                target_transitions = int(max_games * avg_transitions_per_game)
+                if verbose:
+                    print(f"Loading transitions from ~{max_games} games into memory...")
+                    print(f"  Avg transitions/game: {avg_transitions_per_game:.1f}")
+                    print(f"  Target transitions: ~{target_transitions}")
+            else:
+                target_transitions = None
+                if verbose:
+                    print("Loading all transitions into memory...")
+            
+            all_transitions = []
+            transition_files = sorted(cache_data_dir.glob("transitions_*.pkl"))
+            
+            for file_path in tqdm(transition_files, desc="Loading files", disable=not verbose):
+                # Check if we've loaded enough data
+                if target_transitions is not None and len(all_transitions) >= target_transitions:
+                    break
+                
+                with open(file_path, 'rb') as f:
+                    transitions = pickle.load(f)
+                    
+                    # If we have a target, check if we need to truncate this file's data
+                    if target_transitions is not None:
+                        remaining = target_transitions - len(all_transitions)
+                        if remaining < len(transitions):
+                            # Only take what we need
+                            all_transitions.extend(transitions[:remaining])
+                            break
+                    
+                    all_transitions.extend(transitions)
+            
+            if verbose:
+                print(f"Loaded {len(all_transitions)} transitions into memory")
+                if max_games and avg_transitions_per_game is not None:
+                    actual_games = len(all_transitions) / avg_transitions_per_game
+                    print(f"  Approximately {actual_games:.1f} games worth of data")
+            
+            return all_transitions
     
     # No cache or force refresh - download and parse
     if verbose:
         if force_refresh:
             print("Force refresh enabled - ignoring cache")
-        print("Downloading and parsing human games (streaming to disk)...")
+        if stream_from_disk:
+            print("Downloading and parsing human games (streaming to disk)...")
+        else:
+            print("Downloading and parsing human games (loading into memory)...")
     
     # Create cache directory
     cache_data_dir.mkdir(parents=True, exist_ok=True)
@@ -359,6 +413,7 @@ def generate_human_games_data(
     transition_file_index = 0
     transitions_per_file = 1000  # Save every 1000 transitions to a file
     current_batch = []
+    all_transitions: List[Tuple] = [] if not stream_from_disk else []  # Collect all transitions if not streaming
     
     for sheet_url in tqdm(sheet_urls, desc="Processing sheets", disable=not verbose):
         if verbose:
@@ -387,7 +442,11 @@ def generate_human_games_data(
                 total_games_processed += 1
                 total_transitions += len(transitions)
                 
-                # Write batch to disk when it reaches threshold
+                # If loading into memory, add to all_transitions
+                if not stream_from_disk:
+                    all_transitions.extend(transitions)
+                
+                # Write batch to disk when it reaches threshold (for caching or streaming)
                 if len(current_batch) >= transitions_per_file:
                     batch_file = cache_data_dir / f"transitions_{transition_file_index:06d}.pkl"
                     with open(batch_file, 'wb') as f:
@@ -420,7 +479,10 @@ def generate_human_games_data(
         print(f"Failed to parse: {total_games_failed} games")
         print(f"Total transitions: {total_transitions}")
         print(f"Avg transitions per game: {total_transitions / max(total_games_processed, 1):.1f}")
-        print(f"Saved to {transition_file_index} files in {cache_data_dir}")
+        if stream_from_disk:
+            print(f"Saved to {transition_file_index} files in {cache_data_dir}")
+        else:
+            print(f"Loaded into memory ({len(all_transitions)} transitions)")
     
     # Save metadata
     metadata = {
@@ -437,7 +499,11 @@ def generate_human_games_data(
     if verbose:
         print(f"Saved metadata to {cache_metadata_path}")
     
-    return str(cache_data_dir)
+    # Return in requested format
+    if stream_from_disk:
+        return str(cache_data_dir)
+    else:
+        return all_transitions
 
 
 def save_human_games_data(training_data: List[Tuple], filepath: str):
@@ -477,49 +543,90 @@ def load_human_games_data(filepath: str) -> List[Tuple]:
 
 class HumanGamesDataset:
     """
-    Dataset class that streams human games transitions from disk.
+    Dataset class for human games transitions.
     
-    This class reads transition files on-demand, avoiding loading all data into memory.
-    It can be used with PyTorch DataLoader or iterated directly.
+    Supports two modes:
+    1. In-memory mode: All transitions are stored in memory (default, faster)
+    2. Streaming mode: Transitions are loaded from disk on-demand (memory-efficient)
+    
+    This class can be used with PyTorch DataLoader or iterated directly.
     """
     
-    def __init__(self, cache_dir: str, shuffle: bool = True, verbose: bool = True):
+    def __init__(
+        self, 
+        data_source,  # Either cache_dir (str) for streaming or transitions list for in-memory
+        shuffle: bool = True, 
+        verbose: bool = True,
+        streaming: Optional[bool] = None,  # Auto-detect if None
+    ):
         """
         Initialize the dataset.
         
         Args:
-            cache_dir: Directory containing transition files and metadata
+            data_source: Either a string (cache directory path for streaming mode)
+                        or a list of transitions (for in-memory mode)
             shuffle: Whether to shuffle the data
             verbose: Print loading information
+            streaming: Force streaming mode (True) or in-memory mode (False).
+                      If None (default), auto-detect based on data_source type.
         """
-        self.cache_dir = Path(cache_dir)
         self.shuffle = shuffle
         self.verbose = verbose
         
-        # Load metadata
-        metadata_path = self.cache_dir / "metadata.pkl"
-        if not metadata_path.exists():
-            raise FileNotFoundError(f"Metadata not found at {metadata_path}")
+        # Auto-detect mode if not specified
+        if streaming is None:
+            streaming = isinstance(data_source, str)
         
-        with open(metadata_path, 'rb') as f:
-            self.metadata = pickle.load(f)
+        self.streaming = streaming
         
-        # Find all transition files
-        self.transition_files = sorted(self.cache_dir.glob("transitions_*.pkl"))
-        
-        if len(self.transition_files) == 0:
-            raise FileNotFoundError(f"No transition files found in {cache_dir}")
-        
-        if verbose:
-            print(f"HumanGamesDataset initialized:")
-            print(f"  Cache dir: {cache_dir}")
-            print(f"  Total games: {self.metadata['total_games']}")
-            print(f"  Total transitions: {self.metadata['total_transitions']}")
-            print(f"  Files: {len(self.transition_files)}")
-        
-        # Optionally shuffle file order
-        if self.shuffle:
-            random.shuffle(self.transition_files)
+        if self.streaming:
+            # Streaming mode: data_source is a cache directory
+            self.cache_dir = Path(data_source)
+            self.transitions_memory = None
+            
+            # Load metadata
+            metadata_path = self.cache_dir / "metadata.pkl"
+            if not metadata_path.exists():
+                raise FileNotFoundError(f"Metadata not found at {metadata_path}")
+            
+            with open(metadata_path, 'rb') as f:
+                self.metadata = pickle.load(f)
+            
+            # Find all transition files
+            self.transition_files = sorted(self.cache_dir.glob("transitions_*.pkl"))
+            
+            if len(self.transition_files) == 0:
+                raise FileNotFoundError(f"No transition files found in {data_source}")
+            
+            if verbose:
+                print(f"HumanGamesDataset initialized in STREAMING mode:")
+                print(f"  Cache dir: {data_source}")
+                print(f"  Total games: {self.metadata['total_games']}")
+                print(f"  Total transitions: {self.metadata['total_transitions']}")
+                print(f"  Files: {len(self.transition_files)}")
+            
+            # Optionally shuffle file order
+            if self.shuffle:
+                random.shuffle(self.transition_files)
+        else:
+            # In-memory mode: data_source is a list of transitions
+            self.transitions_memory = list(data_source)
+            self.cache_dir = None
+            self.transition_files = None
+            
+            # Create metadata
+            self.metadata = {
+                'total_transitions': len(self.transitions_memory),
+                'total_games': 'unknown',  # Not tracked in memory mode
+            }
+            
+            if verbose:
+                print(f"HumanGamesDataset initialized in IN-MEMORY mode:")
+                print(f"  Total transitions: {len(self.transitions_memory)}")
+            
+            # Optionally shuffle transitions
+            if self.shuffle:
+                random.shuffle(self.transitions_memory)
     
     def __len__(self):
         """Return total number of transitions."""
@@ -527,27 +634,37 @@ class HumanGamesDataset:
     
     def __iter__(self):
         """
-        Iterate over all transitions, streaming from disk.
+        Iterate over all transitions.
         
         Yields:
             Transition tuples: (curr_features, curr_edge_index, next_features, 
                                next_edge_index, is_terminal, final_result)
         """
-        files_to_process = list(self.transition_files)
-        if self.shuffle:
-            random.shuffle(files_to_process)
-        
-        for file_path in files_to_process:
-            # Load one file at a time
-            with open(file_path, 'rb') as f:
-                transitions = pickle.load(f)
-            
-            # Optionally shuffle transitions within file
+        if self.streaming:
+            # Streaming mode: read from disk
+            files_to_process = list(self.transition_files or [])
             if self.shuffle:
-                random.shuffle(transitions)
+                random.shuffle(files_to_process)
             
-            # Yield each transition
-            for transition in transitions:
+            for file_path in files_to_process:
+                # Load one file at a time
+                with open(file_path, 'rb') as f:
+                    transitions = pickle.load(f)
+                
+                # Optionally shuffle transitions within file
+                if self.shuffle:
+                    random.shuffle(transitions)
+                
+                # Yield each transition
+                for transition in transitions:
+                    yield transition
+        else:
+            # In-memory mode: iterate over transitions in memory
+            transitions_to_yield = list(self.transitions_memory or [])
+            if self.shuffle:
+                random.shuffle(transitions_to_yield)
+            
+            for transition in transitions_to_yield:
                 yield transition
     
     def iter_batches(self, batch_size: int):
@@ -586,14 +703,13 @@ def train_epoch_streaming(
     verbose: bool = True,
 ):
     """
-    Train the model for one epoch using streaming TD learning from disk.
+    Train the model for one epoch using TD learning.
     
-    This function streams transitions from disk rather than loading everything
-    into memory, making it suitable for large datasets.
+    This function works with HumanGamesDataset in both streaming and in-memory modes.
     
     Args:
         model: GNN model
-        dataset: HumanGamesDataset instance
+        dataset: HumanGamesDataset instance (streaming or in-memory)
         optimizer: Optimizer
         batch_size: Batch size
         device: Device to train on
@@ -610,11 +726,15 @@ def train_epoch_streaming(
     # Create progress bar if verbose
     batch_iter = dataset.iter_batches(batch_size)
     if verbose:
-        batch_iter = tqdm(
-            batch_iter,
-            desc="Training",
-            total=len(dataset) // batch_size
-        )
+        try:
+            from tqdm import tqdm
+            batch_iter = tqdm(
+                batch_iter,
+                desc="Training",
+                total=len(dataset) // batch_size
+            )
+        except ImportError:
+            pass  # tqdm not available, continue without progress bar
     
     for batch_transitions in batch_iter:
         curr_states = []
@@ -680,7 +800,7 @@ def train_epoch_streaming(
         total_loss += loss.item()
         num_batches += 1
         
-        # Update progress bar
+        # Update progress bar (if tqdm is available)
         if verbose and hasattr(batch_iter, 'set_postfix'):
             batch_iter.set_postfix({"loss": f"{loss.item():.6f}"})
     
@@ -697,25 +817,29 @@ if __name__ == "__main__":
         "https://docs.google.com/spreadsheets/d/1JGc6hbmQITjqF-MLiW4AGZ24VpAFgN802EY179RrPII/edit?gid=194203898#gid=194203898",
     ]
     
-    # Generate small dataset for testing (streams to disk)
-    cache_dir = generate_human_games_data(
+    # Test 1: Generate small dataset in memory (default)
+    print("\n" + "="*60)
+    print("TEST 1: In-memory mode (default)")
+    print("="*60)
+    transitions = generate_human_games_data(
         sheet_urls=sheet_urls,
         max_games=5,
-        verbose=True
+        verbose=True,
+        stream_from_disk=False,  # Load into memory
     )
     
-    print(f"\nData saved to: {cache_dir}")
+    print(f"\nGenerated {len(transitions)} transitions in memory")
     
-    # Test streaming dataset
-    print("\nTesting HumanGamesDataset...")
-    dataset = HumanGamesDataset(cache_dir, shuffle=False, verbose=True)
+    # Test in-memory dataset
+    print("\nTesting HumanGamesDataset in in-memory mode...")
+    dataset_memory = HumanGamesDataset(transitions, shuffle=False, verbose=True)
     
-    print(f"\nDataset contains {len(dataset)} transitions")
-    print(f"Metadata: {dataset.get_metadata()}")
+    print(f"\nDataset contains {len(dataset_memory)} transitions")
+    print(f"Metadata: {dataset_memory.get_metadata()}")
     
     # Test iteration
     print("\nTesting iteration (first 3 transitions):")
-    for i, transition in enumerate(dataset):
+    for i, transition in enumerate(dataset_memory):
         if i >= 3:
             break
         curr_features, curr_edge_index, next_features, next_edge_index, is_terminal, final_result = transition
@@ -727,7 +851,39 @@ if __name__ == "__main__":
     
     # Test batch iteration
     print("\nTesting batch iteration (batch_size=2):")
-    for i, batch in enumerate(dataset.iter_batches(batch_size=2)):
+    for i, batch in enumerate(dataset_memory.iter_batches(batch_size=2)):
         if i >= 2:
             break
         print(f"Batch {i+1}: {len(batch)} transitions")
+    
+    # Test 2: Generate small dataset with streaming
+    print("\n" + "="*60)
+    print("TEST 2: Streaming mode")
+    print("="*60)
+    cache_dir = generate_human_games_data(
+        sheet_urls=sheet_urls,
+        max_games=5,
+        verbose=True,
+        stream_from_disk=True,  # Stream from disk
+    )
+    
+    print(f"\nData saved to: {cache_dir}")
+    
+    # Test streaming dataset
+    print("\nTesting HumanGamesDataset in streaming mode...")
+    dataset_streaming = HumanGamesDataset(cache_dir, shuffle=False, verbose=True)
+    
+    print(f"\nDataset contains {len(dataset_streaming)} transitions")
+    print(f"Metadata: {dataset_streaming.get_metadata()}")
+    
+    # Test iteration
+    print("\nTesting iteration (first 3 transitions):")
+    for i, transition in enumerate(dataset_streaming):
+        if i >= 3:
+            break
+        curr_features, curr_edge_index, next_features, next_edge_index, is_terminal, final_result = transition
+        print(f"\nTransition {i+1}:")
+        print(f"  Current state nodes: {len(curr_features)}")
+        print(f"  Next state nodes: {len(next_features)}")
+        print(f"  Is terminal: {is_terminal}")
+        print(f"  Final result: {final_result}")
