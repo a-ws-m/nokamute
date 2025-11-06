@@ -23,6 +23,10 @@ from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
 from typing import List, Tuple, Optional, Set
 from tqdm import tqdm
+import argparse
+import hashlib
+from pathlib import Path
+from multiprocessing import Pool, cpu_count
 
 import sys
 import os
@@ -157,6 +161,228 @@ def _add_position_if_unique(board, aggression, eval_depth, unique_positions):
         unique_positions[pos_hash] = (node_features, edge_index, eval_score)
 
 
+def _generate_positions_worker(args):
+    """
+    Worker function for multiprocessing position generation.
+    
+    Args:
+        args: Tuple of (positions_per_worker, aggression, max_depth, branch_probability, eval_depth, seed)
+        
+    Returns:
+        List of (node_features, edge_index, eval_score) tuples
+    """
+    positions_per_worker, aggression, max_depth, branch_probability, eval_depth, seed = args
+    
+    # Set random seed for this worker
+    random.seed(seed)
+    
+    # Generate positions
+    return generate_random_positions_branching(
+        num_positions=positions_per_worker,
+        aggression=aggression,
+        max_depth=max_depth,
+        branch_probability=branch_probability,
+        eval_depth=eval_depth,
+        verbose=False,  # Disable verbose in workers
+    )
+
+
+def _get_cache_key(num_positions: int, aggression: int, max_depth: int, 
+                    branch_probability: float, eval_depth: int) -> str:
+    """
+    Generate a unique cache key for a set of generation parameters.
+    
+    Args:
+        num_positions: Number of positions
+        aggression: Aggression level
+        max_depth: Maximum depth
+        branch_probability: Branch probability
+        eval_depth: Evaluation depth
+        
+    Returns:
+        MD5 hash of the configuration
+    """
+    config_str = f"{num_positions}|{aggression}|{max_depth}|{branch_probability}|{eval_depth}"
+    return hashlib.md5(config_str.encode()).hexdigest()
+
+
+def _get_cache_path(cache_dir: str, cache_key: str) -> Path:
+    """
+    Get the path to a cached data directory.
+    
+    Args:
+        cache_dir: Base directory to store cache files
+        cache_key: Unique cache key
+        
+    Returns:
+        Path to cache directory
+    """
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    return cache_path / f"eval_matching_{cache_key}"
+
+
+def generate_and_save_positions(
+    num_positions: int = 1000,
+    aggression: int = 3,
+    max_depth: int = 50,
+    branch_probability: float = 0.3,
+    eval_depth: int = 0,
+    cache_dir: str = "pretrain_cache",
+    num_workers: Optional[int] = None,
+    force_refresh: bool = False,
+    verbose: bool = True,
+) -> str:
+    """
+    Generate random positions with evaluations and save to disk using multiprocessing.
+    
+    Similar to human_games.py's generate_human_games_data, this function generates
+    positions and saves them in a format suitable for streaming during training.
+    
+    Args:
+        num_positions: Total number of unique positions to generate
+        aggression: Aggression level 1-5 for BasicEvaluator (default: 3)
+        max_depth: Maximum number of moves from start position (default: 50)
+        branch_probability: Probability of creating a branch point (default: 0.3)
+        eval_depth: Search depth for minimax evaluation (default: 0 for static eval)
+        cache_dir: Directory to store cached data (default: "pretrain_cache")
+        num_workers: Number of parallel workers (default: cpu_count())
+        force_refresh: If True, ignore cache and regenerate data
+        verbose: Print progress information
+        
+    Returns:
+        Path to the cache directory containing the generated positions
+    """
+    if num_workers is None:
+        num_workers = cpu_count()
+    
+    # Check cache first
+    cache_key = _get_cache_key(num_positions, aggression, max_depth, branch_probability, eval_depth)
+    cache_data_dir = _get_cache_path(cache_dir, cache_key)
+    cache_metadata_path = cache_data_dir / "metadata.pkl"
+    
+    # Check if we have cached data
+    if not force_refresh and cache_metadata_path.exists():
+        if verbose:
+            print(f"Found cached data at {cache_data_dir}")
+        # Load metadata to get statistics
+        with open(cache_metadata_path, 'rb') as f:
+            metadata = pickle.load(f)
+        
+        if verbose:
+            print(f"Loaded cached data:")
+            print(f"  Total positions: {metadata['total_positions']}")
+            print(f"  Evaluation depth: {metadata['eval_depth']}")
+            print(f"  Number of files: {metadata['num_files']}")
+        
+        return str(cache_data_dir)
+    
+    # No cache or force refresh - generate positions
+    if verbose:
+        if force_refresh:
+            print("Force refresh enabled - regenerating data")
+        print(f"\nGenerating {num_positions} positions using {num_workers} workers...")
+        print(f"Parameters:")
+        print(f"  Aggression: {aggression}")
+        print(f"  Max depth: {max_depth}")
+        print(f"  Branch probability: {branch_probability}")
+        print(f"  Eval depth: {eval_depth}")
+    
+    # Create cache directory
+    cache_data_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Divide work among workers
+    positions_per_worker = num_positions // num_workers
+    remainder = num_positions % num_workers
+    
+    # Create worker arguments
+    worker_args = []
+    for i in range(num_workers):
+        # Distribute remainder positions across first few workers
+        worker_positions = positions_per_worker + (1 if i < remainder else 0)
+        seed = random.randint(0, 2**32 - 1)
+        worker_args.append((worker_positions, aggression, max_depth, branch_probability, eval_depth, seed))
+    
+    # Run workers in parallel
+    if verbose:
+        print(f"\nRunning {num_workers} parallel workers...")
+    
+    with Pool(num_workers) as pool:
+        if verbose:
+            results = list(tqdm(
+                pool.imap(_generate_positions_worker, worker_args),
+                total=num_workers,
+                desc="Workers completed"
+            ))
+        else:
+            results = pool.map(_generate_positions_worker, worker_args)
+    
+    # Combine results and save to disk
+    if verbose:
+        print("\nCombining results and saving to disk...")
+    
+    total_positions = 0
+    positions_per_file = 1000  # Save every 1000 positions to a file
+    file_index = 0
+    current_batch = []
+    
+    for worker_result in results:
+        for position in worker_result:
+            current_batch.append(position)
+            total_positions += 1
+            
+            # Save batch when it reaches the target size
+            if len(current_batch) >= positions_per_file:
+                batch_file = cache_data_dir / f"positions_{file_index:06d}.pkl"
+                with open(batch_file, 'wb') as f:
+                    pickle.dump(current_batch, f)
+                file_index += 1
+                current_batch = []
+    
+    # Save any remaining positions
+    if len(current_batch) > 0:
+        batch_file = cache_data_dir / f"positions_{file_index:06d}.pkl"
+        with open(batch_file, 'wb') as f:
+            pickle.dump(current_batch, f)
+        file_index += 1
+    
+    # Save metadata
+    metadata = {
+        'total_positions': total_positions,
+        'num_files': file_index,
+        'aggression': aggression,
+        'max_depth': max_depth,
+        'branch_probability': branch_probability,
+        'eval_depth': eval_depth,
+        'cache_key': cache_key,
+    }
+    with open(cache_metadata_path, 'wb') as f:
+        pickle.dump(metadata, f)
+    
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Data Generation Complete")
+        print(f"{'='*60}")
+        print(f"Total positions: {total_positions}")
+        print(f"Saved to: {cache_data_dir}")
+        print(f"Number of files: {file_index}")
+        
+        # Show evaluation statistics
+        if total_positions > 0:
+            all_evals = []
+            for worker_result in results:
+                for _, _, eval_score in worker_result:
+                    all_evals.append(eval_score)
+            
+            print(f"\nEvaluation statistics:")
+            print(f"  Min: {min(all_evals):.2f}")
+            print(f"  Max: {max(all_evals):.2f}")
+            print(f"  Mean: {sum(all_evals) / len(all_evals):.2f}")
+            print(f"  Median: {sorted(all_evals)[len(all_evals) // 2]:.2f}")
+    
+    return str(cache_data_dir)
+
+
 class EvaluationMatchingDataset(Dataset):
     """
     PyTorch Geometric Dataset for evaluation matching training.
@@ -240,6 +466,95 @@ class EvaluationMatchingDataset(Dataset):
         """Regenerate positions for a new epoch."""
         if self.regenerate_each_epoch:
             self._regenerate_positions()
+
+
+class CachedEvaluationDataset(Dataset):
+    """
+    PyTorch Geometric Dataset for loading pre-generated evaluation data from disk.
+    
+    This dataset loads positions and evaluations that were previously generated
+    using generate_and_save_positions(). The data is loaded into memory and
+    used for multiple epochs with shuffling.
+    
+    Similar to HumanGamesDataset but simpler since we don't need TD learning.
+    """
+    
+    def __init__(
+        self,
+        cache_dir: str,
+        scale: float = 0.001,
+        verbose: bool = True,
+    ):
+        """
+        Initialize the cached evaluation dataset.
+        
+        Args:
+            cache_dir: Directory containing cached position files
+            scale: Scaling factor for normalizing evaluations
+            verbose: Print loading information
+        """
+        super().__init__()
+        self.cache_dir = Path(cache_dir)
+        self.scale = scale
+        self.verbose = verbose
+        
+        # Load metadata
+        metadata_path = self.cache_dir / "metadata.pkl"
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"No metadata found at {metadata_path}")
+        
+        with open(metadata_path, 'rb') as f:
+            self.metadata = pickle.load(f)
+        
+        if verbose:
+            print(f"Loading cached evaluation data from {cache_dir}")
+            print(f"  Total positions: {self.metadata['total_positions']}")
+            print(f"  Evaluation depth: {self.metadata['eval_depth']}")
+            print(f"  Number of files: {self.metadata['num_files']}")
+        
+        # Load all positions into memory
+        self.data_list = []
+        position_files = sorted(self.cache_dir.glob("positions_*.pkl"))
+        
+        if verbose:
+            print(f"Loading {len(position_files)} position files...")
+            position_files = tqdm(position_files, desc="Loading files")
+        
+        for filepath in position_files:
+            with open(filepath, 'rb') as f:
+                positions = pickle.load(f)
+            
+            # Convert to PyG Data objects
+            for node_features, edge_index, eval_score in positions:
+                # Skip empty graphs
+                if len(node_features) == 0:
+                    continue
+                
+                # Convert to tensors
+                x = torch.tensor(node_features, dtype=torch.float32)
+                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
+                
+                # Normalize evaluation score
+                normalized_score = normalize_evaluation(eval_score, self.scale)
+                y = torch.tensor([normalized_score], dtype=torch.float32)
+                
+                data = Data(x=x, edge_index=edge_index_tensor, y=y)
+                self.data_list.append(data)
+        
+        if verbose:
+            print(f"Loaded {len(self.data_list)} positions into memory")
+    
+    def len(self):
+        """Return the number of positions in the dataset."""
+        return len(self.data_list)
+    
+    def get(self, idx):
+        """Get a single position."""
+        return self.data_list[idx]
+    
+    def get_metadata(self):
+        """Return dataset metadata."""
+        return self.metadata.copy()
 
 
 def normalize_evaluation(eval_score: float, scale: float = 0.001) -> float:
@@ -463,63 +778,170 @@ def generate_eval_matching_data(
 
 
 if __name__ == "__main__":
-    # Test random position generation
-    print("Testing evaluation matching pre-training with branching Markov chain...")
-    
-    # Generate small dataset
-    print("\n1. Testing position generation:")
-    data = generate_random_positions_branching(
-        num_positions=100,
-        aggression=3,
-        max_depth=30,
-        branch_probability=0.3,
-        eval_depth=0,  # Static evaluation
-        verbose=True
+    parser = argparse.ArgumentParser(
+        description="Generate random positions with evaluations for pre-training"
     )
     
-    print(f"\nGenerated {len(data)} training examples")
-    
-    # Test normalization
-    if data:
-        sample_node_features, sample_edge_index, sample_eval = data[0]
-        print(f"\nSample position:")
-        print(f"  Nodes: {len(sample_node_features)}")
-        print(f"  Edges: {len(sample_edge_index[0]) if sample_edge_index else 0}")
-        print(f"  Raw evaluation: {sample_eval}")
-        print(f"  Normalized: {normalize_evaluation(sample_eval):.4f}")
-    
-    # Test with depth > 0
-    print("\n2. Testing with minimax evaluation (depth=2):")
-    data_depth = generate_random_positions_branching(
-        num_positions=20,
-        aggression=3,
-        max_depth=30,
-        branch_probability=0.3,
-        eval_depth=2,  # Minimax evaluation at depth 2
-        verbose=True
+    # Generation parameters
+    parser.add_argument(
+        "--num-positions",
+        type=int,
+        default=1000,
+        help="Number of unique positions to generate (default: 1000)"
+    )
+    parser.add_argument(
+        "--aggression",
+        type=int,
+        default=3,
+        choices=[1, 2, 3, 4, 5],
+        help="Aggression level for BasicEvaluator (default: 3)"
+    )
+    parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=50,
+        help="Maximum number of moves from start position (default: 50)"
+    )
+    parser.add_argument(
+        "--branch-probability",
+        type=float,
+        default=0.3,
+        help="Probability of creating a branch point (default: 0.3)"
+    )
+    parser.add_argument(
+        "--eval-depth",
+        type=int,
+        default=0,
+        help="Search depth for minimax evaluation (default: 0 for static eval)"
     )
     
-    print(f"\nGenerated {len(data_depth)} training examples with minimax eval")
-    
-    # Test dataset
-    print("\n3. Testing EvaluationMatchingDataset:")
-    dataset = EvaluationMatchingDataset(
-        num_positions=50,
-        aggression=3,
-        max_depth=30,
-        branch_probability=0.3,
-        eval_depth=0,
-        regenerate_each_epoch=True,
+    # Output parameters
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default="pretrain_cache",
+        help="Directory to store cached data (default: pretrain_cache)"
     )
-    print(f"Dataset length: {len(dataset)}")
-    sample = dataset[0]
-    print(f"Sample data shape: x={sample.x.shape}, edge_index={sample.edge_index.shape}, y={sample.y.shape}")
+    parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="Force regeneration even if cache exists"
+    )
     
-    print("\n4. Testing DataLoader:")
-    loader = DataLoader(dataset, batch_size=8, shuffle=True)
-    for batch in loader:
-        print(f"Batch: x={batch.x.shape}, edge_index={batch.edge_index.shape}, y={batch.y.shape}")
-        print(f"Batch has {batch.num_graphs} graphs")
-        break
+    # Performance parameters
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: number of CPU cores)"
+    )
     
-    print("\nAll tests passed!")
+    # Testing mode
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run tests instead of generating data"
+    )
+    
+    args = parser.parse_args()
+    
+    if args.test:
+        # Test random position generation
+        print("Testing evaluation matching pre-training with branching Markov chain...")
+        
+        # Generate small dataset
+        print("\n1. Testing position generation:")
+        data = generate_random_positions_branching(
+            num_positions=100,
+            aggression=3,
+            max_depth=30,
+            branch_probability=0.3,
+            eval_depth=0,  # Static evaluation
+            verbose=True
+        )
+        
+        print(f"\nGenerated {len(data)} training examples")
+        
+        # Test normalization
+        if data:
+            sample_node_features, sample_edge_index, sample_eval = data[0]
+            print(f"\nSample position:")
+            print(f"  Nodes: {len(sample_node_features)}")
+            print(f"  Edges: {len(sample_edge_index[0]) if sample_edge_index else 0}")
+            print(f"  Raw evaluation: {sample_eval}")
+            print(f"  Normalized: {normalize_evaluation(sample_eval):.4f}")
+        
+        # Test with depth > 0
+        print("\n2. Testing with minimax evaluation (depth=2):")
+        data_depth = generate_random_positions_branching(
+            num_positions=20,
+            aggression=3,
+            max_depth=30,
+            branch_probability=0.3,
+            eval_depth=2,  # Minimax evaluation at depth 2
+            verbose=True
+        )
+        
+        print(f"\nGenerated {len(data_depth)} training examples with minimax eval")
+        
+        # Test dataset
+        print("\n3. Testing EvaluationMatchingDataset:")
+        dataset = EvaluationMatchingDataset(
+            num_positions=50,
+            aggression=3,
+            max_depth=30,
+            branch_probability=0.3,
+            eval_depth=0,
+            regenerate_each_epoch=True,
+        )
+        print(f"Dataset length: {len(dataset)}")
+        sample = dataset[0]
+        print(f"Sample data shape: x={sample.x.shape}, edge_index={sample.edge_index.shape}, y={sample.y.shape}")
+        
+        print("\n4. Testing DataLoader:")
+        loader = DataLoader(dataset, batch_size=8, shuffle=True)
+        for batch in loader:
+            print(f"Batch: x={batch.x.shape}, edge_index={batch.edge_index.shape}, y={batch.y.shape}")
+            print(f"Batch has {batch.num_graphs} graphs")
+            break
+        
+        print("\n5. Testing multiprocessing generation and caching:")
+        cache_dir = generate_and_save_positions(
+            num_positions=100,
+            aggression=3,
+            max_depth=30,
+            branch_probability=0.3,
+            eval_depth=0,
+            cache_dir="test_cache",
+            num_workers=2,
+            force_refresh=True,
+            verbose=True,
+        )
+        
+        print("\n6. Testing CachedEvaluationDataset:")
+        cached_dataset = CachedEvaluationDataset(cache_dir, verbose=True)
+        print(f"Cached dataset length: {len(cached_dataset)}")
+        sample = cached_dataset[0]
+        print(f"Sample data shape: x={sample.x.shape}, edge_index={sample.edge_index.shape}, y={sample.y.shape}")
+        
+        print("\nAll tests passed!")
+    else:
+        # Generate and save positions
+        cache_dir = generate_and_save_positions(
+            num_positions=args.num_positions,
+            aggression=args.aggression,
+            max_depth=args.max_depth,
+            branch_probability=args.branch_probability,
+            eval_depth=args.eval_depth,
+            cache_dir=args.cache_dir,
+            num_workers=args.num_workers,
+            force_refresh=args.force_refresh,
+            verbose=True,
+        )
+        
+        print(f"\n{'='*60}")
+        print("SUCCESS!")
+        print(f"{'='*60}")
+        print(f"Generated positions saved to: {cache_dir}")
+        print(f"\nTo use this data for pre-training, run:")
+        print(f"  python train.py --pretrain eval-matching --pretrain-data-path {cache_dir}")

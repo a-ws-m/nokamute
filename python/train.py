@@ -7,10 +7,12 @@ import os
 import time
 import pickle
 from pathlib import Path
+from tqdm import tqdm
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+import random
 from model import create_model
 from self_play import SelfPlayGame, prepare_training_data
 from torch.utils.tensorboard import SummaryWriter
@@ -28,6 +30,7 @@ try:
         pretrain_eval_matching,
         save_eval_data,
         load_eval_data,
+        CachedEvaluationDataset,
     )
     from pretrain.human_games import (
         generate_human_games_data,
@@ -675,73 +678,173 @@ def main():
         if args.pretrain == "eval-matching":
             print(f"\nPre-training method: Evaluation Matching")
             print(f"Target: Match analytical BasicEvaluator scores")
-            print(f"Method: Branching Markov chain random position generation")
             
-            # Pre-train the model using the new branching approach
-            # This generates fresh random positions each epoch
-            print(f"\nPre-training for {args.epochs} epochs...")
-            print(f"Positions per epoch: {args.pretrain_positions}")
-            print(f"Batch size: {args.batch_size}")
-            print(f"Learning rate: {args.lr}")
-            print(f"Max depth for random walks: {min(args.max_moves, 50)}")
-            print(f"Branch probability: 0.3")
-            print(f"Evaluation depth: {args.pretrain_eval_depth} (0=static, >0=minimax)")
-            print(f"Saving checkpoints every {args.save_interval} epochs")
-            
-            # Define checkpoint save path
-            pretrain_model_path = os.path.join(args.model_path, "model_eval_matching_latest.pt")
-            
-            # Define epoch callback for tensorboard logging and checkpoint saving
-            def epoch_callback(epoch, loss):
-                # Log to tensorboard
-                writer.add_scalar("Pretrain/Loss", loss, epoch)
+            # Check if using pre-generated data
+            if args.pretrain_data_path:
+                # Load from pre-generated cache
+                print(f"Method: Load pre-generated positions from disk")
+                print(f"Data path: {args.pretrain_data_path}")
                 
-                # Save checkpoint at intervals
-                if (epoch + 1) % args.save_interval == 0:
-                    torch.save({
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "pretrain_method": args.pretrain,
-                        "pretrain_loss": loss,
-                        "config": model_config,
-                        "pretrain_positions": args.pretrain_positions,
-                        "pretrain_eval_depth": args.pretrain_eval_depth,
-                        "epoch": epoch + 1,
-                        "total_epochs": args.epochs,
-                    }, pretrain_model_path)
-                    print(f"  Checkpoint saved at epoch {epoch + 1}: {pretrain_model_path}")
-            
-            pretrain_losses = pretrain_eval_matching(
-                model=model,
-                num_positions_per_epoch=args.pretrain_positions,
-                optimizer=optimizer,
-                num_epochs=args.epochs,
-                batch_size=args.batch_size,
-                device=args.device,
-                aggression=3,
-                max_depth=min(args.max_moves, 50),
-                branch_probability=0.3,
-                eval_depth=args.pretrain_eval_depth,
-                scale=0.001,
-                regenerate_each_epoch=True,  # Fresh positions each epoch
-                verbose=True,
-                epoch_callback=epoch_callback,
-            )
-            
-            # Save final pre-trained model
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "pretrain_method": args.pretrain,
-                "pretrain_loss": pretrain_losses[-1],
-                "config": model_config,
-                "pretrain_positions": args.pretrain_positions,
-                "pretrain_eval_depth": args.pretrain_eval_depth,
-                "epoch": args.epochs,
-                "total_epochs": args.epochs,
-            }, pretrain_model_path)
-            print(f"\nFinal pre-trained model saved to: {pretrain_model_path}")
-            print(f"Final pre-training loss: {pretrain_losses[-1]:.6f}")
+                from pretrain.eval_matching import CachedEvaluationDataset
+                
+                # Load dataset
+                print(f"\nLoading cached evaluation data...")
+                dataset = CachedEvaluationDataset(
+                    cache_dir=args.pretrain_data_path,
+                    scale=0.001,
+                    verbose=True,
+                )
+                
+                # Create DataLoader
+                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+                
+                print(f"\nPre-training for {args.epochs} epochs...")
+                print(f"Total positions: {len(dataset)}")
+                print(f"Batch size: {args.batch_size}")
+                print(f"Learning rate: {args.lr}")
+                print(f"Using same data each epoch (shuffled)")
+                print(f"Saving checkpoints every {args.save_interval} epochs")
+                
+                # Define checkpoint save path
+                pretrain_model_path = os.path.join(args.model_path, "model_eval_matching_latest.pt")
+                
+                # Training loop
+                model.train()
+                pretrain_losses = []
+                
+                for epoch in tqdm(range(args.epochs), desc="Pre-training epochs"):
+                    total_loss = 0
+                    num_batches = 0
+                    
+                    for batch in loader:
+                        batch = batch.to(args.device)
+                        
+                        # Forward pass
+                        optimizer.zero_grad()
+                        predictions, _ = model(batch.x, batch.edge_index, batch.batch)
+                        
+                        # Extract targets from batch
+                        targets = batch.y.unsqueeze(1) if batch.y.dim() == 1 else batch.y
+                        
+                        # Compute MSE loss
+                        loss = F.mse_loss(predictions, targets)
+                        
+                        # Backward pass
+                        loss.backward()
+                        optimizer.step()
+                        
+                        total_loss += loss.item()
+                        num_batches += 1
+                    
+                    avg_loss = total_loss / max(num_batches, 1)
+                    pretrain_losses.append(avg_loss)
+                    
+                    # Log to tensorboard
+                    writer.add_scalar("Pretrain/Loss", avg_loss, epoch)
+                    
+                    # Print progress
+                    if (epoch + 1) % 10 == 0:
+                        tqdm.write(f"Epoch {epoch + 1}/{args.epochs}: Loss = {avg_loss:.6f}")
+                    
+                    # Save checkpoint at intervals
+                    if (epoch + 1) % args.save_interval == 0:
+                        torch.save({
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "pretrain_method": args.pretrain,
+                            "pretrain_loss": avg_loss,
+                            "config": model_config,
+                            "pretrain_data_path": args.pretrain_data_path,
+                            "epoch": epoch + 1,
+                            "total_epochs": args.epochs,
+                        }, pretrain_model_path)
+                        print(f"  Checkpoint saved at epoch {epoch + 1}: {pretrain_model_path}")
+                
+                # Save final pre-trained model
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "pretrain_method": args.pretrain,
+                    "pretrain_loss": pretrain_losses[-1],
+                    "config": model_config,
+                    "pretrain_data_path": args.pretrain_data_path,
+                    "epoch": args.epochs,
+                    "total_epochs": args.epochs,
+                }, pretrain_model_path)
+                print(f"\nFinal pre-trained model saved to: {pretrain_model_path}")
+                print(f"Final pre-training loss: {pretrain_losses[-1]:.6f}")
+                
+            else:
+                # Generate positions on-the-fly each epoch (old method)
+                print(f"Method: Branching Markov chain random position generation")
+                print(f"Positions generated fresh each epoch")
+                
+                # Pre-train the model using the new branching approach
+                # This generates fresh random positions each epoch
+                print(f"\nPre-training for {args.epochs} epochs...")
+                print(f"Positions per epoch: {args.pretrain_positions}")
+                print(f"Batch size: {args.batch_size}")
+                print(f"Learning rate: {args.lr}")
+                print(f"Max depth for random walks: {min(args.max_moves, 50)}")
+                print(f"Branch probability: 0.3")
+                print(f"Evaluation depth: {args.pretrain_eval_depth} (0=static, >0=minimax)")
+                print(f"Saving checkpoints every {args.save_interval} epochs")
+                
+                # Define checkpoint save path
+                pretrain_model_path = os.path.join(args.model_path, "model_eval_matching_latest.pt")
+                
+                # Define epoch callback for tensorboard logging and checkpoint saving
+                def epoch_callback(epoch, loss):
+                    # Log to tensorboard
+                    writer.add_scalar("Pretrain/Loss", loss, epoch)
+                    
+                    # Save checkpoint at intervals
+                    if (epoch + 1) % args.save_interval == 0:
+                        torch.save({
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "pretrain_method": args.pretrain,
+                            "pretrain_loss": loss,
+                            "config": model_config,
+                            "pretrain_positions": args.pretrain_positions,
+                            "pretrain_eval_depth": args.pretrain_eval_depth,
+                            "epoch": epoch + 1,
+                            "total_epochs": args.epochs,
+                        }, pretrain_model_path)
+                        print(f"  Checkpoint saved at epoch {epoch + 1}: {pretrain_model_path}")
+                
+                pretrain_losses = pretrain_eval_matching(
+                    model=model,
+                    num_positions_per_epoch=args.pretrain_positions,
+                    optimizer=optimizer,
+                    num_epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    device=args.device,
+                    aggression=3,
+                    max_depth=min(args.max_moves, 50),
+                    branch_probability=0.3,
+                    eval_depth=args.pretrain_eval_depth,
+                    scale=0.001,
+                    regenerate_each_epoch=True,  # Fresh positions each epoch
+                    verbose=True,
+                    epoch_callback=epoch_callback,
+                )
+                
+                # Save final pre-trained model
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "pretrain_method": args.pretrain,
+                    "pretrain_loss": pretrain_losses[-1],
+                    "config": model_config,
+                    "pretrain_positions": args.pretrain_positions,
+                    "pretrain_eval_depth": args.pretrain_eval_depth,
+                    "epoch": args.epochs,
+                    "total_epochs": args.epochs,
+                }, pretrain_model_path)
+                print(f"\nFinal pre-trained model saved to: {pretrain_model_path}")
+                print(f"Final pre-training loss: {pretrain_losses[-1]:.6f}")
+
             
             # Evaluate pre-trained model against engine
             print("\nEvaluating pre-trained model against engine...")
