@@ -462,6 +462,78 @@ impl Board {
         Ok(best_move.map(|m| Turn { inner: m }))
     }
 
+    /// Get the best move and its evaluation in one search
+    ///
+    /// This is more efficient than calling get_engine_move() and get_evaluation()
+    /// separately, as it performs only one minimax search.
+    ///
+    /// Args:
+    ///     depth: Search depth for minimax (default: 3)
+    ///     time_limit_ms: Time limit in milliseconds (optional, overrides depth)
+    ///     aggression: Aggression level 1-5 for the evaluator (default: 3)
+    ///
+    /// Returns:
+    ///     Tuple[Optional[Turn], i16]: (best_move, evaluation_score)
+    ///         - best_move: Best move according to the engine, or None if game is over
+    ///         - evaluation_score: Evaluation on absolute scale (positive = White advantage)
+    fn get_engine_move_with_eval(
+        &self, depth: Option<u8>, time_limit_ms: Option<u64>, aggression: Option<u8>,
+    ) -> PyResult<(Option<Turn>, i16)> {
+        use crate::BasicEvaluator;
+        use minimax::{Evaluator, Game, Strategy};
+        use std::time::Duration;
+
+        // Check if game is over
+        if Rules::get_winner(&self.inner).is_some() {
+            let eval = BasicEvaluator::new(aggression.unwrap_or(3));
+            let score = eval.evaluate(&self.inner);
+            let absolute_score = if self.inner.to_move() == RustColor::Black { -score } else { score };
+            return Ok((None, absolute_score));
+        }
+
+        let eval = BasicEvaluator::new(aggression.unwrap_or(3));
+        let opts = minimax::IterativeOptions::new().verbose().with_table_byte_size(100 << 20);
+
+        let mut strategy = minimax::IterativeSearch::new(eval, opts);
+
+        if let Some(time_ms) = time_limit_ms {
+            strategy.set_timeout(Duration::from_millis(time_ms));
+        } else {
+            strategy.set_max_depth(depth.unwrap_or(3));
+        }
+
+        let best_move = strategy.choose_move(&self.inner);
+        
+        // Get the evaluation from the principal variation
+        let pv = strategy.principal_variation();
+        let eval2 = BasicEvaluator::new(aggression.unwrap_or(3));
+        let score = if pv.is_empty() {
+            // Fallback to static eval
+            eval2.evaluate(&self.inner)
+        } else {
+            // Apply all moves in the principal variation
+            let mut board_copy = self.inner.clone();
+            for &mv in &pv {
+                board_copy.apply(mv);
+            }
+
+            // Evaluate the resulting position
+            let mut pv_score = eval2.evaluate(&board_copy);
+
+            // If the PV has an odd number of moves, the evaluation is from the opponent's perspective
+            if pv.len() % 2 == 1 {
+                pv_score = -pv_score;
+            }
+
+            pv_score
+        };
+
+        // Convert to absolute scale
+        let absolute_score = if self.inner.to_move() == RustColor::Black { -score } else { score };
+
+        Ok((best_move.map(|m| Turn { inner: m }), absolute_score))
+    }
+
     /// Get the analytical evaluation of the current position
     ///
     /// Args:

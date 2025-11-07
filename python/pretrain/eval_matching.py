@@ -45,10 +45,9 @@ def generate_random_positions_branching(
     aggression: int = 3,
     max_depth: int = 50,
     branch_probability: float = 0.3,
-    eval_depth: int = 0,
-    engine_depth: int = 3,
-    random_move_probability: float = 0.1,
-    suboptimal_move_probability: float = 0.2,
+    search_depth: int = 3,
+    random_move_probability: float = 0.3,
+    suboptimal_move_probability: float = 0.0,
     top_n_moves: int = 3,
     verbose: bool = True,
 ) -> List[Tuple[List[float], List[List[int]], float]]:
@@ -67,14 +66,16 @@ def generate_random_positions_branching(
     This gives more realistic game-like positions compared to pure random walks,
     while still maintaining diversity through stochasticity and branching.
     
+    The search_depth parameter is used for BOTH move selection AND evaluation,
+    ensuring we don't duplicate the expensive minimax search computation.
+    
     Args:
         num_positions: Target number of unique positions to generate
         aggression: Aggression level 1-5 for BasicEvaluator (default: 3)
         max_depth: Maximum number of moves from start position (default: 50)
         branch_probability: Probability of creating a branch point (default: 0.3)
-        eval_depth: Search depth for minimax evaluation (default: 0 for static eval)
-                   If > 0, uses minimax to evaluate position N moves ahead
-        engine_depth: Search depth for engine move selection (default: 3)
+        search_depth: Search depth for both move selection and evaluation (default: 3)
+                     If 0, uses static evaluation; if > 0, uses minimax
         random_move_probability: Probability of choosing a completely random move (default: 0.1)
         suboptimal_move_probability: Probability of choosing a suboptimal move from top-N (default: 0.2)
         top_n_moves: Number of top moves to consider for suboptimal selection (default: 3)
@@ -89,7 +90,7 @@ def generate_random_positions_branching(
     
     if verbose:
         print(f"Generating {num_positions} unique positions using engine self-play with branching...")
-        print(f"  Engine depth: {engine_depth}")
+        print(f"  Search depth: {search_depth}")
         print(f"  Random move probability: {random_move_probability}")
         print(f"  Suboptimal move probability: {suboptimal_move_probability}")
         pbar = tqdm(total=num_positions, desc="Generating positions")
@@ -103,7 +104,7 @@ def generate_random_positions_branching(
         board, current_depth = branch_points.pop(0)
         
         # Add current position if unique
-        _add_position_if_unique(board, aggression, eval_depth, unique_positions)
+        _add_position_if_unique(board, aggression, search_depth, unique_positions)
         if verbose:
             pbar.update(1)
         
@@ -127,16 +128,16 @@ def generate_random_positions_branching(
             move = random.choice(legal_moves)
         elif rand < random_move_probability + suboptimal_move_probability:
             # Choose from top-N moves
-            move = _choose_suboptimal_move(board, legal_moves, aggression, engine_depth, top_n_moves)
+            move = _choose_suboptimal_move(board, legal_moves, aggression, search_depth, top_n_moves)
         else:
             # Choose best engine move
-            engine_move = board.get_engine_move(depth=engine_depth, aggression=aggression)
+            engine_move = board.get_engine_move(depth=search_depth, aggression=aggression)
             move = engine_move if engine_move is not None else random.choice(legal_moves)
         
         board.apply(move)
         
         # Add the new position
-        _add_position_if_unique(board, aggression, eval_depth, unique_positions)
+        _add_position_if_unique(board, aggression, search_depth, unique_positions)
         if verbose:
             pbar.update(1)
         
@@ -171,18 +172,20 @@ def generate_random_positions_branching(
     return list(unique_positions.values())
 
 
-def _choose_suboptimal_move(board, legal_moves, aggression, engine_depth, top_n):
+def _choose_suboptimal_move(board, legal_moves, aggression, search_depth, top_n):
     """
     Choose a suboptimal move from the top-N best moves.
     
     This evaluates all legal moves, ranks them by evaluation score,
     and randomly selects from the top-N moves.
     
+    Uses the new combined API to get move + evaluation efficiently.
+    
     Args:
         board: Current board state
         legal_moves: List of legal moves
         aggression: Aggression level for evaluation
-        engine_depth: Search depth for move evaluation
+        search_depth: Search depth for move evaluation
         top_n: Number of top moves to consider
         
     Returns:
@@ -191,15 +194,15 @@ def _choose_suboptimal_move(board, legal_moves, aggression, engine_depth, top_n)
     if len(legal_moves) <= 1:
         return legal_moves[0] if legal_moves else None
     
-    # Evaluate each move
+    # Evaluate each move using the combined API
     move_scores = []
     for move in legal_moves:
         board.apply(move)
-        # Get evaluation from the perspective of the player who just moved
-        # (we want to maximize this score)
-        score = -board.get_evaluation(aggression, engine_depth)
+        # Use the new combined API - we only need the evaluation, but it's cached from move selection
+        _, score = board.get_engine_move_with_eval(depth=search_depth, aggression=aggression)
+        # Negate because we want to maximize this score from the previous player's perspective
         board.undo(move)
-        move_scores.append((move, score))
+        move_scores.append((move, -score))
     
     # Sort by score (descending)
     move_scores.sort(key=lambda x: x[1], reverse=True)
@@ -211,14 +214,16 @@ def _choose_suboptimal_move(board, legal_moves, aggression, engine_depth, top_n)
     return selected_move
 
 
-def _add_position_if_unique(board, aggression, eval_depth, unique_positions):
+def _add_position_if_unique(board, aggression, search_depth, unique_positions):
     """
     Add a position to the training data if it hasn't been seen before.
+    
+    Uses the new combined API to efficiently get evaluation without redundant search.
     
     Args:
         board: Current board state
         aggression: Aggression level for evaluation
-        eval_depth: Search depth for minimax evaluation (0 for static eval)
+        search_depth: Search depth for evaluation (0 for static eval, >0 for minimax)
         unique_positions: Dictionary of unique positions (modified in-place)
     """
     # Get graph representation and hash
@@ -227,8 +232,79 @@ def _add_position_if_unique(board, aggression, eval_depth, unique_positions):
     
     # Only add if we haven't seen it before
     if pos_hash not in unique_positions:
-        eval_score = board.get_evaluation(aggression, eval_depth)
+        # Use the combined API - we only need the evaluation
+        # The move is ignored since we're just evaluating the position
+        _, eval_score = board.get_engine_move_with_eval(depth=search_depth, aggression=aggression)
         unique_positions[pos_hash] = (node_features, edge_index, eval_score)
+
+
+def play_game_to_completion(
+    aggression: int = 3,
+    max_depth: int = 200,
+    branch_probability: float = 0.3,
+    search_depth: int = 3,
+    random_move_probability: float = 0.3,
+    suboptimal_move_probability: float = 0.0,
+    top_n_moves: int = 3,
+) -> List[Tuple[List[float], List[List[int]], float]]:
+    """
+    Play a single game to completion using engine self-play with stochastic move selection.
+    
+    This plays ONE game path from start to finish (win/draw/max_depth), collecting
+    all unique positions encountered along that path. Uses simple stochastic move selection:
+    either random moves (for exploration) or best engine moves (for quality).
+    
+    NOTE: The branch_probability and suboptimal_move_probability parameters are ignored
+    in this version - we only use random vs. best move selection.
+    
+    Args:
+        aggression: Aggression level 1-5 for BasicEvaluator
+        max_depth: Maximum number of moves before stopping
+        branch_probability: IGNORED - kept for API compatibility
+        search_depth: Search depth for both move selection and evaluation
+        random_move_probability: Probability of choosing random moves (default: 0.3)
+        suboptimal_move_probability: IGNORED - kept for API compatibility
+        top_n_moves: IGNORED - kept for API compatibility
+        
+    Returns:
+        List of (node_features, edge_index, eval_score) tuples from the game
+    """
+    unique_positions = {}  # Map: graph_hash -> (node_features, edge_index, eval_score)
+    
+    # Start with initial position
+    board = nokamute.Board()
+    
+    # Play game to completion
+    move_count = 0
+    while move_count < max_depth:
+        # Add current position if unique
+        _add_position_if_unique(board, aggression, search_depth, unique_positions)
+        
+        # Check if game is over
+        if board.get_winner() is not None:
+            break
+        
+        # Get legal moves
+        legal_moves = board.legal_moves()
+        if not legal_moves:
+            break
+        
+        # Choose move: either random (for exploration) or best (for quality)
+        if random.random() < random_move_probability:
+            # Completely random move for exploration
+            move = random.choice(legal_moves)
+        else:
+            # Choose best engine move using minimax with alpha-beta pruning
+            engine_move = board.get_engine_move(depth=search_depth, aggression=aggression)
+            move = engine_move if engine_move is not None else random.choice(legal_moves)
+        
+        board.apply(move)
+        move_count += 1
+    
+    # Add final position
+    _add_position_if_unique(board, aggression, search_depth, unique_positions)
+    
+    return list(unique_positions.values())
 
 
 def _generate_position_batch_worker(args):
@@ -239,15 +315,15 @@ def _generate_position_batch_worker(args):
     from each game.
     
     Args:
-        args: Tuple of (num_games, aggression, max_depth, branch_probability, eval_depth, 
-                        engine_depth, random_move_probability, suboptimal_move_probability, 
+        args: Tuple of (num_games, aggression, max_depth, branch_probability, search_depth,
+                        random_move_probability, suboptimal_move_probability, 
                         top_n_moves, seed)
         
     Returns:
         List of (node_features, edge_index, eval_score) tuples from all games
     """
-    (num_games, aggression, max_depth, branch_probability, eval_depth, 
-     engine_depth, random_move_probability, suboptimal_move_probability, 
+    (num_games, aggression, max_depth, branch_probability, search_depth,
+     random_move_probability, suboptimal_move_probability, 
      top_n_moves, seed) = args
     
     # Set random seed for this worker
@@ -257,19 +333,15 @@ def _generate_position_batch_worker(args):
     
     # Play through num_games complete games
     for _ in range(num_games):
-        # Generate positions from one complete game using the branching process
-        # Use a large num_positions to ensure we explore the full game
-        game_positions = generate_random_positions_branching(
-            num_positions=10000,  # Large enough to explore full game tree
+        # Play one game to completion
+        game_positions = play_game_to_completion(
             aggression=aggression,
             max_depth=max_depth,
             branch_probability=branch_probability,
-            eval_depth=eval_depth,
-            engine_depth=engine_depth,
+            search_depth=search_depth,
             random_move_probability=random_move_probability,
             suboptimal_move_probability=suboptimal_move_probability,
             top_n_moves=top_n_moves,
-            verbose=False,
         )
         all_positions.extend(game_positions)
     
@@ -277,7 +349,7 @@ def _generate_position_batch_worker(args):
 
 
 def _get_cache_key(num_games: int, aggression: int, max_depth: int, 
-                    branch_probability: float, eval_depth: int, engine_depth: int,
+                    branch_probability: float, search_depth: int,
                     random_move_probability: float, suboptimal_move_probability: float,
                     top_n_moves: int) -> str:
     """
@@ -288,8 +360,7 @@ def _get_cache_key(num_games: int, aggression: int, max_depth: int,
         aggression: Aggression level
         max_depth: Maximum depth
         branch_probability: Branch probability
-        eval_depth: Evaluation depth
-        engine_depth: Engine search depth for move selection
+        search_depth: Search depth for both move selection and evaluation
         random_move_probability: Probability of random moves
         suboptimal_move_probability: Probability of suboptimal moves
         top_n_moves: Number of top moves to consider
@@ -298,7 +369,7 @@ def _get_cache_key(num_games: int, aggression: int, max_depth: int,
         MD5 hash of the configuration
     """
     config_str = (f"{num_games}|{aggression}|{max_depth}|{branch_probability}|"
-                  f"{eval_depth}|{engine_depth}|{random_move_probability}|"
+                  f"{search_depth}|{random_move_probability}|"
                   f"{suboptimal_move_probability}|{top_n_moves}")
     return hashlib.md5(config_str.encode()).hexdigest()
 
@@ -324,10 +395,9 @@ def generate_and_save_positions(
     aggression: int = 3,
     max_depth: int = 200,
     branch_probability: float = 0.3,
-    eval_depth: int = 0,
-    engine_depth: int = 3,
-    random_move_probability: float = 0.1,
-    suboptimal_move_probability: float = 0.2,
+    search_depth: int = 3,
+    random_move_probability: float = 0.3,
+    suboptimal_move_probability: float = 0.0,
     top_n_moves: int = 3,
     cache_dir: str = "pretrain_cache",
     num_workers: Optional[int] = None,
@@ -341,13 +411,16 @@ def generate_and_save_positions(
     Each worker plays through N complete games (games_per_worker) to completion,
     collecting all unique positions encountered during gameplay.
     
+    The search_depth parameter is used for BOTH move selection AND position evaluation,
+    eliminating redundant minimax searches.
+    
     Args:
         num_games: Total number of games to play
         aggression: Aggression level 1-5 for BasicEvaluator (default: 3)
         max_depth: Maximum number of moves from start position (default: 200)
         branch_probability: Probability of creating a branch point (default: 0.3)
-        eval_depth: Search depth for minimax evaluation (default: 0 for static eval)
-        engine_depth: Search depth for engine move selection (default: 3)
+        search_depth: Search depth for both move selection and evaluation (default: 3)
+                     If 0, uses static evaluation; if > 0, uses minimax
         random_move_probability: Probability of choosing random moves (default: 0.1)
         suboptimal_move_probability: Probability of choosing suboptimal moves (default: 0.2)
         top_n_moves: Number of top moves to consider for suboptimal selection (default: 3)
@@ -365,7 +438,7 @@ def generate_and_save_positions(
     
     # Check cache first
     cache_key = _get_cache_key(num_games, aggression, max_depth, branch_probability, 
-                                eval_depth, engine_depth, random_move_probability, 
+                                search_depth, random_move_probability, 
                                 suboptimal_move_probability, top_n_moves)
     cache_data_dir = _get_cache_path(cache_dir, cache_key)
     cache_metadata_path = cache_data_dir / "metadata.pkl"
@@ -382,8 +455,7 @@ def generate_and_save_positions(
             print(f"Loaded cached data:")
             print(f"  Total games: {metadata['num_games']}")
             print(f"  Total positions: {metadata['total_positions']}")
-            print(f"  Evaluation depth: {metadata['eval_depth']}")
-            print(f"  Engine depth: {metadata['engine_depth']}")
+            print(f"  Search depth: {metadata['search_depth']}")
             print(f"  Number of files: {metadata['num_files']}")
         
         return str(cache_data_dir)
@@ -397,8 +469,7 @@ def generate_and_save_positions(
         print(f"  Aggression: {aggression}")
         print(f"  Max depth: {max_depth}")
         print(f"  Branch probability: {branch_probability}")
-        print(f"  Eval depth: {eval_depth}")
-        print(f"  Engine depth: {engine_depth}")
+        print(f"  Search depth: {search_depth}")
         print(f"  Random move probability: {random_move_probability}")
         print(f"  Suboptimal move probability: {suboptimal_move_probability}")
         print(f"  Games per worker task: {games_per_worker}")
@@ -417,7 +488,7 @@ def generate_and_save_positions(
         remaining -= current_task_games
         seed = random.randint(0, 2**32 - 1)
         work_items.append((current_task_games, aggression, max_depth, branch_probability, 
-                          eval_depth, engine_depth, random_move_probability, 
+                          search_depth, random_move_probability, 
                           suboptimal_move_probability, top_n_moves, seed))
     
     # Run workers in parallel
@@ -561,8 +632,7 @@ def generate_and_save_positions(
         'aggression': aggression,
         'max_depth': max_depth,
         'branch_probability': branch_probability,
-        'eval_depth': eval_depth,
-        'engine_depth': engine_depth,
+        'search_depth': search_depth,
         'random_move_probability': random_move_probability,
         'suboptimal_move_probability': suboptimal_move_probability,
         'top_n_moves': top_n_moves,
@@ -608,8 +678,7 @@ class EvaluationMatchingDataset(Dataset):
         aggression: int = 3,
         max_depth: int = 50,
         branch_probability: float = 0.3,
-        eval_depth: int = 0,
-        engine_depth: int = 3,
+        search_depth: int = 3,
         random_move_probability: float = 0.1,
         suboptimal_move_probability: float = 0.2,
         top_n_moves: int = 3,
@@ -624,8 +693,7 @@ class EvaluationMatchingDataset(Dataset):
             aggression: Aggression level for BasicEvaluator (1-5)
             max_depth: Maximum depth for position generation
             branch_probability: Probability of branching during generation
-            eval_depth: Search depth for minimax evaluation (0 for static eval)
-            engine_depth: Search depth for engine move selection
+            search_depth: Search depth for both move selection and evaluation (0 for static, >0 for minimax)
             random_move_probability: Probability of choosing random moves
             suboptimal_move_probability: Probability of choosing suboptimal moves
             top_n_moves: Number of top moves to consider for suboptimal selection
@@ -637,8 +705,7 @@ class EvaluationMatchingDataset(Dataset):
         self.aggression = aggression
         self.max_depth = max_depth
         self.branch_probability = branch_probability
-        self.eval_depth = eval_depth
-        self.engine_depth = engine_depth
+        self.search_depth = search_depth
         self.random_move_probability = random_move_probability
         self.suboptimal_move_probability = suboptimal_move_probability
         self.top_n_moves = top_n_moves
@@ -655,8 +722,7 @@ class EvaluationMatchingDataset(Dataset):
             aggression=self.aggression,
             max_depth=self.max_depth,
             branch_probability=self.branch_probability,
-            eval_depth=self.eval_depth,
-            engine_depth=self.engine_depth,
+            search_depth=self.search_depth,
             random_move_probability=self.random_move_probability,
             suboptimal_move_probability=self.suboptimal_move_probability,
             top_n_moves=self.top_n_moves,
@@ -736,7 +802,11 @@ class CachedEvaluationDataset(Dataset):
         if verbose:
             print(f"Loading cached evaluation data from {cache_dir}")
             print(f"  Total positions: {self.metadata['total_positions']}")
-            print(f"  Evaluation depth: {self.metadata['eval_depth']}")
+            # Handle both old and new metadata formats
+            if 'search_depth' in self.metadata:
+                print(f"  Search depth: {self.metadata['search_depth']}")
+            elif 'eval_depth' in self.metadata:
+                print(f"  Evaluation depth: {self.metadata['eval_depth']}")
             print(f"  Number of files: {self.metadata['num_files']}")
         
         # Load all positions into memory
@@ -859,8 +929,7 @@ def pretrain_eval_matching(
     aggression: int = 3,
     max_depth: int = 50,
     branch_probability: float = 0.3,
-    eval_depth: int = 0,
-    engine_depth: int = 3,
+    search_depth: int = 3,
     random_move_probability: float = 0.1,
     suboptimal_move_probability: float = 0.2,
     top_n_moves: int = 3,
@@ -874,7 +943,7 @@ def pretrain_eval_matching(
     
     Each epoch:
     1. Generate N unique positions using engine self-play with stochasticity
-    2. Evaluate each position with the Rust engine
+    2. Evaluate each position with the Rust engine (using the same search as move selection)
     3. Train the GNN to match these evaluations using MSE loss with mini-batching
     
     Args:
@@ -887,9 +956,8 @@ def pretrain_eval_matching(
         aggression: Aggression level 1-5 for BasicEvaluator (default: 3)
         max_depth: Maximum depth for position generation (default: 50)
         branch_probability: Branching probability during position generation (default: 0.3)
-        eval_depth: Search depth for minimax evaluation (default: 0 for static eval)
-                   If > 0, uses minimax to evaluate position N moves ahead
-        engine_depth: Search depth for engine move selection (default: 3)
+        search_depth: Search depth for both move selection and evaluation (default: 3)
+                     If 0, uses static evaluation; if > 0, uses minimax
         random_move_probability: Probability of choosing random moves (default: 0.1)
         suboptimal_move_probability: Probability of choosing suboptimal moves (default: 0.2)
         top_n_moves: Number of top moves to consider for suboptimal selection (default: 3)
@@ -913,8 +981,7 @@ def pretrain_eval_matching(
         aggression=aggression,
         max_depth=max_depth,
         branch_probability=branch_probability,
-        eval_depth=eval_depth,
-        engine_depth=engine_depth,
+        search_depth=search_depth,
         random_move_probability=random_move_probability,
         suboptimal_move_probability=suboptimal_move_probability,
         top_n_moves=top_n_moves,
@@ -926,7 +993,7 @@ def pretrain_eval_matching(
         print(f"Training on {len(dataset)} positions per epoch...")
         print(f"Regenerating positions each epoch: {regenerate_each_epoch}")
         print(f"Using engine self-play with:")
-        print(f"  Engine depth: {engine_depth}")
+        print(f"  Search depth: {search_depth}")
         print(f"  Random move probability: {random_move_probability}")
         print(f"  Suboptimal move probability: {suboptimal_move_probability}")
     
@@ -1222,7 +1289,7 @@ def generate_eval_matching_data(
         aggression: Aggression level 1-5 for BasicEvaluator
         randomness_rate: Ignored (kept for compatibility)
         max_moves: Used as max_depth for random walks
-        eval_depth: Search depth for minimax evaluation (default: 0 for static eval)
+        eval_depth: Used as search_depth (search depth for both move selection and evaluation)
         verbose: Print progress information
         
     Returns:
@@ -1245,7 +1312,7 @@ def generate_eval_matching_data(
         aggression=aggression,
         max_depth=max_depth,
         branch_probability=0.3,
-        eval_depth=eval_depth,
+        search_depth=eval_depth,
         verbose=verbose,
     )
 
@@ -1284,34 +1351,28 @@ if __name__ == "__main__":
         help="Probability of creating a branch point (default: 0.3)"
     )
     parser.add_argument(
-        "--eval-depth",
-        type=int,
-        default=0,
-        help="Search depth for minimax evaluation (default: 0 for static eval)"
-    )
-    parser.add_argument(
-        "--engine-depth",
+        "--search-depth",
         type=int,
         default=3,
-        help="Search depth for engine move selection (default: 3)"
+        help="Search depth for both move selection and evaluation (default: 3, 0=static eval)"
     )
     parser.add_argument(
         "--random-move-probability",
         type=float,
-        default=0.1,
-        help="Probability of choosing completely random moves (default: 0.1)"
+        default=0.3,
+        help="Probability of choosing completely random moves (default: 0.3)"
     )
     parser.add_argument(
         "--suboptimal-move-probability",
         type=float,
-        default=0.2,
-        help="Probability of choosing suboptimal moves from top-N (default: 0.2)"
+        default=0.0,
+        help="DEPRECATED - suboptimal move selection removed for performance (default: 0.0)"
     )
     parser.add_argument(
         "--top-n-moves",
         type=int,
         default=3,
-        help="Number of top moves to consider for suboptimal selection (default: 3)"
+        help="DEPRECATED - not used without suboptimal move selection (default: 3)"
     )
     
     # Output parameters
@@ -1361,8 +1422,7 @@ if __name__ == "__main__":
             aggression=3,
             max_depth=30,
             branch_probability=0.3,
-            eval_depth=0,  # Static evaluation
-            engine_depth=2,  # Shallow engine search for testing
+            search_depth=2,  # Shallow search for testing
             random_move_probability=0.1,
             suboptimal_move_probability=0.2,
             top_n_moves=3,
@@ -1387,8 +1447,7 @@ if __name__ == "__main__":
             aggression=3,
             max_depth=30,
             branch_probability=0.3,
-            eval_depth=2,  # Minimax evaluation at depth 2
-            engine_depth=2,
+            search_depth=2,  # Minimax search at depth 2
             random_move_probability=0.1,
             suboptimal_move_probability=0.2,
             top_n_moves=3,
@@ -1404,8 +1463,7 @@ if __name__ == "__main__":
             aggression=3,
             max_depth=30,
             branch_probability=0.3,
-            eval_depth=0,
-            engine_depth=2,
+            search_depth=2,
             random_move_probability=0.1,
             suboptimal_move_probability=0.2,
             top_n_moves=3,
@@ -1428,8 +1486,7 @@ if __name__ == "__main__":
             aggression=3,
             max_depth=30,
             branch_probability=0.3,
-            eval_depth=0,
-            engine_depth=2,
+            search_depth=2,
             random_move_probability=0.1,
             suboptimal_move_probability=0.2,
             top_n_moves=3,
@@ -1454,8 +1511,7 @@ if __name__ == "__main__":
             aggression=args.aggression,
             max_depth=args.max_depth,
             branch_probability=args.branch_probability,
-            eval_depth=args.eval_depth,
-            engine_depth=args.engine_depth,
+            search_depth=args.search_depth,
             random_move_probability=args.random_move_probability,
             suboptimal_move_probability=args.suboptimal_move_probability,
             top_n_moves=args.top_n_moves,
