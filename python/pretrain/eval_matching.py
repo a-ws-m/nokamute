@@ -51,7 +51,6 @@ def generate_random_positions_branching(
     suboptimal_move_probability: float = 0.2,
     top_n_moves: int = 3,
     verbose: bool = True,
-    use_cached_engine: bool = True,
 ) -> List[Tuple[List[float], List[List[int]], float]]:
     """
     Generate positions using engine self-play with stochasticity and branching.
@@ -80,7 +79,6 @@ def generate_random_positions_branching(
         suboptimal_move_probability: Probability of choosing a suboptimal move from top-N (default: 0.2)
         top_n_moves: Number of top moves to consider for suboptimal selection (default: 3)
         verbose: Print progress information
-        use_cached_engine: Use CachedEngine for better performance (default: True)
         
     Returns:
         List of (node_features, edge_index, eval_score) tuples
@@ -89,21 +87,11 @@ def generate_random_positions_branching(
     unique_positions = {}  # Map: graph_hash -> (node_features, edge_index, eval_score)
     branch_points = []  # List of (board_state, depth) tuples for branching
     
-    # Create cached engine for efficient move selection
-    cached_engine = None
-    if use_cached_engine:
-        cached_engine = nokamute.CachedEngine(
-            aggression=aggression,
-            depth=engine_depth,
-            table_size_mb=200  # Use larger cache for better hit rates
-        )
-    
     if verbose:
         print(f"Generating {num_positions} unique positions using engine self-play with branching...")
         print(f"  Engine depth: {engine_depth}")
         print(f"  Random move probability: {random_move_probability}")
         print(f"  Suboptimal move probability: {suboptimal_move_probability}")
-        print(f"  Using cached engine: {use_cached_engine}")
         pbar = tqdm(total=num_positions, desc="Generating positions")
     
     # Start with initial position
@@ -139,17 +127,11 @@ def generate_random_positions_branching(
             move = random.choice(legal_moves)
         elif rand < random_move_probability + suboptimal_move_probability:
             # Choose from top-N moves
-            if use_cached_engine and cached_engine is not None:
-                move = cached_engine.get_suboptimal_move(board, top_n=top_n_moves)
-            else:
-                move = _choose_suboptimal_move(board, legal_moves, aggression, engine_depth, top_n_moves)
+            move = _choose_suboptimal_move(board, legal_moves, aggression, engine_depth, top_n_moves)
         else:
             # Choose best engine move
-            if use_cached_engine and cached_engine is not None:
-                move = cached_engine.get_move(board)
-            else:
-                engine_move = board.get_engine_move(depth=engine_depth, aggression=aggression)
-                move = engine_move if engine_move is not None else random.choice(legal_moves)
+            engine_move = board.get_engine_move(depth=engine_depth, aggression=aggression)
+            move = engine_move if engine_move is not None else random.choice(legal_moves)
         
         board.apply(move)
         
@@ -259,14 +241,14 @@ def _generate_position_batch_worker(args):
     Args:
         args: Tuple of (batch_size, aggression, max_depth, branch_probability, eval_depth, 
                         engine_depth, random_move_probability, suboptimal_move_probability, 
-                        top_n_moves, use_cached_engine, seed)
+                        top_n_moves, seed)
         
     Returns:
         List of (node_features, edge_index, eval_score) tuples
     """
     (batch_size, aggression, max_depth, branch_probability, eval_depth, 
      engine_depth, random_move_probability, suboptimal_move_probability, 
-     top_n_moves, use_cached_engine, seed) = args
+     top_n_moves, seed) = args
     
     # Set random seed for this batch
     random.seed(seed)
@@ -282,7 +264,6 @@ def _generate_position_batch_worker(args):
         random_move_probability=random_move_probability,
         suboptimal_move_probability=suboptimal_move_probability,
         top_n_moves=top_n_moves,
-        use_cached_engine=use_cached_engine,
         verbose=False,
     )
     
@@ -346,7 +327,6 @@ def generate_and_save_positions(
     num_workers: Optional[int] = None,
     force_refresh: bool = False,
     verbose: bool = True,
-    use_cached_engine: bool = True,
 ) -> str:
     """
     Generate positions using engine self-play and save to disk using multiprocessing.
@@ -368,7 +348,6 @@ def generate_and_save_positions(
         num_workers: Number of parallel workers (default: cpu_count())
         force_refresh: If True, ignore cache and regenerate data
         verbose: Print progress information
-        use_cached_engine: Use CachedEngine for better performance (default: True)
         
     Returns:
         Path to the cache directory containing the generated positions
@@ -413,7 +392,6 @@ def generate_and_save_positions(
         print(f"  Engine depth: {engine_depth}")
         print(f"  Random move probability: {random_move_probability}")
         print(f"  Suboptimal move probability: {suboptimal_move_probability}")
-        print(f"  Using cached engine: {use_cached_engine}")
     
     # Create cache directory
     cache_data_dir.mkdir(parents=True, exist_ok=True)
@@ -431,7 +409,7 @@ def generate_and_save_positions(
         seed = random.randint(0, 2**32 - 1)
         work_items.append((current_batch_size, aggression, max_depth, branch_probability, 
                           eval_depth, engine_depth, random_move_probability, 
-                          suboptimal_move_probability, top_n_moves, use_cached_engine, seed))
+                          suboptimal_move_probability, top_n_moves, seed))
     
     # Run workers in parallel
     if verbose:
@@ -617,7 +595,6 @@ class EvaluationMatchingDataset(Dataset):
         top_n_moves: int = 3,
         scale: float = 0.001,
         regenerate_each_epoch: bool = True,
-        use_cached_engine: bool = True,
     ):
         """
         Initialize the evaluation matching dataset.
@@ -634,7 +611,6 @@ class EvaluationMatchingDataset(Dataset):
             top_n_moves: Number of top moves to consider for suboptimal selection
             scale: Scaling factor for normalizing evaluations
             regenerate_each_epoch: If True, generate new positions each epoch
-            use_cached_engine: Use CachedEngine for better performance
         """
         super().__init__()
         self.num_positions = num_positions
@@ -648,7 +624,6 @@ class EvaluationMatchingDataset(Dataset):
         self.top_n_moves = top_n_moves
         self.scale = scale
         self.regenerate_each_epoch = regenerate_each_epoch
-        self.use_cached_engine = use_cached_engine
         
         # Generate initial data
         self._regenerate_positions()
@@ -665,7 +640,6 @@ class EvaluationMatchingDataset(Dataset):
             random_move_probability=self.random_move_probability,
             suboptimal_move_probability=self.suboptimal_move_probability,
             top_n_moves=self.top_n_moves,
-            use_cached_engine=self.use_cached_engine,
             verbose=False,
         )
         
@@ -872,7 +846,6 @@ def pretrain_eval_matching(
     top_n_moves: int = 3,
     scale: float = 0.001,
     regenerate_each_epoch: bool = True,
-    use_cached_engine: bool = True,
     verbose: bool = True,
     epoch_callback=None,
 ) -> List[float]:
@@ -902,7 +875,6 @@ def pretrain_eval_matching(
         top_n_moves: Number of top moves to consider for suboptimal selection (default: 3)
         scale: Scaling factor for normalizing evaluations (default: 0.001)
         regenerate_each_epoch: If True, generate new positions each epoch (default: True)
-        use_cached_engine: Use CachedEngine for better performance (default: True)
         verbose: Print progress information
         epoch_callback: Optional callback function called after each epoch with (epoch, loss)
         
@@ -928,7 +900,6 @@ def pretrain_eval_matching(
         top_n_moves=top_n_moves,
         scale=scale,
         regenerate_each_epoch=regenerate_each_epoch,
-        use_cached_engine=use_cached_engine,
     )
     
     if verbose:

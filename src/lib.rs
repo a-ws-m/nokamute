@@ -8,10 +8,6 @@ mod cli;
 pub use cli::*;
 mod eval;
 pub use eval::*;
-#[cfg(not(target_arch = "wasm32"))]
-mod cached_engine;
-#[cfg(not(target_arch = "wasm32"))]
-pub use cached_engine::*;
 mod hex_grid;
 pub use hex_grid::*;
 #[cfg(not(target_arch = "wasm32"))]
