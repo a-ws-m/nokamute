@@ -422,6 +422,10 @@ def generate_and_save_positions(
     file_index = 0
     current_batch = []
     
+    # Track unique positions across all batches to prevent duplicates
+    seen_hashes = set()
+    duplicates_skipped = 0
+    
     # Track statistics without keeping all positions in memory
     eval_min = float('inf')
     eval_max = float('-inf')
@@ -440,11 +444,22 @@ def generate_and_save_positions(
             for batch in pool.imap(_generate_position_batch_worker, work_items):
                 # Process each position in the batch
                 for position in batch:
+                    # Check for duplicates across all batches
+                    node_features, edge_index, eval_score = position
+                    pos_hash = graph_hash(node_features, edge_index)
+                    
+                    if pos_hash in seen_hashes:
+                        # Skip duplicate position
+                        duplicates_skipped += 1
+                        continue
+                    
+                    # Add to seen hashes
+                    seen_hashes.add(pos_hash)
+                    
                     current_batch.append(position)
                     total_positions += 1
                     
                     # Update statistics
-                    _, _, eval_score = position
                     eval_min = min(eval_min, eval_score)
                     eval_max = max(eval_max, eval_score)
                     eval_sum += eval_score
@@ -474,11 +489,22 @@ def generate_and_save_positions(
             for batch in pool.map(_generate_position_batch_worker, work_items):
                 # Process each position in the batch
                 for position in batch:
+                    # Check for duplicates across all batches
+                    node_features, edge_index, eval_score = position
+                    pos_hash = graph_hash(node_features, edge_index)
+                    
+                    if pos_hash in seen_hashes:
+                        # Skip duplicate position
+                        duplicates_skipped += 1
+                        continue
+                    
+                    # Add to seen hashes
+                    seen_hashes.add(pos_hash)
+                    
                     current_batch.append(position)
                     total_positions += 1
                     
                     # Update statistics
-                    _, _, eval_score = position
                     eval_min = min(eval_min, eval_score)
                     eval_max = max(eval_max, eval_score)
                     eval_sum += eval_score
@@ -530,7 +556,8 @@ def generate_and_save_positions(
         print(f"\n{'='*60}")
         print(f"Data Generation Complete")
         print(f"{'='*60}")
-        print(f"Total positions: {total_positions}")
+        print(f"Total unique positions: {total_positions}")
+        print(f"Duplicates skipped: {duplicates_skipped}")
         print(f"Saved to: {cache_data_dir}")
         print(f"Number of files: {file_index}")
         
@@ -1227,8 +1254,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-depth",
         type=int,
-        default=200,
-        help="Maximum number of moves from start position (default: 200)"
+        default=500,
+        help="Maximum number of moves from start position (default: 500)"
     )
     parser.add_argument(
         "--branch-probability",
