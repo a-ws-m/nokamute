@@ -13,7 +13,7 @@ class HiveGNN(nn.Module):
     Graph Neural Network for evaluating Hive board positions.
 
     Architecture:
-    - Input: Graph with node features (color, bug type, height, stacking)
+    - Input: Graph with node features (color, bug type, height, current player)
     - Multiple GAT (Graph Attention) layers for message passing
     - Global pooling (mean + max)
     - MLP head for position evaluation
@@ -25,7 +25,7 @@ class HiveGNN(nn.Module):
 
     def __init__(
         self,
-        node_features=11,  # color (1) + bug onehot (9) + height (1)
+        node_features=12,  # color (1) + bug onehot (9) + height (1) + current_player (1)
         hidden_dim=128,
         num_layers=4,
         num_heads=4,
@@ -159,7 +159,7 @@ def create_model(config=None):
         config = {}
 
     return HiveGNN(
-        node_features=config.get("node_features", 11),  # color + bug_onehot + height
+        node_features=config.get("node_features", 12),  # color + bug_onehot + height + current_player
         hidden_dim=config.get("hidden_dim", 128),
         num_layers=config.get("num_layers", 4),
         num_heads=config.get("num_heads", 4),
@@ -174,9 +174,9 @@ if __name__ == "__main__":
     model = create_model()
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Create dummy data with correct feature size (11)
+    # Create dummy data with correct feature size (12)
     num_nodes = 10
-    node_features = 11  # color + bug_onehot (9) + height
+    node_features = 12  # color + bug_onehot (9) + height + current_player
     num_edges = 20
 
     x = torch.randn(num_nodes, node_features)
