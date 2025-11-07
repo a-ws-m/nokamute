@@ -755,6 +755,53 @@ def normalize_evaluation(eval_score: float, scale: float = 0.001) -> float:
     return torch.tanh(torch.tensor(eval_score * scale)).item()
 
 
+def split_dataset(dataset, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1, seed=42):
+    """
+    Split a dataset into train/validation/test sets.
+    
+    Args:
+        dataset: PyTorch Geometric Dataset
+        train_ratio: Fraction for training (default: 0.8)
+        val_ratio: Fraction for validation (default: 0.1)
+        test_ratio: Fraction for testing (default: 0.1)
+        seed: Random seed for reproducibility
+        
+    Returns:
+        Tuple of (train_dataset, val_dataset, test_dataset)
+    """
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
+    
+    # Set random seed
+    import random
+    random.seed(seed)
+    torch.manual_seed(seed)
+    
+    # Get total size
+    total_size = len(dataset)
+    
+    # Calculate split sizes
+    train_size = int(total_size * train_ratio)
+    val_size = int(total_size * val_ratio)
+    test_size = total_size - train_size - val_size  # Ensure all samples are used
+    
+    # Create random indices
+    indices = list(range(total_size))
+    random.shuffle(indices)
+    
+    # Split indices
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:train_size + val_size]
+    test_indices = indices[train_size + val_size:]
+    
+    # Create subset datasets
+    from torch.utils.data import Subset
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices)
+    test_dataset = Subset(dataset, test_indices)
+    
+    return train_dataset, val_dataset, test_dataset
+
+
 def pretrain_eval_matching(
     model,
     num_positions_per_epoch: int = 1000,
@@ -887,6 +934,191 @@ def pretrain_eval_matching(
             epoch_callback(epoch, avg_loss)
     
     return epoch_losses
+
+
+def pretrain_eval_matching_with_validation(
+    model,
+    train_dataset,
+    val_dataset,
+    test_dataset,
+    optimizer=None,
+    num_epochs: int = 50,
+    batch_size: int = 64,
+    device: str = "cpu",
+    scale: float = 0.001,
+    verbose: bool = True,
+    checkpoint_callback=None,
+    writer=None,
+) -> dict:
+    """
+    Pre-train model with proper train/validation/test split.
+    
+    This function trains on the training set, validates on the validation set,
+    and reports final test performance.
+    
+    Args:
+        model: GNN model to train
+        train_dataset: Training dataset (PyTorch Dataset or Subset)
+        val_dataset: Validation dataset (PyTorch Dataset or Subset)
+        test_dataset: Test dataset (PyTorch Dataset or Subset)
+        optimizer: PyTorch optimizer (if None, uses Adam with lr=1e-3)
+        num_epochs: Number of training epochs (default: 50)
+        batch_size: Batch size for mini-batch training
+        device: Device to train on
+        scale: Scaling factor for normalizing evaluations (default: 0.001)
+        verbose: Print progress information
+        checkpoint_callback: Optional callback(epoch, train_loss, val_loss, is_best) -> None
+        writer: Optional TensorBoard SummaryWriter for logging
+        
+    Returns:
+        Dictionary with training history and test results:
+        {
+            'train_losses': List of training losses per epoch,
+            'val_losses': List of validation losses per epoch,
+            'test_loss': Final test loss,
+            'best_epoch': Epoch with best validation loss,
+            'best_val_loss': Best validation loss achieved
+        }
+    """
+    if optimizer is None:
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+    if verbose:
+        print(f"\nDataset sizes:")
+        print(f"  Training:   {len(train_dataset):,} positions")
+        print(f"  Validation: {len(val_dataset):,} positions")
+        print(f"  Test:       {len(test_dataset):,} positions")
+        print(f"\nTraining for {num_epochs} epochs...")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Device: {device}")
+    
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    best_epoch = 0
+    
+    for epoch in tqdm(range(num_epochs), desc="Training epochs", disable=not verbose):
+        # Training phase
+        model.train()
+        train_total_loss = 0
+        train_num_batches = 0
+        
+        for batch in train_loader:
+            batch = batch.to(device)
+            
+            # Forward pass
+            optimizer.zero_grad()
+            predictions, _ = model(batch.x, batch.edge_index, batch.batch)
+            
+            # Extract targets from batch
+            targets = batch.y.unsqueeze(1) if batch.y.dim() == 1 else batch.y
+            
+            # Compute MSE loss
+            loss = F.mse_loss(predictions, targets)
+            
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+            
+            train_total_loss += loss.item()
+            train_num_batches += 1
+        
+        train_loss = train_total_loss / max(train_num_batches, 1)
+        train_losses.append(train_loss)
+        
+        # Validation phase
+        model.eval()
+        val_total_loss = 0
+        val_num_batches = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = batch.to(device)
+                
+                # Forward pass
+                predictions, _ = model(batch.x, batch.edge_index, batch.batch)
+                
+                # Extract targets from batch
+                targets = batch.y.unsqueeze(1) if batch.y.dim() == 1 else batch.y
+                
+                # Compute MSE loss
+                loss = F.mse_loss(predictions, targets)
+                
+                val_total_loss += loss.item()
+                val_num_batches += 1
+        
+        val_loss = val_total_loss / max(val_num_batches, 1)
+        val_losses.append(val_loss)
+        
+        # Check if this is the best model so far
+        is_best = val_loss < best_val_loss
+        if is_best:
+            best_val_loss = val_loss
+            best_epoch = epoch
+        
+        # Log to tensorboard if provided
+        if writer is not None:
+            writer.add_scalar("Pretrain/TrainLoss", train_loss, epoch)
+            writer.add_scalar("Pretrain/ValLoss", val_loss, epoch)
+            writer.add_scalar("Pretrain/BestValLoss", best_val_loss, epoch)
+        
+        # Print progress
+        if verbose and ((epoch + 1) % 10 == 0 or epoch == 0):
+            tqdm.write(f"Epoch {epoch + 1}/{num_epochs}: "
+                      f"Train Loss = {train_loss:.6f}, "
+                      f"Val Loss = {val_loss:.6f}"
+                      f"{' (BEST)' if is_best else ''}")
+        
+        # Call checkpoint callback if provided
+        if checkpoint_callback is not None:
+            checkpoint_callback(epoch, train_loss, val_loss, is_best)
+    
+    # Final evaluation on test set
+    if verbose:
+        print(f"\nBest validation loss: {best_val_loss:.6f} at epoch {best_epoch + 1}")
+        print(f"\nEvaluating on test set...")
+    
+    model.eval()
+    test_total_loss = 0
+    test_num_batches = 0
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            batch = batch.to(device)
+            
+            # Forward pass
+            predictions, _ = model(batch.x, batch.edge_index, batch.batch)
+            
+            # Extract targets from batch
+            targets = batch.y.unsqueeze(1) if batch.y.dim() == 1 else batch.y
+            
+            # Compute MSE loss
+            loss = F.mse_loss(predictions, targets)
+            
+            test_total_loss += loss.item()
+            test_num_batches += 1
+    
+    test_loss = test_total_loss / max(test_num_batches, 1)
+    
+    if verbose:
+        print(f"Test loss: {test_loss:.6f}")
+    
+    # Log final test loss
+    if writer is not None:
+        writer.add_scalar("Pretrain/TestLoss", test_loss, num_epochs)
+    
+    return {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'test_loss': test_loss,
+        'best_epoch': best_epoch,
+        'best_val_loss': best_val_loss,
+    }
 
 
 

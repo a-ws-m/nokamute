@@ -685,118 +685,66 @@ def main():
                 print(f"Method: Load pre-generated positions from disk")
                 print(f"Data path: {args.pretrain_data_path}")
                 
-                from pretrain.eval_matching import CachedEvaluationDataset
+                from pretrain.eval_matching import CachedEvaluationDataset, split_dataset
                 
-                # Load dataset
+                # Load full dataset
                 print(f"\nLoading cached evaluation data...")
-                dataset = CachedEvaluationDataset(
+                full_dataset = CachedEvaluationDataset(
                     cache_dir=args.pretrain_data_path,
                     scale=0.001,
                     verbose=True,
                 )
                 
-                # Create DataLoader
-                loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+                # Split into train/val/test
+                print(f"\nSplitting dataset (80% train, 10% val, 10% test)...")
+                train_dataset, val_dataset, test_dataset = split_dataset(
+                    full_dataset, 
+                    train_ratio=0.8, 
+                    val_ratio=0.1, 
+                    test_ratio=0.1,
+                    seed=42
+                )
+                
+                print(f"Dataset sizes:")
+                print(f"  Training:   {len(train_dataset):,} positions")
+                print(f"  Validation: {len(val_dataset):,} positions")
+                print(f"  Test:       {len(test_dataset):,} positions")
                 
                 print(f"\nPre-training for {args.epochs} epochs...")
-                print(f"Total positions: {len(dataset)}")
                 print(f"Batch size: {args.batch_size}")
                 print(f"Learning rate: {args.lr}")
                 print(f"Using same data each epoch (shuffled)")
                 print(f"Saving checkpoints every {args.save_interval} epochs")
                 
-                # Define checkpoint save path
+                # Define checkpoint save paths
                 pretrain_model_path = os.path.join(args.model_path, "model_eval_matching_latest.pt")
+                pretrain_best_model_path = os.path.join(args.model_path, "model_eval_matching_best.pt")
                 
-                # Training loop
-                model.train()
-                pretrain_losses = []
+                # Track best model state
+                best_model_state = None
+                best_val_loss = float('inf')
+                best_epoch_num = 0
                 
-                for epoch in tqdm(range(args.epochs), desc="Pre-training epochs"):
-                    total_loss = 0
-                    num_batches = 0
+                # Define checkpoint callback
+                def checkpoint_callback(epoch, train_loss, val_loss, is_best):
+                    nonlocal best_model_state, best_val_loss, best_epoch_num
                     
-                    for batch in loader:
-                        batch = batch.to(args.device)
-                        
-                        # Forward pass
-                        optimizer.zero_grad()
-                        predictions, _ = model(batch.x, batch.edge_index, batch.batch)
-                        
-                        # Extract targets from batch
-                        targets = batch.y.unsqueeze(1) if batch.y.dim() == 1 else batch.y
-                        
-                        # Compute MSE loss
-                        loss = F.mse_loss(predictions, targets)
-                        
-                        # Backward pass
-                        loss.backward()
-                        optimizer.step()
-                        
-                        total_loss += loss.item()
-                        num_batches += 1
-                    
-                    avg_loss = total_loss / max(num_batches, 1)
-                    pretrain_losses.append(avg_loss)
-                    
-                    # Log to tensorboard
-                    writer.add_scalar("Pretrain/Loss", avg_loss, epoch)
-                    
-                    # Print progress
-                    if (epoch + 1) % 10 == 0:
-                        tqdm.write(f"Epoch {epoch + 1}/{args.epochs}: Loss = {avg_loss:.6f}")
-                    
-                    # Save checkpoint at intervals
-                    if (epoch + 1) % args.save_interval == 0:
-                        torch.save({
-                            "model_state_dict": model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
+                    # Update best model if this is the best so far
+                    if is_best:
+                        best_model_state = {
+                            "model_state_dict": model.state_dict().copy(),
+                            "optimizer_state_dict": optimizer.state_dict().copy(),
                             "pretrain_method": args.pretrain,
-                            "pretrain_loss": avg_loss,
+                            "pretrain_train_loss": train_loss,
+                            "pretrain_val_loss": val_loss,
                             "config": model_config,
                             "pretrain_data_path": args.pretrain_data_path,
                             "epoch": epoch + 1,
                             "total_epochs": args.epochs,
-                        }, pretrain_model_path)
-                        print(f"  Checkpoint saved at epoch {epoch + 1}: {pretrain_model_path}")
-                
-                # Save final pre-trained model
-                torch.save({
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "pretrain_method": args.pretrain,
-                    "pretrain_loss": pretrain_losses[-1],
-                    "config": model_config,
-                    "pretrain_data_path": args.pretrain_data_path,
-                    "epoch": args.epochs,
-                    "total_epochs": args.epochs,
-                }, pretrain_model_path)
-                print(f"\nFinal pre-trained model saved to: {pretrain_model_path}")
-                print(f"Final pre-training loss: {pretrain_losses[-1]:.6f}")
-                
-            else:
-                # Generate positions on-the-fly each epoch (old method)
-                print(f"Method: Branching Markov chain random position generation")
-                print(f"Positions generated fresh each epoch")
-                
-                # Pre-train the model using the new branching approach
-                # This generates fresh random positions each epoch
-                print(f"\nPre-training for {args.epochs} epochs...")
-                print(f"Positions per epoch: {args.pretrain_positions}")
-                print(f"Batch size: {args.batch_size}")
-                print(f"Learning rate: {args.lr}")
-                print(f"Max depth for random walks: {min(args.max_moves, 50)}")
-                print(f"Branch probability: 0.3")
-                print(f"Evaluation depth: {args.pretrain_eval_depth} (0=static, >0=minimax)")
-                print(f"Saving checkpoints every {args.save_interval} epochs")
-                
-                # Define checkpoint save path
-                pretrain_model_path = os.path.join(args.model_path, "model_eval_matching_latest.pt")
-                
-                # Define epoch callback for tensorboard logging and checkpoint saving
-                def epoch_callback(epoch, loss):
-                    # Log to tensorboard
-                    writer.add_scalar("Pretrain/Loss", loss, epoch)
+                            "is_best": True,
+                        }
+                        best_val_loss = val_loss
+                        best_epoch_num = epoch + 1
                     
                     # Save checkpoint at intervals
                     if (epoch + 1) % args.save_interval == 0:
@@ -804,46 +752,241 @@ def main():
                             "model_state_dict": model.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
                             "pretrain_method": args.pretrain,
-                            "pretrain_loss": loss,
+                            "pretrain_train_loss": train_loss,
+                            "pretrain_val_loss": val_loss,
                             "config": model_config,
-                            "pretrain_positions": args.pretrain_positions,
-                            "pretrain_eval_depth": args.pretrain_eval_depth,
+                            "pretrain_data_path": args.pretrain_data_path,
                             "epoch": epoch + 1,
                             "total_epochs": args.epochs,
+                            "best_val_loss": best_val_loss,
+                            "best_epoch": best_epoch_num,
                         }, pretrain_model_path)
                         print(f"  Checkpoint saved at epoch {epoch + 1}: {pretrain_model_path}")
                 
-                pretrain_losses = pretrain_eval_matching(
+                # Train with validation
+                from pretrain.eval_matching import pretrain_eval_matching_with_validation
+                
+                results = pretrain_eval_matching_with_validation(
                     model=model,
-                    num_positions_per_epoch=args.pretrain_positions,
+                    train_dataset=train_dataset,
+                    val_dataset=val_dataset,
+                    test_dataset=test_dataset,
                     optimizer=optimizer,
                     num_epochs=args.epochs,
                     batch_size=args.batch_size,
                     device=args.device,
-                    aggression=3,
-                    max_depth=min(args.max_moves, 50),
-                    branch_probability=0.3,
-                    eval_depth=args.pretrain_eval_depth,
                     scale=0.001,
-                    regenerate_each_epoch=True,  # Fresh positions each epoch
                     verbose=True,
-                    epoch_callback=epoch_callback,
+                    checkpoint_callback=checkpoint_callback,
+                    writer=writer,
                 )
                 
-                # Save final pre-trained model
+                # Save final model (latest epoch)
                 torch.save({
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "pretrain_method": args.pretrain,
-                    "pretrain_loss": pretrain_losses[-1],
+                    "pretrain_train_loss": results['train_losses'][-1],
+                    "pretrain_val_loss": results['val_losses'][-1],
+                    "pretrain_test_loss": results['test_loss'],
                     "config": model_config,
-                    "pretrain_positions": args.pretrain_positions,
+                    "pretrain_data_path": args.pretrain_data_path,
+                    "epoch": args.epochs,
+                    "total_epochs": args.epochs,
+                    "best_val_loss": results['best_val_loss'],
+                    "best_epoch": results['best_epoch'] + 1,
+                }, pretrain_model_path)
+                print(f"\nFinal pre-trained model saved to: {pretrain_model_path}")
+                
+                # Save best model
+                if best_model_state is not None:
+                    torch.save(best_model_state, pretrain_best_model_path)
+                    print(f"Best pre-trained model saved to: {pretrain_best_model_path}")
+                    print(f"  Best validation loss: {results['best_val_loss']:.6f} at epoch {results['best_epoch'] + 1}")
+                
+                # Print results summary
+                print(f"\nPre-training Results:")
+                print(f"  Final train loss:      {results['train_losses'][-1]:.6f}")
+                print(f"  Final validation loss: {results['val_losses'][-1]:.6f}")
+                print(f"  Test loss:             {results['test_loss']:.6f}")
+                print(f"  Best validation loss:  {results['best_val_loss']:.6f} (epoch {results['best_epoch'] + 1})")
+                
+            else:
+                # Generate positions on-the-fly (not recommended for proper train/val/test split)
+                # For best results, use --pretrain-data-path with pre-generated data
+                print(f"Method: Branching Markov chain random position generation")
+                print(f"WARNING: On-the-fly generation doesn't support proper train/val/test split")
+                print(f"         Consider using --pretrain-data-path with pre-generated data")
+                print(f"Positions generated fresh each epoch")
+                
+                # Generate a large dataset once for splitting
+                print(f"\nGenerating initial dataset for train/val/test split...")
+                total_positions = args.pretrain_positions * 3  # Generate enough for splitting
+                
+                from pretrain.eval_matching import (
+                    generate_random_positions_branching,
+                    EvaluationMatchingDataset,
+                    split_dataset,
+                    pretrain_eval_matching_with_validation
+                )
+                
+                # Generate positions
+                print(f"Generating {total_positions} positions...")
+                raw_data = generate_random_positions_branching(
+                    num_positions=total_positions,
+                    aggression=3,
+                    max_depth=min(args.max_moves, 50),
+                    branch_probability=0.3,
+                    eval_depth=args.pretrain_eval_depth,
+                    engine_depth=3,
+                    random_move_probability=0.1,
+                    suboptimal_move_probability=0.2,
+                    top_n_moves=3,
+                    verbose=True,
+                )
+                
+                # Create dataset from raw data
+                from torch_geometric.data import Data
+                data_list = []
+                scale = 0.001
+                for node_features, edge_index, eval_score in raw_data:
+                    x = torch.tensor(node_features, dtype=torch.float32)
+                    edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
+                    normalized_score = torch.tanh(torch.tensor(eval_score * scale))
+                    
+                    data = Data(x=x, edge_index=edge_index_tensor)
+                    data.y = normalized_score
+                    data_list.append(data)
+                
+                # Create a simple dataset wrapper
+                class SimpleDataset:
+                    def __init__(self, data_list):
+                        self.data_list = data_list
+                    
+                    def __len__(self):
+                        return len(self.data_list)
+                    
+                    def __getitem__(self, idx):
+                        return self.data_list[idx]
+                
+                full_dataset = SimpleDataset(data_list)
+                
+                # Split into train/val/test
+                print(f"\nSplitting dataset (80% train, 10% val, 10% test)...")
+                train_dataset, val_dataset, test_dataset = split_dataset(
+                    full_dataset,
+                    train_ratio=0.8,
+                    val_ratio=0.1,
+                    test_ratio=0.1,
+                    seed=42
+                )
+                
+                print(f"Dataset sizes:")
+                print(f"  Training:   {len(train_dataset):,} positions")
+                print(f"  Validation: {len(val_dataset):,} positions")
+                print(f"  Test:       {len(test_dataset):,} positions")
+                
+                print(f"\nPre-training for {args.epochs} epochs...")
+                print(f"Batch size: {args.batch_size}")
+                print(f"Learning rate: {args.lr}")
+                print(f"Evaluation depth: {args.pretrain_eval_depth} (0=static, >0=minimax)")
+                print(f"Saving checkpoints every {args.save_interval} epochs")
+                
+                # Define checkpoint save paths
+                pretrain_model_path = os.path.join(args.model_path, "model_eval_matching_latest.pt")
+                pretrain_best_model_path = os.path.join(args.model_path, "model_eval_matching_best.pt")
+                
+                # Track best model state
+                best_model_state = None
+                best_val_loss = float('inf')
+                best_epoch_num = 0
+                
+                # Define checkpoint callback
+                def checkpoint_callback(epoch, train_loss, val_loss, is_best):
+                    nonlocal best_model_state, best_val_loss, best_epoch_num
+                    
+                    # Update best model if this is the best so far
+                    if is_best:
+                        best_model_state = {
+                            "model_state_dict": model.state_dict().copy(),
+                            "optimizer_state_dict": optimizer.state_dict().copy(),
+                            "pretrain_method": args.pretrain,
+                            "pretrain_train_loss": train_loss,
+                            "pretrain_val_loss": val_loss,
+                            "config": model_config,
+                            "pretrain_positions": total_positions,
+                            "pretrain_eval_depth": args.pretrain_eval_depth,
+                            "epoch": epoch + 1,
+                            "total_epochs": args.epochs,
+                            "is_best": True,
+                        }
+                        best_val_loss = val_loss
+                        best_epoch_num = epoch + 1
+                    
+                    # Save checkpoint at intervals
+                    if (epoch + 1) % args.save_interval == 0:
+                        torch.save({
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "pretrain_method": args.pretrain,
+                            "pretrain_train_loss": train_loss,
+                            "pretrain_val_loss": val_loss,
+                            "config": model_config,
+                            "pretrain_positions": total_positions,
+                            "pretrain_eval_depth": args.pretrain_eval_depth,
+                            "epoch": epoch + 1,
+                            "total_epochs": args.epochs,
+                            "best_val_loss": best_val_loss,
+                            "best_epoch": best_epoch_num,
+                        }, pretrain_model_path)
+                        print(f"  Checkpoint saved at epoch {epoch + 1}: {pretrain_model_path}")
+                
+                # Train with validation
+                results = pretrain_eval_matching_with_validation(
+                    model=model,
+                    train_dataset=train_dataset,
+                    val_dataset=val_dataset,
+                    test_dataset=test_dataset,
+                    optimizer=optimizer,
+                    num_epochs=args.epochs,
+                    batch_size=args.batch_size,
+                    device=args.device,
+                    scale=scale,
+                    verbose=True,
+                    checkpoint_callback=checkpoint_callback,
+                    writer=writer,
+                )
+                
+                # Save final model (latest epoch)
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "pretrain_method": args.pretrain,
+                    "pretrain_train_loss": results['train_losses'][-1],
+                    "pretrain_val_loss": results['val_losses'][-1],
+                    "pretrain_test_loss": results['test_loss'],
+                    "config": model_config,
+                    "pretrain_positions": total_positions,
                     "pretrain_eval_depth": args.pretrain_eval_depth,
                     "epoch": args.epochs,
                     "total_epochs": args.epochs,
+                    "best_val_loss": results['best_val_loss'],
+                    "best_epoch": results['best_epoch'] + 1,
                 }, pretrain_model_path)
                 print(f"\nFinal pre-trained model saved to: {pretrain_model_path}")
-                print(f"Final pre-training loss: {pretrain_losses[-1]:.6f}")
+                
+                # Save best model
+                if best_model_state is not None:
+                    torch.save(best_model_state, pretrain_best_model_path)
+                    print(f"Best pre-trained model saved to: {pretrain_best_model_path}")
+                    print(f"  Best validation loss: {results['best_val_loss']:.6f} at epoch {results['best_epoch'] + 1}")
+                
+                # Print results summary
+                print(f"\nPre-training Results:")
+                print(f"  Final train loss:      {results['train_losses'][-1]:.6f}")
+                print(f"  Final validation loss: {results['val_losses'][-1]:.6f}")
+                print(f"  Test loss:             {results['test_loss']:.6f}")
+                print(f"  Best validation loss:  {results['best_val_loss']:.6f} (epoch {results['best_epoch'] + 1})")
 
             
             # Evaluate pre-trained model against engine
@@ -858,9 +1001,52 @@ def main():
                 verbose=True,
             )
             
-            print("\nPre-training evaluation results:")
-            for depth, results in pretrain_eval_results.items():
-                print(f"  vs Depth {depth}: {results}")
+            print("\n" + "=" * 60)
+            print("EVALUATION AGAINST ENGINE")
+            print("=" * 60)
+            for depth, res in pretrain_eval_results.items():
+                print(f"  vs Depth {depth}: {res}")
+            
+            # Get final ELO rating
+            current_elo = elo_tracker.get_rating("model_pretrained")
+            print(f"\nPre-trained model ELO: {current_elo:.1f}")
+            writer.add_scalar("Pretrain/ELO", current_elo, 0)
+            
+            # Final comprehensive summary
+            print("\n" + "=" * 60)
+            print("PRE-TRAINING COMPLETE!")
+            print("=" * 60)
+            if args.pretrain_data_path:
+                print(f"\nData source: {args.pretrain_data_path}")
+                print(f"Total positions: {len(full_dataset):,}")
+            else:
+                print(f"\nData source: On-the-fly generation")
+                print(f"Total positions: {len(full_dataset):,}")
+            
+            print(f"\nCheckpoints:")
+            print(f"  Latest model:  {pretrain_model_path}")
+            if best_model_state is not None:
+                print(f"  Best model:    {pretrain_best_model_path}")
+            
+            print(f"\nTraining Performance:")
+            print(f"  Train loss:      {results['train_losses'][-1]:.6f}")
+            print(f"  Validation loss: {results['val_losses'][-1]:.6f}")
+            print(f"  Test loss:       {results['test_loss']:.6f}")
+            print(f"  Best val loss:   {results['best_val_loss']:.6f} (epoch {results['best_epoch'] + 1})")
+            
+            print(f"\nEngine Evaluation:")
+            print(f"  ELO rating: {current_elo:.1f}")
+            for depth, result in pretrain_eval_results.items():
+                wins = result.get('wins', 0)
+                losses = result.get('losses', 0)
+                draws = result.get('draws', 0)
+                total = wins + losses + draws
+                if total > 0:
+                    win_rate = wins / total * 100
+                    print(f"  Depth {depth}: {wins}W-{losses}L-{draws}D ({win_rate:.1f}% win rate)")
+            
+            print(f"\nTo continue with self-play training, run:")
+            print(f"  python train.py --resume {pretrain_best_model_path if best_model_state else pretrain_model_path} --iterations N")
         
         elif args.pretrain == "human-games":
             print(f"\nPre-training method: Human Games TD Learning")
