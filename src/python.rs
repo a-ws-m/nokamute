@@ -1,4 +1,4 @@
-use crate::{Board as RustBoard, Bug as RustBug, Color as RustColor, Hex, Rules, Turn as RustTurn};
+use crate::{Board as RustBoard, Bug as RustBug, CachedEngine as RustCachedEngine, Color as RustColor, Hex, Rules, Turn as RustTurn};
 use minimax::Game;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -540,6 +540,104 @@ impl Board {
     }
 }
 
+/// Cached engine that maintains transposition table across moves for efficient self-play
+#[pyclass]
+pub struct CachedEngine {
+    inner: RustCachedEngine,
+}
+
+#[pymethods]
+impl CachedEngine {
+    #[new]
+    #[pyo3(signature = (aggression=None, depth=None, time_limit_ms=None, table_size_mb=None))]
+    fn new(
+        aggression: Option<u8>,
+        depth: Option<u8>,
+        time_limit_ms: Option<u64>,
+        table_size_mb: Option<usize>,
+    ) -> Self {
+        CachedEngine {
+            inner: RustCachedEngine::new(aggression, depth, time_limit_ms, table_size_mb),
+        }
+    }
+
+    /// Get the best move for the current position using cached evaluations
+    ///
+    /// Args:
+    ///     board: Current board position
+    ///     depth: Optional search depth override
+    ///     time_limit_ms: Optional time limit override in milliseconds
+    ///
+    /// Returns:
+    ///     Turn: Best move, or None if game is over
+    #[pyo3(signature = (board, depth=None, time_limit_ms=None))]
+    fn get_move(
+        &mut self,
+        board: &Board,
+        depth: Option<u8>,
+        time_limit_ms: Option<u64>,
+    ) -> Option<Turn> {
+        self.inner.get_move(&board.inner, depth, time_limit_ms).map(|m| Turn { inner: m })
+    }
+
+    /// Get the evaluation of the current position
+    ///
+    /// Args:
+    ///     board: Current board position
+    ///     depth: Search depth (0 for static eval, default: 0)
+    ///
+    /// Returns:
+    ///     int: Evaluation score (positive = White advantage, negative = Black advantage)
+    #[pyo3(signature = (board, depth=None))]
+    fn get_evaluation(&mut self, board: &Board, depth: Option<u8>) -> i16 {
+        self.inner.get_evaluation(&board.inner, depth)
+    }
+
+    /// Get a suboptimal move from the top-N best moves
+    ///
+    /// Useful for generating diverse training data by choosing moves
+    /// that are good but not necessarily optimal.
+    ///
+    /// Args:
+    ///     board: Current board position
+    ///     top_n: Number of top moves to consider (default: 3)
+    ///     depth: Optional search depth override
+    ///
+    /// Returns:
+    ///     Turn: A randomly selected move from top-N moves, or None if no legal moves
+    #[pyo3(signature = (board, top_n=3, depth=None))]
+    fn get_suboptimal_move(
+        &mut self,
+        board: &Board,
+        top_n: Option<usize>,
+        depth: Option<u8>,
+    ) -> Option<Turn> {
+        self.inner
+            .get_suboptimal_move(&board.inner, top_n.unwrap_or(3), depth)
+            .map(|m| Turn { inner: m })
+    }
+
+    /// Clear the transposition table cache
+    ///
+    /// This resets the cached evaluations. Useful for starting fresh
+    /// or managing memory usage.
+    fn clear_cache(&mut self) {
+        self.inner.clear_cache();
+    }
+
+    /// Get statistics about cache efficiency
+    ///
+    /// Returns:
+    ///     str: Information about cache hits/misses
+    fn get_cache_stats(&self) -> String {
+        self.inner.get_cache_stats()
+    }
+
+    fn __repr__(&self) -> String {
+        "CachedEngine()".to_string()
+    }
+}
+
 /// Python module initialization
 #[pymodule]
 fn nokamute(_py: Python, m: &PyModule) -> PyResult<()> {
@@ -547,5 +645,6 @@ fn nokamute(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Turn>()?;
     m.add_class::<Bug>()?;
     m.add_class::<Color>()?;
+    m.add_class::<CachedEngine>()?;
     Ok(())
 }
