@@ -1,17 +1,22 @@
 """
 Pre-training by matching analytical evaluation function.
 
-This module generates random positions using a branching Markov chain process
+This module generates positions using engine self-play with controlled stochasticity
 and trains the GNN model to match the Rust engine's analytical evaluation scores.
 
-Rather than playing full games, we generate diverse positions by:
+Rather than using purely random moves, we generate more realistic positions by:
 1. Starting from the initial position
-2. Applying random legal moves with branching
-3. Evaluating each unique position with the Rust engine
-4. Training the GNN to match these evaluations using MSE loss
+2. Using engine self-play to select moves, with controlled randomness:
+   - Sometimes choosing completely random moves
+   - Sometimes choosing suboptimal (but good) moves from top-N
+   - Otherwise choosing the best engine move
+3. Applying branching to create parallel exploration paths
+4. Evaluating each unique position with the Rust engine
+5. Training the GNN to match these evaluations using MSE loss
 
 This gives the model a good initial understanding of position evaluation
-before transitioning to self-play training.
+with more game-realistic positions compared to pure random walks, while
+still maintaining diversity through stochasticity and branching.
 """
 
 import random
@@ -41,19 +46,26 @@ def generate_random_positions_branching(
     max_depth: int = 50,
     branch_probability: float = 0.3,
     eval_depth: int = 0,
+    engine_depth: int = 3,
+    random_move_probability: float = 0.1,
+    suboptimal_move_probability: float = 0.2,
+    top_n_moves: int = 3,
     verbose: bool = True,
 ) -> List[Tuple[List[float], List[List[int]], float]]:
     """
-    Generate random positions using a branching Markov chain process.
+    Generate positions using engine self-play with stochasticity and branching.
     
     This creates diverse positions by:
     1. Starting from initial position (or random branch points)
-    2. Applying random legal moves to explore the state space
+    2. Using engine self-play to select moves, with controlled randomness:
+       - Sometimes choosing completely random moves
+       - Sometimes choosing suboptimal (but good) moves from top-N
+       - Otherwise choosing the best engine move
     3. Occasionally branching to create parallel exploration paths
     4. Evaluating each unique position with the Rust engine
     
-    This is more efficient than playing full games, as we don't need to
-    reach terminal states and can explore a wider variety of positions.
+    This gives more realistic game-like positions compared to pure random walks,
+    while still maintaining diversity through stochasticity and branching.
     
     Args:
         num_positions: Target number of unique positions to generate
@@ -62,6 +74,10 @@ def generate_random_positions_branching(
         branch_probability: Probability of creating a branch point (default: 0.3)
         eval_depth: Search depth for minimax evaluation (default: 0 for static eval)
                    If > 0, uses minimax to evaluate position N moves ahead
+        engine_depth: Search depth for engine move selection (default: 3)
+        random_move_probability: Probability of choosing a completely random move (default: 0.1)
+        suboptimal_move_probability: Probability of choosing a suboptimal move from top-N (default: 0.2)
+        top_n_moves: Number of top moves to consider for suboptimal selection (default: 3)
         verbose: Print progress information
         
     Returns:
@@ -72,7 +88,10 @@ def generate_random_positions_branching(
     branch_points = []  # List of (board_state, depth) tuples for branching
     
     if verbose:
-        print(f"Generating {num_positions} unique positions using branching Markov chain...")
+        print(f"Generating {num_positions} unique positions using engine self-play with branching...")
+        print(f"  Engine depth: {engine_depth}")
+        print(f"  Random move probability: {random_move_probability}")
+        print(f"  Suboptimal move probability: {suboptimal_move_probability}")
         pbar = tqdm(total=num_positions, desc="Generating positions")
     
     # Start with initial position
@@ -101,8 +120,19 @@ def generate_random_positions_branching(
         if not legal_moves:
             continue
         
-        # Apply a random move
-        move = random.choice(legal_moves)
+        # Choose move based on stochastic policy
+        rand = random.random()
+        if rand < random_move_probability:
+            # Completely random move
+            move = random.choice(legal_moves)
+        elif rand < random_move_probability + suboptimal_move_probability:
+            # Choose from top-N moves
+            move = _choose_suboptimal_move(board, legal_moves, aggression, engine_depth, top_n_moves)
+        else:
+            # Choose best engine move
+            engine_move = board.get_engine_move(depth=engine_depth, aggression=aggression)
+            move = engine_move if engine_move is not None else random.choice(legal_moves)
+        
         board.apply(move)
         
         # Add the new position
@@ -115,7 +145,7 @@ def generate_random_positions_branching(
             # Create branches for other legal moves
             num_branches = min(2, len(legal_moves) - 1)  # Limit branching factor
             other_moves = [m for m in legal_moves if m != move]
-            for branch_move in random.sample(other_moves, num_branches):
+            for branch_move in random.sample(other_moves, min(num_branches, len(other_moves))):
                 # Clone the board state before the move
                 board.undo(move)
                 branch_board = board.clone()
@@ -139,6 +169,46 @@ def generate_random_positions_branching(
         print(f"  Median: {sorted(evals)[len(evals) // 2]:.2f}")
     
     return list(unique_positions.values())
+
+
+def _choose_suboptimal_move(board, legal_moves, aggression, engine_depth, top_n):
+    """
+    Choose a suboptimal move from the top-N best moves.
+    
+    This evaluates all legal moves, ranks them by evaluation score,
+    and randomly selects from the top-N moves.
+    
+    Args:
+        board: Current board state
+        legal_moves: List of legal moves
+        aggression: Aggression level for evaluation
+        engine_depth: Search depth for move evaluation
+        top_n: Number of top moves to consider
+        
+    Returns:
+        A randomly selected move from the top-N moves
+    """
+    if len(legal_moves) <= 1:
+        return legal_moves[0] if legal_moves else None
+    
+    # Evaluate each move
+    move_scores = []
+    for move in legal_moves:
+        board.apply(move)
+        # Get evaluation from the perspective of the player who just moved
+        # (we want to maximize this score)
+        score = -board.get_evaluation(aggression, engine_depth)
+        board.undo(move)
+        move_scores.append((move, score))
+    
+    # Sort by score (descending)
+    move_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    # Select from top-N
+    top_moves = move_scores[:min(top_n, len(move_scores))]
+    selected_move, _ = random.choice(top_moves)
+    
+    return selected_move
 
 
 def _add_position_if_unique(board, aggression, eval_depth, unique_positions):
@@ -169,12 +239,16 @@ def _generate_position_batch_worker(args):
     frequent progress bar updates while preserving the branching behavior.
     
     Args:
-        args: Tuple of (batch_size, aggression, max_depth, branch_probability, eval_depth, seed)
+        args: Tuple of (batch_size, aggression, max_depth, branch_probability, eval_depth, 
+                        engine_depth, random_move_probability, suboptimal_move_probability, 
+                        top_n_moves, seed)
         
     Returns:
         List of (node_features, edge_index, eval_score) tuples
     """
-    batch_size, aggression, max_depth, branch_probability, eval_depth, seed = args
+    (batch_size, aggression, max_depth, branch_probability, eval_depth, 
+     engine_depth, random_move_probability, suboptimal_move_probability, 
+     top_n_moves, seed) = args
     
     # Set random seed for this batch
     random.seed(seed)
@@ -186,6 +260,10 @@ def _generate_position_batch_worker(args):
         max_depth=max_depth,
         branch_probability=branch_probability,
         eval_depth=eval_depth,
+        engine_depth=engine_depth,
+        random_move_probability=random_move_probability,
+        suboptimal_move_probability=suboptimal_move_probability,
+        top_n_moves=top_n_moves,
         verbose=False,
     )
     
@@ -193,7 +271,9 @@ def _generate_position_batch_worker(args):
 
 
 def _get_cache_key(num_positions: int, aggression: int, max_depth: int, 
-                    branch_probability: float, eval_depth: int) -> str:
+                    branch_probability: float, eval_depth: int, engine_depth: int,
+                    random_move_probability: float, suboptimal_move_probability: float,
+                    top_n_moves: int) -> str:
     """
     Generate a unique cache key for a set of generation parameters.
     
@@ -203,11 +283,17 @@ def _get_cache_key(num_positions: int, aggression: int, max_depth: int,
         max_depth: Maximum depth
         branch_probability: Branch probability
         eval_depth: Evaluation depth
+        engine_depth: Engine search depth for move selection
+        random_move_probability: Probability of random moves
+        suboptimal_move_probability: Probability of suboptimal moves
+        top_n_moves: Number of top moves to consider
         
     Returns:
         MD5 hash of the configuration
     """
-    config_str = f"{num_positions}|{aggression}|{max_depth}|{branch_probability}|{eval_depth}"
+    config_str = (f"{num_positions}|{aggression}|{max_depth}|{branch_probability}|"
+                  f"{eval_depth}|{engine_depth}|{random_move_probability}|"
+                  f"{suboptimal_move_probability}|{top_n_moves}")
     return hashlib.md5(config_str.encode()).hexdigest()
 
 
@@ -233,13 +319,17 @@ def generate_and_save_positions(
     max_depth: int = 200,
     branch_probability: float = 0.3,
     eval_depth: int = 0,
+    engine_depth: int = 3,
+    random_move_probability: float = 0.1,
+    suboptimal_move_probability: float = 0.2,
+    top_n_moves: int = 3,
     cache_dir: str = "pretrain_cache",
     num_workers: Optional[int] = None,
     force_refresh: bool = False,
     verbose: bool = True,
 ) -> str:
     """
-    Generate random positions with evaluations and save to disk using multiprocessing.
+    Generate positions using engine self-play and save to disk using multiprocessing.
     
     Similar to human_games.py's generate_human_games_data, this function generates
     positions and saves them in a format suitable for streaming during training.
@@ -250,6 +340,10 @@ def generate_and_save_positions(
         max_depth: Maximum number of moves from start position (default: 200)
         branch_probability: Probability of creating a branch point (default: 0.3)
         eval_depth: Search depth for minimax evaluation (default: 0 for static eval)
+        engine_depth: Search depth for engine move selection (default: 3)
+        random_move_probability: Probability of choosing random moves (default: 0.1)
+        suboptimal_move_probability: Probability of choosing suboptimal moves (default: 0.2)
+        top_n_moves: Number of top moves to consider for suboptimal selection (default: 3)
         cache_dir: Directory to store cached data (default: "pretrain_cache")
         num_workers: Number of parallel workers (default: cpu_count())
         force_refresh: If True, ignore cache and regenerate data
@@ -262,7 +356,9 @@ def generate_and_save_positions(
         num_workers = cpu_count()
     
     # Check cache first
-    cache_key = _get_cache_key(num_positions, aggression, max_depth, branch_probability, eval_depth)
+    cache_key = _get_cache_key(num_positions, aggression, max_depth, branch_probability, 
+                                eval_depth, engine_depth, random_move_probability, 
+                                suboptimal_move_probability, top_n_moves)
     cache_data_dir = _get_cache_path(cache_dir, cache_key)
     cache_metadata_path = cache_data_dir / "metadata.pkl"
     
@@ -278,6 +374,7 @@ def generate_and_save_positions(
             print(f"Loaded cached data:")
             print(f"  Total positions: {metadata['total_positions']}")
             print(f"  Evaluation depth: {metadata['eval_depth']}")
+            print(f"  Engine depth: {metadata['engine_depth']}")
             print(f"  Number of files: {metadata['num_files']}")
         
         return str(cache_data_dir)
@@ -292,6 +389,9 @@ def generate_and_save_positions(
         print(f"  Max depth: {max_depth}")
         print(f"  Branch probability: {branch_probability}")
         print(f"  Eval depth: {eval_depth}")
+        print(f"  Engine depth: {engine_depth}")
+        print(f"  Random move probability: {random_move_probability}")
+        print(f"  Suboptimal move probability: {suboptimal_move_probability}")
     
     # Create cache directory
     cache_data_dir.mkdir(parents=True, exist_ok=True)
@@ -307,7 +407,9 @@ def generate_and_save_positions(
         current_batch_size = min(batch_size, remaining)
         remaining -= current_batch_size
         seed = random.randint(0, 2**32 - 1)
-        work_items.append((current_batch_size, aggression, max_depth, branch_probability, eval_depth, seed))
+        work_items.append((current_batch_size, aggression, max_depth, branch_probability, 
+                          eval_depth, engine_depth, random_move_probability, 
+                          suboptimal_move_probability, top_n_moves, seed))
     
     # Run workers in parallel
     if verbose:
@@ -415,6 +517,10 @@ def generate_and_save_positions(
         'max_depth': max_depth,
         'branch_probability': branch_probability,
         'eval_depth': eval_depth,
+        'engine_depth': engine_depth,
+        'random_move_probability': random_move_probability,
+        'suboptimal_move_probability': suboptimal_move_probability,
+        'top_n_moves': top_n_moves,
         'cache_key': cache_key,
     }
     with open(cache_metadata_path, 'wb') as f:
@@ -445,7 +551,7 @@ class EvaluationMatchingDataset(Dataset):
     """
     PyTorch Geometric Dataset for evaluation matching training.
     
-    This dataset generates random positions on-the-fly each epoch,
+    This dataset generates positions on-the-fly each epoch using engine self-play,
     ensuring the model sees diverse training data throughout training.
     """
     
@@ -456,6 +562,10 @@ class EvaluationMatchingDataset(Dataset):
         max_depth: int = 50,
         branch_probability: float = 0.3,
         eval_depth: int = 0,
+        engine_depth: int = 3,
+        random_move_probability: float = 0.1,
+        suboptimal_move_probability: float = 0.2,
+        top_n_moves: int = 3,
         scale: float = 0.001,
         regenerate_each_epoch: bool = True,
     ):
@@ -465,9 +575,13 @@ class EvaluationMatchingDataset(Dataset):
         Args:
             num_positions: Number of unique positions to generate per epoch
             aggression: Aggression level for BasicEvaluator (1-5)
-            max_depth: Maximum depth for random walk
+            max_depth: Maximum depth for position generation
             branch_probability: Probability of branching during generation
             eval_depth: Search depth for minimax evaluation (0 for static eval)
+            engine_depth: Search depth for engine move selection
+            random_move_probability: Probability of choosing random moves
+            suboptimal_move_probability: Probability of choosing suboptimal moves
+            top_n_moves: Number of top moves to consider for suboptimal selection
             scale: Scaling factor for normalizing evaluations
             regenerate_each_epoch: If True, generate new positions each epoch
         """
@@ -477,6 +591,10 @@ class EvaluationMatchingDataset(Dataset):
         self.max_depth = max_depth
         self.branch_probability = branch_probability
         self.eval_depth = eval_depth
+        self.engine_depth = engine_depth
+        self.random_move_probability = random_move_probability
+        self.suboptimal_move_probability = suboptimal_move_probability
+        self.top_n_moves = top_n_moves
         self.scale = scale
         self.regenerate_each_epoch = regenerate_each_epoch
         
@@ -484,13 +602,17 @@ class EvaluationMatchingDataset(Dataset):
         self._regenerate_positions()
     
     def _regenerate_positions(self):
-        """Generate new random positions."""
+        """Generate new positions using engine self-play."""
         raw_data = generate_random_positions_branching(
             num_positions=self.num_positions,
             aggression=self.aggression,
             max_depth=self.max_depth,
             branch_probability=self.branch_probability,
             eval_depth=self.eval_depth,
+            engine_depth=self.engine_depth,
+            random_move_probability=self.random_move_probability,
+            suboptimal_move_probability=self.suboptimal_move_probability,
+            top_n_moves=self.top_n_moves,
             verbose=False,
         )
         
@@ -644,16 +766,20 @@ def pretrain_eval_matching(
     max_depth: int = 50,
     branch_probability: float = 0.3,
     eval_depth: int = 0,
+    engine_depth: int = 3,
+    random_move_probability: float = 0.1,
+    suboptimal_move_probability: float = 0.2,
+    top_n_moves: int = 3,
     scale: float = 0.001,
     regenerate_each_epoch: bool = True,
     verbose: bool = True,
     epoch_callback=None,
 ) -> List[float]:
     """
-    Pre-train model to match analytical evaluation scores using random position generation.
+    Pre-train model to match analytical evaluation scores using engine self-play.
     
     Each epoch:
-    1. Generate N unique random positions using branching Markov chain
+    1. Generate N unique positions using engine self-play with stochasticity
     2. Evaluate each position with the Rust engine
     3. Train the GNN to match these evaluations using MSE loss with mini-batching
     
@@ -665,10 +791,14 @@ def pretrain_eval_matching(
         batch_size: Batch size for mini-batch training
         device: Device to train on
         aggression: Aggression level 1-5 for BasicEvaluator (default: 3)
-        max_depth: Maximum depth for random position generation (default: 50)
+        max_depth: Maximum depth for position generation (default: 50)
         branch_probability: Branching probability during position generation (default: 0.3)
         eval_depth: Search depth for minimax evaluation (default: 0 for static eval)
                    If > 0, uses minimax to evaluate position N moves ahead
+        engine_depth: Search depth for engine move selection (default: 3)
+        random_move_probability: Probability of choosing random moves (default: 0.1)
+        suboptimal_move_probability: Probability of choosing suboptimal moves (default: 0.2)
+        top_n_moves: Number of top moves to consider for suboptimal selection (default: 3)
         scale: Scaling factor for normalizing evaluations (default: 0.001)
         regenerate_each_epoch: If True, generate new positions each epoch (default: True)
         verbose: Print progress information
@@ -690,6 +820,10 @@ def pretrain_eval_matching(
         max_depth=max_depth,
         branch_probability=branch_probability,
         eval_depth=eval_depth,
+        engine_depth=engine_depth,
+        random_move_probability=random_move_probability,
+        suboptimal_move_probability=suboptimal_move_probability,
+        top_n_moves=top_n_moves,
         scale=scale,
         regenerate_each_epoch=regenerate_each_epoch,
     )
@@ -697,6 +831,10 @@ def pretrain_eval_matching(
     if verbose:
         print(f"Training on {len(dataset)} positions per epoch...")
         print(f"Regenerating positions each epoch: {regenerate_each_epoch}")
+        print(f"Using engine self-play with:")
+        print(f"  Engine depth: {engine_depth}")
+        print(f"  Random move probability: {random_move_probability}")
+        print(f"  Suboptimal move probability: {suboptimal_move_probability}")
     
     for epoch in tqdm(range(num_epochs), desc="Training epochs", disable=not verbose):
         # Regenerate positions for this epoch if enabled
@@ -837,7 +975,7 @@ def generate_eval_matching_data(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generate random positions with evaluations for pre-training"
+        description="Generate positions using engine self-play for pre-training"
     )
     
     # Generation parameters
@@ -872,6 +1010,30 @@ if __name__ == "__main__":
         default=0,
         help="Search depth for minimax evaluation (default: 0 for static eval)"
     )
+    parser.add_argument(
+        "--engine-depth",
+        type=int,
+        default=3,
+        help="Search depth for engine move selection (default: 3)"
+    )
+    parser.add_argument(
+        "--random-move-probability",
+        type=float,
+        default=0.1,
+        help="Probability of choosing completely random moves (default: 0.1)"
+    )
+    parser.add_argument(
+        "--suboptimal-move-probability",
+        type=float,
+        default=0.2,
+        help="Probability of choosing suboptimal moves from top-N (default: 0.2)"
+    )
+    parser.add_argument(
+        "--top-n-moves",
+        type=int,
+        default=3,
+        help="Number of top moves to consider for suboptimal selection (default: 3)"
+    )
     
     # Output parameters
     parser.add_argument(
@@ -904,17 +1066,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     if args.test:
-        # Test random position generation
-        print("Testing evaluation matching pre-training with branching Markov chain...")
+        # Test engine self-play position generation
+        print("Testing evaluation matching pre-training with engine self-play...")
         
         # Generate small dataset
-        print("\n1. Testing position generation:")
+        print("\n1. Testing position generation with engine self-play:")
         data = generate_random_positions_branching(
             num_positions=100,
             aggression=3,
             max_depth=30,
             branch_probability=0.3,
             eval_depth=0,  # Static evaluation
+            engine_depth=2,  # Shallow engine search for testing
+            random_move_probability=0.1,
+            suboptimal_move_probability=0.2,
+            top_n_moves=3,
             verbose=True
         )
         
@@ -937,6 +1103,10 @@ if __name__ == "__main__":
             max_depth=30,
             branch_probability=0.3,
             eval_depth=2,  # Minimax evaluation at depth 2
+            engine_depth=2,
+            random_move_probability=0.1,
+            suboptimal_move_probability=0.2,
+            top_n_moves=3,
             verbose=True
         )
         
@@ -950,6 +1120,10 @@ if __name__ == "__main__":
             max_depth=30,
             branch_probability=0.3,
             eval_depth=0,
+            engine_depth=2,
+            random_move_probability=0.1,
+            suboptimal_move_probability=0.2,
+            top_n_moves=3,
             regenerate_each_epoch=True,
         )
         print(f"Dataset length: {len(dataset)}")
@@ -970,6 +1144,10 @@ if __name__ == "__main__":
             max_depth=30,
             branch_probability=0.3,
             eval_depth=0,
+            engine_depth=2,
+            random_move_probability=0.1,
+            suboptimal_move_probability=0.2,
+            top_n_moves=3,
             cache_dir="test_cache",
             num_workers=2,
             force_refresh=True,
@@ -991,6 +1169,10 @@ if __name__ == "__main__":
             max_depth=args.max_depth,
             branch_probability=args.branch_probability,
             eval_depth=args.eval_depth,
+            engine_depth=args.engine_depth,
+            random_move_probability=args.random_move_probability,
+            suboptimal_move_probability=args.suboptimal_move_probability,
+            top_n_moves=args.top_n_moves,
             cache_dir=args.cache_dir,
             num_workers=args.num_workers,
             force_refresh=args.force_refresh,
