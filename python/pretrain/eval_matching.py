@@ -233,44 +233,50 @@ def _add_position_if_unique(board, aggression, eval_depth, unique_positions):
 
 def _generate_position_batch_worker(args):
     """
-    Worker function for generating a batch of positions.
+    Worker function for generating positions by playing through N complete games.
     
-    This generates positions in small batches (e.g., 10 at a time) to allow
-    frequent progress bar updates while preserving the branching behavior.
+    Each worker plays through N games to completion, collecting all unique positions
+    from each game.
     
     Args:
-        args: Tuple of (batch_size, aggression, max_depth, branch_probability, eval_depth, 
+        args: Tuple of (num_games, aggression, max_depth, branch_probability, eval_depth, 
                         engine_depth, random_move_probability, suboptimal_move_probability, 
                         top_n_moves, seed)
         
     Returns:
-        List of (node_features, edge_index, eval_score) tuples
+        List of (node_features, edge_index, eval_score) tuples from all games
     """
-    (batch_size, aggression, max_depth, branch_probability, eval_depth, 
+    (num_games, aggression, max_depth, branch_probability, eval_depth, 
      engine_depth, random_move_probability, suboptimal_move_probability, 
      top_n_moves, seed) = args
     
-    # Set random seed for this batch
+    # Set random seed for this worker
     random.seed(seed)
     
-    # Generate a batch of positions using the branching process
-    result = generate_random_positions_branching(
-        num_positions=batch_size,
-        aggression=aggression,
-        max_depth=max_depth,
-        branch_probability=branch_probability,
-        eval_depth=eval_depth,
-        engine_depth=engine_depth,
-        random_move_probability=random_move_probability,
-        suboptimal_move_probability=suboptimal_move_probability,
-        top_n_moves=top_n_moves,
-        verbose=False,
-    )
+    all_positions = []
     
-    return result
+    # Play through num_games complete games
+    for _ in range(num_games):
+        # Generate positions from one complete game using the branching process
+        # Use a large num_positions to ensure we explore the full game
+        game_positions = generate_random_positions_branching(
+            num_positions=10000,  # Large enough to explore full game tree
+            aggression=aggression,
+            max_depth=max_depth,
+            branch_probability=branch_probability,
+            eval_depth=eval_depth,
+            engine_depth=engine_depth,
+            random_move_probability=random_move_probability,
+            suboptimal_move_probability=suboptimal_move_probability,
+            top_n_moves=top_n_moves,
+            verbose=False,
+        )
+        all_positions.extend(game_positions)
+    
+    return all_positions
 
 
-def _get_cache_key(num_positions: int, aggression: int, max_depth: int, 
+def _get_cache_key(num_games: int, aggression: int, max_depth: int, 
                     branch_probability: float, eval_depth: int, engine_depth: int,
                     random_move_probability: float, suboptimal_move_probability: float,
                     top_n_moves: int) -> str:
@@ -278,7 +284,7 @@ def _get_cache_key(num_positions: int, aggression: int, max_depth: int,
     Generate a unique cache key for a set of generation parameters.
     
     Args:
-        num_positions: Number of positions
+        num_games: Number of games to play
         aggression: Aggression level
         max_depth: Maximum depth
         branch_probability: Branch probability
@@ -291,7 +297,7 @@ def _get_cache_key(num_positions: int, aggression: int, max_depth: int,
     Returns:
         MD5 hash of the configuration
     """
-    config_str = (f"{num_positions}|{aggression}|{max_depth}|{branch_probability}|"
+    config_str = (f"{num_games}|{aggression}|{max_depth}|{branch_probability}|"
                   f"{eval_depth}|{engine_depth}|{random_move_probability}|"
                   f"{suboptimal_move_probability}|{top_n_moves}")
     return hashlib.md5(config_str.encode()).hexdigest()
@@ -314,7 +320,7 @@ def _get_cache_path(cache_dir: str, cache_key: str) -> Path:
 
 
 def generate_and_save_positions(
-    num_positions: int = 1000,
+    num_games: int = 100,
     aggression: int = 3,
     max_depth: int = 200,
     branch_probability: float = 0.3,
@@ -325,17 +331,18 @@ def generate_and_save_positions(
     top_n_moves: int = 3,
     cache_dir: str = "pretrain_cache",
     num_workers: Optional[int] = None,
+    games_per_worker: int = 10,
     force_refresh: bool = False,
     verbose: bool = True,
 ) -> str:
     """
     Generate positions using engine self-play and save to disk using multiprocessing.
     
-    Similar to human_games.py's generate_human_games_data, this function generates
-    positions and saves them in a format suitable for streaming during training.
+    Each worker plays through N complete games (games_per_worker) to completion,
+    collecting all unique positions encountered during gameplay.
     
     Args:
-        num_positions: Total number of unique positions to generate
+        num_games: Total number of games to play
         aggression: Aggression level 1-5 for BasicEvaluator (default: 3)
         max_depth: Maximum number of moves from start position (default: 200)
         branch_probability: Probability of creating a branch point (default: 0.3)
@@ -346,6 +353,7 @@ def generate_and_save_positions(
         top_n_moves: Number of top moves to consider for suboptimal selection (default: 3)
         cache_dir: Directory to store cached data (default: "pretrain_cache")
         num_workers: Number of parallel workers (default: cpu_count())
+        games_per_worker: Number of complete games each worker plays per task (default: 10)
         force_refresh: If True, ignore cache and regenerate data
         verbose: Print progress information
         
@@ -356,7 +364,7 @@ def generate_and_save_positions(
         num_workers = cpu_count()
     
     # Check cache first
-    cache_key = _get_cache_key(num_positions, aggression, max_depth, branch_probability, 
+    cache_key = _get_cache_key(num_games, aggression, max_depth, branch_probability, 
                                 eval_depth, engine_depth, random_move_probability, 
                                 suboptimal_move_probability, top_n_moves)
     cache_data_dir = _get_cache_path(cache_dir, cache_key)
@@ -372,6 +380,7 @@ def generate_and_save_positions(
         
         if verbose:
             print(f"Loaded cached data:")
+            print(f"  Total games: {metadata['num_games']}")
             print(f"  Total positions: {metadata['total_positions']}")
             print(f"  Evaluation depth: {metadata['eval_depth']}")
             print(f"  Engine depth: {metadata['engine_depth']}")
@@ -383,7 +392,7 @@ def generate_and_save_positions(
     if verbose:
         if force_refresh:
             print("Force refresh enabled - regenerating data")
-        print(f"\nGenerating {num_positions} positions using {num_workers} workers...")
+        print(f"\nPlaying {num_games} games using {num_workers} workers...")
         print(f"Parameters:")
         print(f"  Aggression: {aggression}")
         print(f"  Max depth: {max_depth}")
@@ -392,32 +401,32 @@ def generate_and_save_positions(
         print(f"  Engine depth: {engine_depth}")
         print(f"  Random move probability: {random_move_probability}")
         print(f"  Suboptimal move probability: {suboptimal_move_probability}")
+        print(f"  Games per worker task: {games_per_worker}")
     
     # Create cache directory
     cache_data_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create work items - batch positions into groups for progress updates
-    batch_size = 10  # Generate this many positions per worker task
-    num_batches = (num_positions + batch_size - 1) // batch_size  # Ceiling division
+    # Create work items - each worker plays games_per_worker complete games
+    num_tasks = (num_games + games_per_worker - 1) // games_per_worker  # Ceiling division
     
     work_items = []
-    remaining = num_positions
-    for i in range(num_batches):
-        # Last batch might be smaller
-        current_batch_size = min(batch_size, remaining)
-        remaining -= current_batch_size
+    remaining = num_games
+    for i in range(num_tasks):
+        # Last task might have fewer games
+        current_task_games = min(games_per_worker, remaining)
+        remaining -= current_task_games
         seed = random.randint(0, 2**32 - 1)
-        work_items.append((current_batch_size, aggression, max_depth, branch_probability, 
+        work_items.append((current_task_games, aggression, max_depth, branch_probability, 
                           eval_depth, engine_depth, random_move_probability, 
                           suboptimal_move_probability, top_n_moves, seed))
     
     # Run workers in parallel
     if verbose:
-        print(f"\nGenerating {num_positions} positions using {num_workers} workers...")
-        print(f"Processing in batches of {batch_size} positions for progress updates...")
+        print(f"\nProcessing {num_tasks} tasks ({games_per_worker} games per task)...")
     
     # Initialize counters for incremental saving
     total_positions = 0
+    total_games_processed = 0
     positions_per_file = 1000  # Save every 1000 positions to a file
     file_index = 0
     current_batch = []
@@ -439,9 +448,13 @@ def generate_and_save_positions(
     
     with Pool(num_workers) as pool:
         if verbose:
-            # Use imap to process batches, updating progress bar for each batch
-            pbar = tqdm(total=num_positions, desc="Positions generated", unit="pos")
-            for batch in pool.imap(_generate_position_batch_worker, work_items):
+            # Use imap to process tasks, updating progress bar for each task
+            pbar = tqdm(total=num_games, desc="Games completed", unit="game")
+            pbar_positions = tqdm(total=0, desc="Unique positions", unit="pos", position=1)
+            for idx, batch in enumerate(pool.imap(_generate_position_batch_worker, work_items)):
+                # Get the number of games in this task
+                games_in_task = work_items[idx][0]  # First element is num_games
+                
                 # Process each position in the batch
                 for position in batch:
                     # Check for duplicates across all batches
@@ -483,8 +496,13 @@ def generate_and_save_positions(
                         file_index += 1
                         current_batch = []
                 
-                pbar.update(len(batch))
+                total_games_processed += games_in_task
+                pbar.update(games_in_task)
+                pbar_positions.total = total_positions
+                pbar_positions.n = total_positions
+                pbar_positions.refresh()
             pbar.close()
+            pbar_positions.close()
         else:
             for batch in pool.map(_generate_position_batch_worker, work_items):
                 # Process each position in the batch
@@ -537,6 +555,7 @@ def generate_and_save_positions(
     
     # Save metadata
     metadata = {
+        'num_games': num_games,
         'total_positions': total_positions,
         'num_files': file_index,
         'aggression': aggression,
@@ -556,6 +575,7 @@ def generate_and_save_positions(
         print(f"\n{'='*60}")
         print(f"Data Generation Complete")
         print(f"{'='*60}")
+        print(f"Total games played: {num_games}")
         print(f"Total unique positions: {total_positions}")
         print(f"Duplicates skipped: {duplicates_skipped}")
         print(f"Saved to: {cache_data_dir}")
@@ -1239,10 +1259,10 @@ if __name__ == "__main__":
     
     # Generation parameters
     parser.add_argument(
-        "--num-positions",
+        "--num-games",
         type=int,
-        default=1000,
-        help="Number of unique positions to generate (default: 1000)"
+        default=100,
+        help="Number of games to play (default: 100)"
     )
     parser.add_argument(
         "--aggression",
@@ -1313,6 +1333,12 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Number of parallel workers (default: number of CPU cores)"
+    )
+    parser.add_argument(
+        "--games-per-worker",
+        type=int,
+        default=10,
+        help="Number of games each worker plays per task (default: 10)"
     )
     
     # Testing mode
@@ -1398,7 +1424,7 @@ if __name__ == "__main__":
         
         print("\n5. Testing multiprocessing generation and caching:")
         cache_dir = generate_and_save_positions(
-            num_positions=100,
+            num_games=10,
             aggression=3,
             max_depth=30,
             branch_probability=0.3,
@@ -1409,6 +1435,7 @@ if __name__ == "__main__":
             top_n_moves=3,
             cache_dir="test_cache",
             num_workers=2,
+            games_per_worker=5,
             force_refresh=True,
             verbose=True,
         )
@@ -1423,7 +1450,7 @@ if __name__ == "__main__":
     else:
         # Generate and save positions
         cache_dir = generate_and_save_positions(
-            num_positions=args.num_positions,
+            num_games=args.num_games,
             aggression=args.aggression,
             max_depth=args.max_depth,
             branch_probability=args.branch_probability,
@@ -1434,6 +1461,7 @@ if __name__ == "__main__":
             top_n_moves=args.top_n_moves,
             cache_dir=args.cache_dir,
             num_workers=args.num_workers,
+            games_per_worker=args.games_per_worker,
             force_refresh=args.force_refresh,
             verbose=True,
         )
