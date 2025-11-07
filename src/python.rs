@@ -216,8 +216,8 @@ impl Board {
         let mut position_to_node: HashMap<(Hex, u8), usize> = HashMap::new();
         let mut node_features = Vec::new();
 
-        // Get current player (1.0 for White, -1.0 for Black)
-        let current_player = if self.inner.to_move() == RustColor::White { 1.0f32 } else { -1.0f32 };
+        // Get current player (1.0 for White, 0.0 for Black)
+        let current_player = if self.inner.to_move() == RustColor::White { 1.0f32 } else { 0.0f32 };
 
         // First pass: collect all occupied positions (hex, height)
         let mut occupied_positions = Vec::new();
@@ -256,7 +256,7 @@ impl Board {
             let mut bug_onehot = vec![0.0f32; 9];
             bug_onehot[bug as usize] = 1.0;
 
-            // Node features: [color (0/1), bug_onehot (9 values), height, current_player (1/-1)]
+            // Node features: [color (0/1), bug_onehot (9 values), height, current_player (1/0)]
             let mut features = vec![color as usize as f32];
             features.extend(bug_onehot);
             features.push(h as f32);
