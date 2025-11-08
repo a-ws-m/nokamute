@@ -647,6 +647,177 @@ impl Board {
     }
 }
 
+/// Cached Negamax strategy for efficient self-play game generation
+///
+/// This strategy maintains a transposition table across moves, making it
+/// much more efficient for sequential move generation in self-play scenarios.
+/// Use this instead of repeated calls to `get_engine_move()` when generating
+/// training data from self-play games.
+#[pyclass]
+pub struct CachedNegamaxStrategy {
+    #[cfg(not(target_arch = "wasm32"))]
+    strategy: crate::CachedNegamax<crate::BasicEvaluator>,
+}
+
+#[pymethods]
+impl CachedNegamaxStrategy {
+    /// Create a new cached negamax strategy
+    ///
+    /// Args:
+    ///     depth: Search depth for minimax (default: 3)
+    ///     aggression: Aggression level 1-5 for the evaluator (default: 3)
+    #[new]
+    fn new(depth: Option<u8>, aggression: Option<u8>) -> PyResult<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let eval = crate::BasicEvaluator::new(aggression.unwrap_or(3));
+            let strategy = crate::CachedNegamax::new(eval, depth.unwrap_or(3));
+            Ok(CachedNegamaxStrategy { strategy })
+        }
+        #[cfg(target_arch = "wasm32")]
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "CachedNegamaxStrategy is not available in wasm32"
+        ))
+    }
+
+    /// Get the best move for a given board position
+    ///
+    /// This uses the cached transposition table for efficiency.
+    ///
+    /// Args:
+    ///     board: The board to evaluate
+    ///
+    /// Returns:
+    ///     Optional[Turn]: Best move, or None if game is over
+    fn choose_move(&mut self, board: &Board) -> PyResult<Option<Turn>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use minimax::Strategy;
+            let best_move = self.strategy.choose_move(&board.inner);
+            Ok(best_move.map(|m| Turn { inner: m }))
+        }
+        #[cfg(target_arch = "wasm32")]
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "CachedNegamaxStrategy is not available in wasm32"
+        ))
+    }
+
+    /// Get the best move and its evaluation in one call
+    ///
+    /// Args:
+    ///     board: The board to evaluate
+    ///
+    /// Returns:
+    ///     Tuple[Optional[Turn], i16]: (best_move, evaluation_score)
+    ///         - best_move: Best move, or None if game is over
+    ///         - evaluation_score: Evaluation on absolute scale (positive = White advantage)
+    fn choose_move_with_eval(&mut self, board: &Board) -> PyResult<(Option<Turn>, i16)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use minimax::{Evaluator, Game, Strategy};
+
+            // Check if game is over
+            if Rules::get_winner(&board.inner).is_some() {
+                let eval = crate::BasicEvaluator::new(self.strategy.eval.aggression());
+                let score = eval.evaluate(&board.inner);
+                let absolute_score = if board.inner.to_move() == RustColor::Black { -score } else { score };
+                return Ok((None, absolute_score));
+            }
+
+            let best_move = self.strategy.choose_move(&board.inner);
+            let score = self.strategy.root_value();
+            
+            // Convert to absolute scale
+            let absolute_score = if board.inner.to_move() == RustColor::Black { -score } else { score };
+            
+            Ok((best_move.map(|m| Turn { inner: m }), absolute_score))
+        }
+        #[cfg(target_arch = "wasm32")]
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "CachedNegamaxStrategy is not available in wasm32"
+        ))
+    }
+
+    /// Clear the transposition table cache
+    ///
+    /// Call this when starting a new game to free memory and reset statistics.
+    fn clear_cache(&mut self) -> PyResult<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.strategy.clear_cache();
+            Ok(())
+        }
+        #[cfg(target_arch = "wasm32")]
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "CachedNegamaxStrategy is not available in wasm32"
+        ))
+    }
+
+    /// Get cache statistics
+    ///
+    /// Returns:
+    ///     Tuple[int, int, float]: (hits, misses, hit_rate)
+    fn cache_stats(&self) -> PyResult<(usize, usize, f64)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Ok(self.strategy.cache_stats())
+        }
+        #[cfg(target_arch = "wasm32")]
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "CachedNegamaxStrategy is not available in wasm32"
+        ))
+    }
+
+    /// Get the size of the cache (number of entries)
+    ///
+    /// Returns:
+    ///     int: Number of cached positions
+    fn cache_size(&self) -> PyResult<usize> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Ok(self.strategy.table.len())
+        }
+        #[cfg(target_arch = "wasm32")]
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "CachedNegamaxStrategy is not available in wasm32"
+        ))
+    }
+
+    /// Set the search depth
+    ///
+    /// Args:
+    ///     depth: New search depth
+    fn set_depth(&mut self, depth: u8) -> PyResult<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use minimax::Strategy;
+            self.strategy.set_max_depth(depth);
+            Ok(())
+        }
+        #[cfg(target_arch = "wasm32")]
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "CachedNegamaxStrategy is not available in wasm32"
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (hits, misses, hit_rate) = self.strategy.cache_stats();
+            format!(
+                "CachedNegamaxStrategy(depth={}, cache_size={}, hits={}, misses={}, hit_rate={:.2}%)",
+                self.strategy.max_depth,
+                self.strategy.table.len(),
+                hits,
+                misses,
+                hit_rate * 100.0
+            )
+        }
+        #[cfg(target_arch = "wasm32")]
+        String::from("CachedNegamaxStrategy(not available in wasm32)")
+    }
+}
+
 /// Python module initialization
 #[pymodule]
 fn nokamute(_py: Python, m: &PyModule) -> PyResult<()> {
@@ -654,5 +825,6 @@ fn nokamute(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Turn>()?;
     m.add_class::<Bug>()?;
     m.add_class::<Color>()?;
+    m.add_class::<CachedNegamaxStrategy>()?;
     Ok(())
 }

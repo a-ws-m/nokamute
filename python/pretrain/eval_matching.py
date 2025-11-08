@@ -393,6 +393,89 @@ def play_game_to_completion(
     return list(unique_positions.values()), branch_points
 
 
+def play_game_to_completion_cached(
+    strategy: 'nokamute.CachedNegamaxStrategy',
+    aggression: int = 3,
+    max_depth: int = 100,
+    search_depth: int = 3,
+    random_move_probability: float = 0.3,
+    collect_branch_points: bool = False,
+) -> Tuple[List[Tuple[List[float], List[List[int]], float]], List[Tuple]]:
+    """
+    Play a single game to completion using a CACHED negamax strategy for efficiency.
+    
+    This version reuses the transposition table across moves, significantly speeding up
+    self-play game generation compared to repeated independent searches.
+    
+    Args:
+        strategy: A CachedNegamaxStrategy instance (reused across moves for efficiency)
+        aggression: Aggression level 1-5 for BasicEvaluator
+        max_depth: Maximum number of moves before stopping
+        search_depth: Search depth for minimax (should match strategy depth)
+        random_move_probability: Probability of choosing random moves (default: 0.3)
+        collect_branch_points: If True, collect branch points for later games
+        
+    Returns:
+        Tuple of:
+        - List of (node_features, edge_index, eval_score) tuples from the game
+        - List of (board_clone, move_count) branch points
+    """
+    unique_positions = {}  # Map: graph_hash -> (node_features, edge_index, eval_score)
+    branch_points = []  # List of (board_clone, move_count) for branching
+    
+    # Start with initial position
+    board = nokamute.Board()
+    
+    # Play game to completion
+    move_count = 0
+    while move_count < max_depth:
+        # Check if game is over
+        if board.get_winner() is not None:
+            break
+        
+        # Get legal moves
+        legal_moves = board.legal_moves()
+        if not legal_moves:
+            break
+        
+        # Choose move: either random (for exploration) or cached negamax (for quality)
+        if random.random() < random_move_probability:
+            # Completely random move for exploration
+            move = random.choice(legal_moves)
+            # For random moves, get evaluation using the strategy
+            _, eval_score = strategy.choose_move_with_eval(board)
+        else:
+            # Use cached negamax strategy - reuses transposition table!
+            move, eval_score = strategy.choose_move_with_eval(board)
+            if move is None:
+                move = random.choice(legal_moves)
+        
+        # Add current position with evaluation
+        node_features, edge_index = board.to_graph()
+        pos_hash = graph_hash(node_features, edge_index)
+        if pos_hash not in unique_positions:
+            unique_positions[pos_hash] = (node_features, edge_index, eval_score)
+        
+        # Collect branch point if requested
+        if collect_branch_points and random.random() < 0.3 and len(legal_moves) > 1:
+            branch_points.append((board.clone(), move_count))
+        
+        # Make the move
+        board.apply(move)
+        move_count += 1
+    
+    # Add final position with static evaluation
+    if board.get_winner() is None:
+        node_features, edge_index = board.to_graph()
+        pos_hash = graph_hash(node_features, edge_index)
+        if pos_hash not in unique_positions:
+            # For terminal/final positions, just use static eval
+            _, eval_score = board.get_engine_move_with_eval(depth=0, aggression=aggression)
+            unique_positions[pos_hash] = (node_features, edge_index, eval_score)
+    
+    return list(unique_positions.values()), branch_points
+
+
 def _generate_position_batch_worker(args):
     """
     Worker function for generating positions by playing through N complete games.
@@ -461,6 +544,60 @@ def _generate_position_batch_worker(args):
                 random_move_probability=random_move_probability,
             )
             all_positions.extend(game_positions)
+    
+    return all_positions
+
+
+def _generate_position_batch_worker_cached(args):
+    """
+    Worker function using CACHED negamax for efficient position generation.
+    
+    This version maintains a single cached negamax strategy instance throughout
+    all games, dramatically reducing redundant tree searches.
+    
+    Args:
+        args: Tuple of (num_games, aggression, max_depth, search_depth,
+                        random_move_probability, seed)
+        
+    Returns:
+        List of (node_features, edge_index, eval_score) tuples from all games
+    """
+    (num_games, aggression, max_depth, search_depth,
+     random_move_probability, seed) = args
+    
+    # Set random seed for this worker
+    random.seed(seed)
+    
+    # Create a single cached negamax strategy for all games
+    # This will build up a large transposition table over time
+    strategy = nokamute.CachedNegamaxStrategy(depth=search_depth, aggression=aggression)
+    
+    all_positions = []
+    
+    for game_num in range(num_games):
+        # Optionally clear cache periodically to prevent unbounded memory growth
+        # Only clear every 10 games to maintain cache benefits
+        if game_num % 10 == 0 and game_num > 0:
+            # Print cache stats before clearing (useful for debugging)
+            if game_num % 100 == 0:
+                hits, misses, hit_rate = strategy.cache_stats()
+                print(f"  Worker seed={seed}, game={game_num}: cache hits={hits}, misses={misses}, hit_rate={hit_rate:.1%}")
+            strategy.clear_cache()
+        
+        # Play game to completion with cached strategy
+        game_positions, _ = play_game_to_completion_cached(
+            strategy=strategy,
+            aggression=aggression,
+            max_depth=max_depth,
+            search_depth=search_depth,
+            random_move_probability=random_move_probability,
+            collect_branch_points=False,
+        )
+        all_positions.extend(game_positions)
+    
+    # Final cache stats
+    hits, misses, hit_rate = strategy.cache_stats()
+    print(f"  Worker seed={seed} finished: total cache hits={hits}, misses={misses}, hit_rate={hit_rate:.1%}")
     
     return all_positions
 
@@ -596,6 +733,7 @@ def generate_and_save_positions(
     num_workers: Optional[int] = None,
     games_per_worker: int = 10,
     force_refresh: bool = False,
+    use_cached_negamax: bool = True,
     verbose: bool = True,
 ) -> str:
     """
@@ -621,6 +759,9 @@ def generate_and_save_positions(
         num_workers: Number of parallel workers (default: cpu_count())
         games_per_worker: Number of complete games each worker plays per task (default: 10)
         force_refresh: If True, ignore cache and regenerate data
+        use_cached_negamax: If True, use cached negamax strategy for efficiency (default: True)
+                            This dramatically speeds up position generation by reusing the
+                            transposition table across moves
         verbose: Print progress information
         
     Returns:
@@ -673,16 +814,32 @@ def generate_and_save_positions(
     # Create work items - each worker plays games_per_worker complete games
     num_tasks = (num_games + games_per_worker - 1) // games_per_worker  # Ceiling division
     
-    work_items = []
-    remaining = num_games
-    for i in range(num_tasks):
-        # Last task might have fewer games
-        current_task_games = min(games_per_worker, remaining)
-        remaining -= current_task_games
-        seed = random.randint(0, 2**32 - 1)
-        work_items.append((current_task_games, aggression, max_depth, branch_probability, 
-                          search_depth, random_move_probability, 
-                          suboptimal_move_probability, top_n_moves, seed))
+    # Choose worker function based on caching strategy
+    if use_cached_negamax:
+        if verbose:
+            print(f"Using CACHED negamax strategy for efficient tree search reuse")
+        worker_func = _generate_position_batch_worker_cached
+        work_items = []
+        remaining = num_games
+        for i in range(num_tasks):
+            current_task_games = min(games_per_worker, remaining)
+            remaining -= current_task_games
+            seed = random.randint(0, 2**32 - 1)
+            work_items.append((current_task_games, aggression, max_depth, 
+                              search_depth, random_move_probability, seed))
+    else:
+        if verbose:
+            print(f"Using standard (non-cached) strategy with branching")
+        worker_func = _generate_position_batch_worker
+        work_items = []
+        remaining = num_games
+        for i in range(num_tasks):
+            current_task_games = min(games_per_worker, remaining)
+            remaining -= current_task_games
+            seed = random.randint(0, 2**32 - 1)
+            work_items.append((current_task_games, aggression, max_depth, branch_probability, 
+                              search_depth, random_move_probability, 
+                              suboptimal_move_probability, top_n_moves, seed))
     
     # Run workers in parallel
     if verbose:
@@ -715,7 +872,7 @@ def generate_and_save_positions(
             # Use imap to process tasks, updating progress bar for each task
             pbar = tqdm(total=num_games, desc="Games completed", unit="game")
             pbar_positions = tqdm(total=0, desc="Unique positions", unit="pos", position=1)
-            for idx, batch in enumerate(pool.imap(_generate_position_batch_worker, work_items)):
+            for idx, batch in enumerate(pool.imap(worker_func, work_items)):
                 # Get the number of games in this task
                 games_in_task = work_items[idx][0]  # First element is num_games
                 
@@ -768,7 +925,7 @@ def generate_and_save_positions(
             pbar.close()
             pbar_positions.close()
         else:
-            for batch in pool.map(_generate_position_batch_worker, work_items):
+            for batch in pool.map(worker_func, work_items):
                 # Process each position in the batch
                 for position in batch:
                     # Check for duplicates across all batches

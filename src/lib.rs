@@ -3,6 +3,10 @@ pub use board::*;
 mod bug;
 pub use bug::*;
 #[cfg(not(target_arch = "wasm32"))]
+mod cached_negamax;
+#[cfg(not(target_arch = "wasm32"))]
+pub use cached_negamax::*;
+#[cfg(not(target_arch = "wasm32"))]
 mod cli;
 #[cfg(not(target_arch = "wasm32"))]
 pub use cli::*;
