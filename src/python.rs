@@ -534,6 +534,41 @@ impl Board {
         Ok((best_move.map(|m| Turn { inner: m }), absolute_score))
     }
 
+    /// Get the principal variation (best line of play) from the current position
+    ///
+    /// Args:
+    ///     depth: Search depth for minimax (default: 3)
+    ///     aggression: Aggression level 1-5 for the evaluator (default: 3)
+    ///
+    /// Returns:
+    ///     List[Turn]: Sequence of best moves for both players
+    fn get_principal_variation(
+        &self, depth: Option<u8>, aggression: Option<u8>,
+    ) -> PyResult<Vec<Turn>> {
+        use crate::BasicEvaluator;
+        use minimax::{Strategy};
+
+        // Check if game is over
+        if Rules::get_winner(&self.inner).is_some() {
+            return Ok(Vec::new());
+        }
+
+        let eval = BasicEvaluator::new(aggression.unwrap_or(3));
+        let opts = minimax::IterativeOptions::new().verbose().with_table_byte_size(100 << 20);
+
+        let mut strategy = minimax::IterativeSearch::new(eval, opts);
+        strategy.set_max_depth(depth.unwrap_or(3));
+
+        // Run the search to populate the principal variation
+        let _best_move = strategy.choose_move(&self.inner);
+
+        // Get the principal variation
+        let pv = strategy.principal_variation();
+
+        // Convert to Python Turn objects
+        Ok(pv.into_iter().map(|m| Turn { inner: m }).collect())
+    }
+
     /// Get the analytical evaluation of the current position
     ///
     /// Args:

@@ -214,8 +214,64 @@ def _choose_suboptimal_move(board, legal_moves, aggression, search_depth, top_n)
     return selected_move
 
 
+def _evaluate_position_along_pv(board, pv, aggression, lookahead_depth):
+    """
+    Evaluate a position by following the principal variation.
+    
+    This function:
+    1. Follows the PV for lookahead_depth moves (or until PV ends)
+    2. Evaluates the resulting position at depth 0 (static evaluation)
+    3. Returns that score for labeling the current position
+    
+    The score represents the evaluation after the current player (who is about
+    to move) gets lookahead_depth more turns.
+    
+    Args:
+        board: Current board state (will not be modified)
+        pv: Principal variation (list of moves)
+        aggression: Aggression level for evaluation
+        lookahead_depth: Number of plies to look ahead
+        
+    Returns:
+        Evaluation score of the position lookahead_depth moves ahead
+    """
+    if not pv or lookahead_depth == 0:
+        # No PV or zero lookahead: just use static eval of current position
+        _, eval_score = board.get_engine_move_with_eval(depth=0, aggression=aggression)
+        return eval_score
+    
+    # Clone board to avoid modifying original
+    future_board = board.clone()
+    
+    # Follow PV for up to lookahead_depth moves
+    moves_applied = 0
+    for i, move in enumerate(pv):
+        if moves_applied >= lookahead_depth:
+            break
+        
+        # Check if move is legal in current position
+        legal_moves = future_board.legal_moves()
+        if move not in legal_moves:
+            # PV became invalid (shouldn't happen but be safe)
+            break
+        
+        future_board.apply(move)
+        moves_applied += 1
+        
+        # Check if game ended
+        if future_board.get_winner() is not None:
+            break
+    
+    # Evaluate the future position at depth 0 (static evaluation)
+    _, eval_score = future_board.get_engine_move_with_eval(depth=0, aggression=aggression)
+    
+    return eval_score
+
+
 def _add_position_if_unique(board, aggression, search_depth, unique_positions):
     """
+    DEPRECATED: Use the new PV-based evaluation in play_game_to_completion instead.
+    
     Add a position to the training data if it hasn't been seen before.
     
     Uses the new combined API to efficiently get evaluation without redundant search.
@@ -240,36 +296,43 @@ def _add_position_if_unique(board, aggression, search_depth, unique_positions):
 
 def play_game_to_completion(
     aggression: int = 3,
-    max_depth: int = 200,
+    max_depth: int = 100,
     branch_probability: float = 0.3,
     search_depth: int = 3,
     random_move_probability: float = 0.3,
     suboptimal_move_probability: float = 0.0,
     top_n_moves: int = 3,
-) -> List[Tuple[List[float], List[List[int]], float]]:
+    collect_branch_points: bool = False,
+) -> Tuple[List[Tuple[List[float], List[List[int]], float]], List[Tuple]]:
     """
-    Play a single game to completion using engine self-play with stochastic move selection.
+    Play a single game to completion, evaluating positions along the principal variation.
     
-    This plays ONE game path from start to finish (win/draw/max_depth), collecting
-    all unique positions encountered along that path. Uses simple stochastic move selection:
-    either random moves (for exploration) or best engine moves (for quality).
+    For each position in the game:
+    1. Get the principal variation (PV) from minimax search at given depth
+    2. Follow the PV for search_depth moves to get a future position
+    3. Evaluate that future position at depth 0 (static evaluation)
+    4. Label the CURRENT position with the future position's score
     
-    NOTE: The branch_probability and suboptimal_move_probability parameters are ignored
-    in this version - we only use random vs. best move selection.
+    The score represents: "after the player who just moved gets search_depth more turns,
+    what is the evaluation?"
     
     Args:
         aggression: Aggression level 1-5 for BasicEvaluator
         max_depth: Maximum number of moves before stopping
-        branch_probability: IGNORED - kept for API compatibility
-        search_depth: Search depth for both move selection and evaluation
+        branch_probability: Probability of creating a branch point
+        search_depth: How many moves ahead to evaluate (depth of PV to follow)
         random_move_probability: Probability of choosing random moves (default: 0.3)
         suboptimal_move_probability: IGNORED - kept for API compatibility
         top_n_moves: IGNORED - kept for API compatibility
+        collect_branch_points: If True, collect branch points for later games
         
     Returns:
-        List of (node_features, edge_index, eval_score) tuples from the game
+        Tuple of:
+        - List of (node_features, edge_index, eval_score) tuples from the game
+        - List of (board_clone, move_count) branch points
     """
     unique_positions = {}  # Map: graph_hash -> (node_features, edge_index, eval_score)
+    branch_points = []  # List of (board_clone, move_count) for branching
     
     # Start with initial position
     board = nokamute.Board()
@@ -277,9 +340,6 @@ def play_game_to_completion(
     # Play game to completion
     move_count = 0
     while move_count < max_depth:
-        # Add current position if unique
-        _add_position_if_unique(board, aggression, search_depth, unique_positions)
-        
         # Check if game is over
         if board.get_winner() is not None:
             break
@@ -293,26 +353,54 @@ def play_game_to_completion(
         if random.random() < random_move_probability:
             # Completely random move for exploration
             move = random.choice(legal_moves)
+            # For random moves, we still need to evaluate properly
+            # Get PV from current position to determine future score
+            pv = board.get_principal_variation(depth=search_depth, aggression=aggression)
         else:
-            # Choose best engine move using minimax with alpha-beta pruning
-            engine_move = board.get_engine_move(depth=search_depth, aggression=aggression)
-            move = engine_move if engine_move is not None else random.choice(legal_moves)
+            # Get principal variation from minimax search
+            # This gives us both the best move AND the continuation
+            pv = board.get_principal_variation(depth=search_depth, aggression=aggression)
+            move = pv[0] if pv else random.choice(legal_moves)
         
+        # Evaluate current position by following PV
+        # The score should be from the perspective of the player who just moved
+        # (i.e., the player who is about to move in the PV)
+        eval_score = _evaluate_position_along_pv(board, pv, aggression, search_depth)
+        
+        # Add current position with future score
+        node_features, edge_index = board.to_graph()
+        pos_hash = graph_hash(node_features, edge_index)
+        if pos_hash not in unique_positions:
+            unique_positions[pos_hash] = (node_features, edge_index, eval_score)
+        
+        # Collect branch point if requested
+        if collect_branch_points and random.random() < branch_probability and len(legal_moves) > 1:
+            branch_points.append((board.clone(), move_count))
+        
+        # Make the move
         board.apply(move)
         move_count += 1
     
-    # Add final position
-    _add_position_if_unique(board, aggression, search_depth, unique_positions)
+    # Add final position with static evaluation
+    if board.get_winner() is None:
+        node_features, edge_index = board.to_graph()
+        pos_hash = graph_hash(node_features, edge_index)
+        if pos_hash not in unique_positions:
+            # For terminal/final positions, just use static eval
+            _, eval_score = board.get_engine_move_with_eval(depth=0, aggression=aggression)
+            unique_positions[pos_hash] = (node_features, edge_index, eval_score)
     
-    return list(unique_positions.values())
+    return list(unique_positions.values()), branch_points
 
 
 def _generate_position_batch_worker(args):
     """
     Worker function for generating positions by playing through N complete games.
     
-    Each worker plays through N games to completion, collecting all unique positions
-    from each game.
+    Strategy:
+    1. First game: play to completion, collecting branch points
+    2. Remaining games: start from a random branch point, make a different move,
+       continue to completion
     
     Args:
         args: Tuple of (num_games, aggression, max_depth, branch_probability, search_depth,
@@ -331,21 +419,126 @@ def _generate_position_batch_worker(args):
     
     all_positions = []
     
-    # Play through num_games complete games
-    for _ in range(num_games):
-        # Play one game to completion
-        game_positions = play_game_to_completion(
-            aggression=aggression,
-            max_depth=max_depth,
-            branch_probability=branch_probability,
-            search_depth=search_depth,
-            random_move_probability=random_move_probability,
-            suboptimal_move_probability=suboptimal_move_probability,
-            top_n_moves=top_n_moves,
-        )
-        all_positions.extend(game_positions)
+    if num_games == 0:
+        return all_positions
+    
+    # First game: play to completion and collect branch points
+    game_positions, branch_points = play_game_to_completion(
+        aggression=aggression,
+        max_depth=max_depth,
+        branch_probability=branch_probability,
+        search_depth=search_depth,
+        random_move_probability=random_move_probability,
+        suboptimal_move_probability=suboptimal_move_probability,
+        top_n_moves=top_n_moves,
+        collect_branch_points=True,
+    )
+    all_positions.extend(game_positions)
+    
+    # Remaining games: start from branch points with different moves
+    for _ in range(num_games - 1):
+        if not branch_points:
+            # No branch points available, play a new game from scratch
+            game_positions, _ = play_game_to_completion(
+                aggression=aggression,
+                max_depth=max_depth,
+                branch_probability=branch_probability,
+                search_depth=search_depth,
+                random_move_probability=random_move_probability,
+                suboptimal_move_probability=suboptimal_move_probability,
+                top_n_moves=top_n_moves,
+                collect_branch_points=False,
+            )
+            all_positions.extend(game_positions)
+        else:
+            # Start from a random branch point
+            branch_board, original_move_count = random.choice(branch_points)
+            game_positions = _play_from_branch_point(
+                branch_board,
+                aggression=aggression,
+                max_depth=max_depth - original_move_count,
+                search_depth=search_depth,
+                random_move_probability=random_move_probability,
+            )
+            all_positions.extend(game_positions)
     
     return all_positions
+
+
+def _play_from_branch_point(
+    branch_board,
+    aggression: int,
+    max_depth: int,
+    search_depth: int,
+    random_move_probability: float,
+) -> List[Tuple[List[float], List[List[int]], float]]:
+    """
+    Play a game from a branch point, making a different initial move than the original.
+    
+    Args:
+        branch_board: Cloned board state to start from
+        aggression: Aggression level
+        max_depth: Maximum moves to play from this point
+        search_depth: Lookahead depth for evaluation
+        random_move_probability: Probability of random moves
+        
+    Returns:
+        List of (node_features, edge_index, eval_score) tuples
+    """
+    unique_positions = {}
+    board = branch_board.clone()  # Clone again to avoid modifying the branch point
+    
+    # Get legal moves at branch point
+    legal_moves = board.legal_moves()
+    if not legal_moves:
+        return []
+    
+    # Make a random move (different from what we did in the first game)
+    # This ensures we explore different continuations
+    move = random.choice(legal_moves)
+    
+    # Get PV and evaluate
+    pv = board.get_principal_variation(depth=search_depth, aggression=aggression)
+    eval_score = _evaluate_position_along_pv(board, pv, aggression, search_depth)
+    
+    # Add this position
+    node_features, edge_index = board.to_graph()
+    pos_hash = graph_hash(node_features, edge_index)
+    if pos_hash not in unique_positions:
+        unique_positions[pos_hash] = (node_features, edge_index, eval_score)
+    
+    # Apply move and continue
+    board.apply(move)
+    
+    # Play out the rest of the game
+    move_count = 1
+    while move_count < max_depth:
+        if board.get_winner() is not None:
+            break
+        
+        legal_moves = board.legal_moves()
+        if not legal_moves:
+            break
+        
+        # Choose move
+        if random.random() < random_move_probability:
+            move = random.choice(legal_moves)
+            pv = board.get_principal_variation(depth=search_depth, aggression=aggression)
+        else:
+            pv = board.get_principal_variation(depth=search_depth, aggression=aggression)
+            move = pv[0] if pv else random.choice(legal_moves)
+        
+        # Evaluate and add position
+        eval_score = _evaluate_position_along_pv(board, pv, aggression, search_depth)
+        node_features, edge_index = board.to_graph()
+        pos_hash = graph_hash(node_features, edge_index)
+        if pos_hash not in unique_positions:
+            unique_positions[pos_hash] = (node_features, edge_index, eval_score)
+        
+        board.apply(move)
+        move_count += 1
+    
+    return list(unique_positions.values())
 
 
 def _get_cache_key(num_games: int, aggression: int, max_depth: int, 
