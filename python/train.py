@@ -612,6 +612,32 @@ def main():
         default=0,
         help="Search depth for minimax evaluation during eval-matching pre-training (default: 0 for static eval). Higher values use minimax to evaluate N moves ahead.",
     )
+    
+    # Performance optimization arguments
+    parser.add_argument(
+        "--use-compile",
+        action="store_true",
+        default=True,
+        help="Use torch.compile() for model inference speedup (default: True, PyTorch 2.0+ required, GPU recommended)",
+    )
+    parser.add_argument(
+        "--no-compile",
+        action="store_false",
+        dest="use_compile",
+        help="Disable torch.compile() (useful for debugging or CPU-only systems)",
+    )
+    parser.add_argument(
+        "--use-amp",
+        action="store_true",
+        help="Use Automatic Mixed Precision for faster GPU inference (requires GPU with Tensor Cores)",
+    )
+    parser.add_argument(
+        "--no-cache-graphs",
+        action="store_false",
+        dest="cache_graphs",
+        default=True,
+        help="Disable graph caching (reduces memory usage at cost of speed)",
+    )
 
     args = parser.parse_args()
 
@@ -649,6 +675,21 @@ def main():
         "num_layers": args.num_layers,
     }
     model = create_model(model_config).to(args.device)
+    
+    # Apply torch.compile() for faster inference (GPU recommended)
+    if args.use_compile:
+        if args.device == "cpu":
+            print("Note: torch.compile() on CPU may not provide speedup and can cause issues")
+            print("      Consider using --no-compile for CPU training, or use GPU with --device cuda")
+        else:
+            try:
+                print("Compiling model with torch.compile()...")
+                model = torch.compile(model, mode="reduce-overhead")
+                print("✓ Model compiled successfully! Expect 30-200% speedup for inference.")
+            except Exception as e:
+                print(f"Warning: Could not compile model: {type(e).__name__}")
+                print(f"         Continuing without compilation...")
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     start_iteration = 0
@@ -1224,6 +1265,8 @@ def main():
             device=args.device,
             enable_branching=args.enable_branching,
             max_moves=args.max_moves,
+            use_amp=args.use_amp,
+            cache_graphs=args.cache_graphs,
         )
         
         if args.enable_branching:

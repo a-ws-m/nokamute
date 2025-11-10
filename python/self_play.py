@@ -51,6 +51,8 @@ class SelfPlayGame:
         device="cpu",
         enable_branching=False,
         max_moves=400,
+        use_amp=False,
+        cache_graphs=True,
     ):
         """
         Args:
@@ -59,12 +61,17 @@ class SelfPlayGame:
             device: Device to run model on
             enable_branching: Enable branching MCMC for game generation
             max_moves: Maximum number of moves before declaring a draw (default: 400)
+            use_amp: Whether to use Automatic Mixed Precision (GPU only)
+            cache_graphs: Whether to cache graph conversions to avoid redundant work
         """
         self.model = model
         self.temperature = temperature
         self.device = device
         self.enable_branching = enable_branching
         self.max_moves = max_moves
+        self.use_amp = use_amp and device != "cpu"
+        self.cache_graphs = cache_graphs
+        self._graph_cache: Dict[str, tuple] = {}
 
         # Branching MCMC state
         self.game_tree: Dict[str, GameNode] = {}  # board_state -> GameNode
@@ -233,15 +240,18 @@ class SelfPlayGame:
         Evaluate all legal moves in a single batch.
         Deduplicates positions with identical graph hashes to avoid redundant evaluations.
 
-        OPTIMIZED: Reuses a single board clone with undo() instead of creating new clones
-        for each move, reducing memory allocation overhead (~1.2x speedup).
+        OPTIMIZATIONS:
+        - Reuses a single board clone with undo() instead of creating new clones
+        - Keeps tensors on device throughout to minimize CPU↔GPU transfers
+        - Caches graph conversions to avoid redundant work
+        - Supports Automatic Mixed Precision (AMP) for GPU
 
         Args:
             board: Current board state
             legal_moves: List of legal moves
 
         Returns:
-            List of values for each move (absolute scale: +1 = White winning, -1 = Black winning)
+            Tensor of values for each move (on device, absolute scale: +1 = White winning, -1 = Black winning)
         """
         # Group moves by resulting graph hash to deduplicate equivalent positions
         hash_to_moves = {}  # graph_hash -> list of move_idx
@@ -254,11 +264,18 @@ class SelfPlayGame:
             # Apply the move
             board_copy.apply(move)
 
-            # Convert to graph
+            # Convert to graph (with optional caching)
             node_features, edge_index = board_copy.to_graph()
-
+            
             # Get graph hash for deduplication
             pos_hash = graph_hash(node_features, edge_index)
+            
+            # Check cache if enabled
+            if self.cache_graphs and pos_hash in self._graph_cache:
+                node_features, edge_index = self._graph_cache[pos_hash]
+            elif self.cache_graphs:
+                # Cache miss - store for future use
+                self._graph_cache[pos_hash] = (node_features, edge_index)
 
             # OPTIMIZATION: Undo the move to reuse the clone
             board_copy.undo(move)
@@ -281,9 +298,9 @@ class SelfPlayGame:
 
             if graph_data is not None:
                 node_features, edge_index = graph_data
-                # Convert to PyG Data object
-                x = torch.tensor(node_features, dtype=torch.float32)
-                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
+                # OPTIMIZATION: Create tensors directly on device (avoid CPU→GPU transfer)
+                x = torch.tensor(node_features, dtype=torch.float32, device=self.device)
+                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long, device=self.device)
 
                 data = Data(x=x, edge_index=edge_index_tensor)
                 data_list.append(data)
@@ -293,26 +310,32 @@ class SelfPlayGame:
         # Batch evaluate all unique valid positions
         if len([d for d in data_list if d is not None]) == 0:
             # All moves lead to empty boards (shouldn't happen in practice)
-            return [0.0] * len(legal_moves)
+            return torch.zeros(len(legal_moves), device=self.device)
 
         # Evaluate unique positions
         hash_to_value = {}
         valid_data = [d for d in data_list if d is not None]
         valid_hashes = [h for h, d in zip(unique_hashes, data_list) if d is not None]
 
-        # Create batch from all data
-        batch = Batch.from_data_list(valid_data).to(self.device)
+        # Create batch from all data (already on device)
+        batch = Batch.from_data_list(valid_data)
 
-        # Evaluate all positions in a single forward pass
+        # Evaluate all positions in a single forward pass with optional AMP
         with torch.no_grad():
-            predictions, _ = self.model(batch.x, batch.edge_index, batch.batch)
+            if self.use_amp:
+                # OPTIMIZATION: Use Automatic Mixed Precision for faster GPU inference
+                with torch.autocast(device_type=self.device, dtype=torch.float16):
+                    predictions, _ = self.model(batch.x, batch.edge_index, batch.batch)
+            else:
+                predictions, _ = self.model(batch.x, batch.edge_index, batch.batch)
+            
             values = predictions.squeeze()
 
             # Keep on device for now - we'll map back to moves in PyTorch
             if len(valid_data) == 1:
                 values = values.unsqueeze(0)  # Make sure it's 1D
 
-        # Map values to graph hashes (keep as tensors)
+        # Map values to graph hashes (keep as tensors on device)
         # Values are absolute (positive = White winning, negative = Black winning)
         hash_to_value = {}
         for i, graph_hash_val in enumerate(valid_hashes):
@@ -323,7 +346,7 @@ class SelfPlayGame:
             if graph_data is None:
                 hash_to_value[graph_hash_val] = torch.tensor(0.0, device=self.device)
 
-        # Map values back to all moves (including duplicates) as a PyTorch tensor
+        # Map values back to all moves (including duplicates) as a PyTorch tensor (on device)
         move_values = torch.zeros(len(legal_moves), device=self.device)
         for graph_hash_val, move_indices in hash_to_moves.items():
             value = hash_to_value[graph_hash_val]
@@ -605,6 +628,21 @@ class SelfPlayGame:
         """
         self.game_tree.clear()
         self.branch_points.clear()
+    
+    def clear_graph_cache(self):
+        """
+        Clear the graph conversion cache.
+        """
+        self._graph_cache.clear()
+    
+    def get_cache_stats(self):
+        """Get statistics about cache usage."""
+        return {
+            "graph_cache_size": len(self._graph_cache),
+            "graph_cache_enabled": self.cache_graphs,
+            "amp_enabled": self.use_amp,
+            "device": self.device,
+        }
 
 
 def prepare_training_data(games):

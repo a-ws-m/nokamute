@@ -97,6 +97,7 @@ def train_main_agent(
     league_tracker: LeagueTracker,
     config: LeagueConfig,
     iteration: int,
+    args=None,
 ):
     """
     Train the Main Agent for one iteration using PFSP.
@@ -130,6 +131,8 @@ def train_main_agent(
         device=config.device,
         enable_branching=config.enable_branching,
         max_moves=config.max_moves,
+        use_amp=args.use_amp if args else False,
+        cache_graphs=args.cache_graphs if args else True,
     )
 
     for game_idx in range(config.main_agent_games_per_iter):
@@ -440,6 +443,32 @@ def main():
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
+    
+    # Performance optimization arguments
+    parser.add_argument(
+        "--use-compile",
+        action="store_true",
+        default=True,
+        help="Use torch.compile() for model inference speedup (default: True, GPU recommended)",
+    )
+    parser.add_argument(
+        "--no-compile",
+        action="store_false",
+        dest="use_compile",
+        help="Disable torch.compile() (useful for debugging or CPU-only systems)",
+    )
+    parser.add_argument(
+        "--use-amp",
+        action="store_true",
+        help="Use Automatic Mixed Precision for faster GPU inference",
+    )
+    parser.add_argument(
+        "--no-cache-graphs",
+        action="store_false",
+        dest="cache_graphs",
+        default=True,
+        help="Disable graph caching",
+    )
 
     args = parser.parse_args()
 
@@ -486,9 +515,21 @@ def main():
 
         # Load pretrained weights if specified
         if args.pretrained_model:
-            print(f"Loading pretrained weights from {args.pretrained_model}")
+            print(f"Loading pretrained model from {args.pretrained_model}...")
             pretrained = torch.load(args.pretrained_model, map_location=config.device)
             model.load_state_dict(pretrained["model_state_dict"])
+        
+        # Apply torch.compile() for faster inference
+        if args.use_compile:
+            if config.device == "cpu":
+                print("Note: torch.compile() on CPU may not provide speedup")
+            else:
+                try:
+                    print("Compiling model with torch.compile()...")
+                    model = torch.compile(model, mode="reduce-overhead")
+                    print("✓ Model compiled successfully!")
+                except Exception as e:
+                    print(f"Warning: Could not compile model: {type(e).__name__}")
 
         optimizer = torch.optim.Adam(model.parameters(), lr=config.main_agent_lr)
         league_manager.initialize_main_agent(model, optimizer, model_config)
@@ -508,7 +549,7 @@ def main():
         # 1. Train Main Agent
         if iteration % config.main_agent_update_interval == 0:
             main_agent = train_main_agent(
-                league_manager, league_tracker, config, iteration
+                league_manager, league_tracker, config, iteration, args
             )
 
         # 2. Spawn new Main Exploiter if needed
