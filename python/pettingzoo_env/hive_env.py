@@ -13,8 +13,8 @@ import gymnasium
 import numpy as np
 from gymnasium import spaces
 from pettingzoo import AECEnv
-from pettingzoo.utils.agent_selector import agent_selector
 from pettingzoo.utils import wrappers
+from pettingzoo.utils.agent_selector import agent_selector
 
 import nokamute
 
@@ -135,16 +135,21 @@ class HiveAECEnv(AECEnv):
         self._action_to_string, self._string_to_action = self._build_action_space()
         
         # Define observation and action spaces
-        # Graph space for board representation
-        # Node features: [color(1), bug_onehot(9), height(1), current_player(1)] = 12 features
-        node_space = spaces.Box(low=0.0, high=10.0, shape=(12,), dtype=np.float32)
-        # Edge features: just adjacency, no additional features
-        edge_space = spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32)
+        # Use fixed-size matrices instead of Graph space for batching compatibility
+        # Maximum nodes: (28 pieces total) × 6 (hex neighbors) + 1 = 169
+        # This is the theoretical upper bound for the graph size
+        self.max_nodes = 169
         
-        # Use Dict space to include both graph and action mask
+        # Node features: [color(1), bug_onehot(9), height(1), current_player(1)] = 12 features
+        # Adjacency matrix: [max_nodes, max_nodes] - symmetric binary matrix
+        # Node mask: [max_nodes] - indicates which nodes are valid (not padding)
+        
+        # Use Dict space to include node features, adjacency matrix, and action mask
         self._observation_spaces = {
             agent: spaces.Dict({
-                "observation": spaces.Graph(node_space=node_space, edge_space=edge_space),
+                "node_features": spaces.Box(low=0.0, high=10.0, shape=(self.max_nodes, 12), dtype=np.float32),
+                "adjacency_matrix": spaces.Box(low=0, high=1, shape=(self.max_nodes, self.max_nodes), dtype=np.float32),
+                "node_mask": spaces.Box(low=0, high=1, shape=(self.max_nodes,), dtype=np.float32),
                 "action_mask": spaces.Box(low=0, high=1, shape=(len(self._action_to_string),), dtype=np.int8),
             })
             for agent in self.possible_agents
@@ -246,47 +251,52 @@ class HiveAECEnv(AECEnv):
     
     def observe(self, agent):
         """
-        Return the observation for the specified agent.
+        Get observation for the specified agent.
         
-        Converts the board state to a Graph observation using the Rust binding's
-        to_graph() method.
-        
-        Args:
-            agent: Agent name
-            
-        Returns:
-            Dict observation with keys:
-            - "observation": Graph with "nodes", "edges", "edge_links"
+        Returns dict with:
+            - "node_features": Fixed-size matrix [max_nodes, 12] with node features
+            - "adjacency_matrix": Fixed-size matrix [max_nodes, max_nodes] with adjacency
+            - "node_mask": Mask [max_nodes] indicating valid nodes
             - "action_mask": Binary mask of legal actions
         """
         # Get graph representation from board
         node_features, edge_index = self.board.to_graph()
         
-        # Convert to numpy arrays with correct shapes
+        # Convert to numpy arrays
         if len(node_features) == 0:
             # Empty board - no nodes
             nodes = np.zeros((0, 12), dtype=np.float32)
+            num_nodes = 0
         else:
             nodes = np.array(node_features, dtype=np.float32)
+            num_nodes = nodes.shape[0]
         
-        if len(edge_index) == 0 or len(edge_index[0]) == 0:
-            # No edges
-            edge_links = np.zeros((0, 2), dtype=np.int32)  # Edge connectivity (pairs of node indices)
-            edges = np.zeros((0, 1), dtype=np.float32)  # Edge features
-        else:
-            # Convert edge_index [sources, targets] to edge_links [[source, target], ...]
+        # Create padded node feature matrix
+        padded_nodes = np.zeros((self.max_nodes, 12), dtype=np.float32)
+        if num_nodes > 0:
+            padded_nodes[:num_nodes] = nodes
+        
+        # Create node mask (1 for valid nodes, 0 for padding)
+        node_mask = np.zeros(self.max_nodes, dtype=np.float32)
+        node_mask[:num_nodes] = 1.0
+        
+        # Create adjacency matrix from edge_index
+        adjacency = np.zeros((self.max_nodes, self.max_nodes), dtype=np.float32)
+        if len(edge_index) > 0 and len(edge_index[0]) > 0:
             edge_array = np.array(edge_index, dtype=np.int32)
-            edge_links = edge_array.T  # Transpose to get (num_edges, 2)
-            # Create edge features (all ones for now, just indicating connectivity)
-            edges = np.ones((edge_links.shape[0], 1), dtype=np.float32)
+            sources = edge_array[0]
+            targets = edge_array[1]
+            # Set adjacency (symmetric for undirected graph)
+            for src, tgt in zip(sources, targets):
+                if src < self.max_nodes and tgt < self.max_nodes:
+                    adjacency[src, tgt] = 1.0
+                    adjacency[tgt, src] = 1.0  # Symmetric
         
-        # Create GraphInstance for the observation
-        from gymnasium.spaces.graph import GraphInstance
-        graph_obs = GraphInstance(nodes=nodes, edges=edges, edge_links=edge_links)
-        
-        # Return dict with graph observation and action mask
+        # Return dict with fixed-size matrices and action mask
         return {
-            "observation": graph_obs,
+            "node_features": padded_nodes,
+            "adjacency_matrix": adjacency,
+            "node_mask": node_mask,
             "action_mask": self.action_mask(agent),
         }
     
@@ -401,6 +411,17 @@ class HiveAECEnv(AECEnv):
         for agent in self.agents:
             self._cumulative_rewards[agent] += self.rewards[agent]
     
+    def _was_dead_step(self, action):
+        """
+        Handle step() being called on a terminated/truncated agent.
+        
+        This is required by PettingZoo AEC API - when step() is called on an
+        agent that has already terminated, we need to handle it gracefully.
+        """
+        # Agent was already terminated, just pass to next agent
+        # Don't accumulate rewards or change game state
+        self.agent_selection = self._agent_selector.next()
+    
     def render(self):
         """
         Render the environment.
@@ -457,12 +478,14 @@ class HiveAECEnv(AECEnv):
         """
         # Get legal moves
         legal_moves = self.board.legal_moves()
-        legal_move_strings = set(self.board.to_move_string(move) for move in legal_moves)
         
-        # Create mask
+        # Create mask efficiently using pre-built string_to_action mapping
         mask = np.zeros(len(self._action_to_string), dtype=np.int8)
-        for action_idx, move_string in self._action_to_string.items():
-            if move_string in legal_move_strings:
-                mask[action_idx] = 1
+        for move in legal_moves:
+            move_string = self.board.to_move_string(move)
+            try:
+                mask[self._string_to_action[move_string]] = 1
+            except KeyError:
+                continue
         
         return mask
