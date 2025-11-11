@@ -319,8 +319,13 @@ class SelfPlayGame:
         probs_np = probs.cpu().numpy()
         legal_probs = probs_np[legal_action_indices]
 
-        # Normalize (should already be normalized, but ensure)
-        legal_probs = legal_probs / legal_probs.sum()
+        # Check for invalid probabilities (NaN or all zeros)
+        if np.isnan(legal_probs).any() or legal_probs.sum() == 0:
+            # Fallback to uniform distribution over legal actions
+            legal_probs = np.ones(len(legal_action_indices)) / len(legal_action_indices)
+        else:
+            # Normalize (should already be normalized, but ensure)
+            legal_probs = legal_probs / legal_probs.sum()
 
         # Sample action index
         selected_action_idx = np.random.choice(legal_action_indices, p=legal_probs)
