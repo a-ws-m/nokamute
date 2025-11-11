@@ -29,10 +29,28 @@ from league import (
     prepare_exploiter_training_data,
 )
 from model import create_model
+from model_policy import create_policy_model
 from self_play import SelfPlayGame, prepare_training_data
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
+
+
+def create_model_by_type(model_type, model_config):
+    """
+    Create model based on type selection.
+
+    Args:
+        model_type: "value" or "policy"
+        model_config: Model configuration dict
+
+    Returns:
+        Model instance
+    """
+    if model_type == "policy":
+        return create_policy_model(model_config)
+    else:
+        return create_model(model_config)
 
 
 def train_epoch_standard(model, training_data, optimizer, batch_size=32, device="cpu"):
@@ -116,7 +134,12 @@ def train_main_agent(
     # Load current Main Agent model
     agent = league_manager.current_main_agent
     checkpoint = torch.load(agent.model_path, map_location=config.device)
-    model = create_model(checkpoint.get("config", {})).to(config.device)
+    model_type = checkpoint.get(
+        "model_type", "value"
+    )  # Default to value for backward compatibility
+    model = create_model_by_type(model_type, checkpoint.get("config", {})).to(
+        config.device
+    )
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer = torch.optim.Adam(model.parameters(), lr=config.main_agent_lr)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -150,9 +173,10 @@ def train_main_agent(
         opponent_checkpoint = torch.load(
             opponent_agent.model_path, map_location=config.device
         )
-        opponent_model = create_model(opponent_checkpoint.get("config", {})).to(
-            config.device
-        )
+        opponent_model_type = opponent_checkpoint.get("model_type", "value")
+        opponent_model = create_model_by_type(
+            opponent_model_type, opponent_checkpoint.get("config", {})
+        ).to(config.device)
         opponent_model.load_state_dict(opponent_checkpoint["model_state_dict"])
         opponent_model.eval()
 
@@ -249,7 +273,10 @@ def train_main_exploiter(
 
     # Load exploiter model
     checkpoint = torch.load(exploiter.model_path, map_location=config.device)
-    model = create_model(checkpoint.get("config", {})).to(config.device)
+    exploiter_model_type = checkpoint.get("model_type", "value")
+    model = create_model_by_type(exploiter_model_type, checkpoint.get("config", {})).to(
+        config.device
+    )
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer = torch.optim.Adam(model.parameters(), lr=config.exploiter_lr)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -257,7 +284,10 @@ def train_main_exploiter(
     # Load target (Main Agent) model
     main_agent = league_manager.current_main_agent
     main_checkpoint = torch.load(main_agent.model_path, map_location=config.device)
-    main_model = create_model(main_checkpoint.get("config", {})).to(config.device)
+    main_model_type = main_checkpoint.get("model_type", "value")
+    main_model = create_model_by_type(
+        main_model_type, main_checkpoint.get("config", {})
+    ).to(config.device)
     main_model.load_state_dict(main_checkpoint["model_state_dict"])
     main_model.eval()
 
@@ -452,6 +482,16 @@ def main():
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
 
+    # Model type
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        choices=["value", "policy"],
+        default="policy",
+        help="Model architecture: 'value' (evaluates each move) or 'policy' (fixed action space). "
+        "Benchmark shows policy is ~11x faster for game generation.",
+    )
+
     # Performance optimization arguments
     parser.add_argument(
         "--use-compile",
@@ -504,6 +544,7 @@ def main():
     print("LEAGUE TRAINING SYSTEM")
     print("=" * 60)
     print(f"Device: {config.device}")
+    print(f"Model type: {args.model_type}")
     print(f"Main Agent games/iter: {config.main_agent_games_per_iter}")
     print(f"Exploiter games/iter: {config.exploiter_games_per_iter}")
     print(f"Minimax reward weight: {config.minimax_reward_weight}")
@@ -528,11 +569,12 @@ def main():
     model_config = {
         "hidden_dim": args.hidden_dim,
         "num_layers": args.num_layers,
+        "model_type": args.model_type,  # Store model type for future loading
     }
 
     if league_manager.current_main_agent is None:
         print("\nInitializing Main Agent...")
-        model = create_model(model_config).to(config.device)
+        model = create_model_by_type(args.model_type, model_config).to(config.device)
 
         # Load pretrained weights if specified
         if args.pretrained_model:
@@ -582,7 +624,9 @@ def main():
             print(f"{'='*60}")
 
             # Create fresh model for exploiter
-            model = create_model(model_config).to(config.device)
+            model = create_model_by_type(args.model_type, model_config).to(
+                config.device
+            )
             optimizer = torch.optim.Adam(model.parameters(), lr=config.exploiter_lr)
             league_manager.spawn_main_exploiter(model, optimizer, model_config)
 
@@ -597,7 +641,9 @@ def main():
             print(f"Spawning new League Exploiter")
             print(f"{'='*60}")
 
-            model = create_model(model_config).to(config.device)
+            model = create_model_by_type(args.model_type, model_config).to(
+                config.device
+            )
             optimizer = torch.optim.Adam(model.parameters(), lr=config.exploiter_lr)
             league_manager.spawn_league_exploiter(model, optimizer, model_config)
 
@@ -623,7 +669,10 @@ def main():
 
             main_agent = league_manager.current_main_agent
             checkpoint = torch.load(main_agent.model_path, map_location=config.device)
-            model = create_model(checkpoint.get("config", {})).to(config.device)
+            eval_model_type = checkpoint.get("model_type", "value")
+            model = create_model_by_type(
+                eval_model_type, checkpoint.get("config", {})
+            ).to(config.device)
             model.load_state_dict(checkpoint["model_state_dict"])
 
             evaluate_and_update_elo(

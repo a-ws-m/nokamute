@@ -88,6 +88,11 @@ class SelfPlayGame:
         if self.model is not None:
             self.model.eval()
 
+        # Detect model type (value-based vs policy-based)
+        self.use_policy_model = (
+            hasattr(model, "num_actions") if model is not None else False
+        )
+
     def _get_board_state_key(self, board):
         """
         Get a hashable representation of the board state.
@@ -164,11 +169,202 @@ class SelfPlayGame:
             str(legal_moves[i]): float(probs_np[i]) for i in range(len(legal_moves))
         }
 
+    def select_move_policy(
+        self, board, legal_moves, return_probs=False, return_value=False
+    ):
+        """
+        Select a move using the policy-based model (fixed action space with action mask).
+        This is an alternative to select_move() that uses a policy head instead of
+        evaluating each move separately.
+
+        Args:
+            board: Current board state
+            legal_moves: List of legal moves
+            return_probs: If True, also return move probabilities
+            return_value: If True, also return the evaluated value of the current position
+
+        Returns:
+            Selected move (and optionally move probabilities dict and/or position value)
+        """
+        from action_space import get_action_space, string_to_action
+
+        if len(legal_moves) == 1:
+            move = legal_moves[0]
+            result = [move]
+            if return_probs:
+                result.append({str(move): 1.0})
+            if return_value:
+                # Evaluate position if requested
+                if self.model is not None:
+                    node_features, edge_index = board.to_graph()
+                    x = torch.tensor(
+                        node_features, dtype=torch.float32, device=self.device
+                    )
+                    edge_index_tensor = torch.tensor(
+                        edge_index, dtype=torch.long, device=self.device
+                    )
+                    with torch.no_grad():
+                        _, value = self.model(x, edge_index_tensor)
+                    result.append(value.item())
+                else:
+                    result.append(0.0)
+            return tuple(result) if len(result) > 1 else result[0]
+
+        # Check for immediate winning moves first
+        current_player = board.to_move().name
+        for move in legal_moves:
+            board_copy = board.clone()
+            board_copy.apply(move)
+            winner = board_copy.get_winner()
+
+            if winner == current_player:
+                # Winning move found - return it immediately
+                result = [move]
+                if return_probs:
+                    result.append({str(move): 1.0})
+                if return_value:
+                    # Winning position has value 1.0 for current player
+                    result.append(1.0 if current_player == "White" else -1.0)
+                del board_copy
+                return tuple(result) if len(result) > 1 else result[0]
+
+            del board_copy
+
+        if self.model is None:
+            # Random selection
+            selected_move = random.choice(legal_moves)
+            result = [selected_move]
+            if return_probs:
+                prob = 1.0 / len(legal_moves)
+                result.append({str(move): prob for move in legal_moves})
+            if return_value:
+                result.append(0.0)
+            return tuple(result) if len(result) > 1 else result[0]
+
+        # Build action mask for legal moves
+        action_to_str, str_to_action, action_space_size = get_action_space()
+        action_mask = torch.zeros(
+            action_space_size, dtype=torch.float32, device=self.device
+        )
+
+        legal_move_strings = []
+        legal_action_indices = []
+        for move in legal_moves:
+            move_str = board.to_move_string(move)  # Convert to UHP format
+            legal_move_strings.append(move_str)
+            action_idx = string_to_action(move_str)
+            if action_idx != -1:
+                action_mask[action_idx] = 1.0
+                legal_action_indices.append(action_idx)
+
+        # Get graph representation
+        node_features, edge_index = board.to_graph()
+
+        # Handle empty board case
+        if len(node_features) == 0:
+            # Empty board - uniform distribution
+            prob = 1.0 / len(legal_moves)
+            result = [random.choice(legal_moves)]
+            if return_probs:
+                result.append({move_str: prob for move_str in legal_move_strings})
+            if return_value:
+                result.append(0.0)
+            return tuple(result) if len(result) > 1 else result[0]
+
+        x = torch.tensor(node_features, dtype=torch.float32, device=self.device)
+        edge_index_tensor = torch.tensor(
+            edge_index, dtype=torch.long, device=self.device
+        )
+
+        # Forward pass through policy model
+        with torch.no_grad():
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    probs = self.model.predict_action_probs(
+                        x,
+                        edge_index_tensor,
+                        action_mask=action_mask.unsqueeze(0),
+                        temperature=self.temperature,
+                    )
+            else:
+                probs = self.model.predict_action_probs(
+                    x,
+                    edge_index_tensor,
+                    action_mask=action_mask.unsqueeze(0),
+                    temperature=self.temperature,
+                )
+
+            probs = probs.squeeze(0)  # Remove batch dimension
+
+            # Also get position value if requested
+            position_value = None
+            if return_value:
+                _, position_value = self.model(
+                    x, edge_index_tensor, action_mask=action_mask.unsqueeze(0)
+                )
+                position_value = position_value.item()
+
+        # Sample action from probabilities
+        probs_np = probs.cpu().numpy()
+        legal_probs = probs_np[legal_action_indices]
+
+        # Normalize (should already be normalized, but ensure)
+        legal_probs = legal_probs / legal_probs.sum()
+
+        # Sample action index
+        selected_action_idx = np.random.choice(legal_action_indices, p=legal_probs)
+        selected_move_str = action_to_str[selected_action_idx]
+
+        # Find the corresponding move object
+        selected_move = None
+        for move in legal_moves:
+            if board.to_move_string(move) == selected_move_str:
+                selected_move = move
+                break
+
+        # Build return value
+        result = [selected_move]
+        if return_probs:
+            # Build move probability dict
+            move_probs = {}
+            for move_str, action_idx in zip(legal_move_strings, legal_action_indices):
+                move_probs[move_str] = float(probs_np[action_idx])
+            result.append(move_probs)
+        if return_value:
+            result.append(position_value if position_value is not None else 0.0)
+
+        return tuple(result) if len(result) > 1 else result[0]
+
     def select_move(self, board, legal_moves, return_probs=False, return_value=False):
         """
         Select a move based on model evaluation or random selection.
-        Checks for immediate winning moves first.
-        Uses batch evaluation for all legal moves when model is available.
+        Routes to either policy-based or value-based move selection depending on model type.
+
+        Args:
+            board: Current board state
+            legal_moves: List of legal moves
+            return_probs: If True, also return move probabilities
+            return_value: If True, also return the evaluated value of the resulting position
+
+        Returns:
+            Selected move (and optionally move probabilities dict and/or move value)
+        """
+        # Route to appropriate method based on model type
+        if self.use_policy_model:
+            return self.select_move_policy(
+                board, legal_moves, return_probs, return_value
+            )
+        else:
+            return self.select_move_value(
+                board, legal_moves, return_probs, return_value
+            )
+
+    def select_move_value(
+        self, board, legal_moves, return_probs=False, return_value=False
+    ):
+        """
+        Select a move using value-based model (evaluates each legal move separately).
+        This is the original implementation.
 
         Args:
             board: Current board state
