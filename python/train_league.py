@@ -690,11 +690,22 @@ def main():
                 print("Note: torch.compile() on CPU may not provide speedup")
             else:
                 try:
-                    print("Compiling model with torch.compile()...")
-                    model = torch.compile(model, mode="reduce-overhead")
-                    print("✓ Model compiled successfully!")
+                    print("Compiling model with torch.compile(fullgraph=True)...")
+                    # For older GPUs (CUDA < 7.0), fallback to eager backend
+                    if torch.cuda.is_available():
+                        capability = torch.cuda.get_device_capability()
+                        if capability[0] < 7:
+                            print(f"GPU CUDA capability {capability[0]}.{capability[1]} < 7.0, using eager backend")
+                            model = torch.compile(model, fullgraph=True, backend="eager")
+                        else:
+                            model = torch.compile(model, fullgraph=True, mode="reduce-overhead")
+                    else:
+                        model = torch.compile(model, fullgraph=True, mode="reduce-overhead")
+                    print("✓ Model compiled successfully with fullgraph=True!")
                 except Exception as e:
                     print(f"Warning: Could not compile model: {type(e).__name__}")
+                    print(f"Falling back to default compile without fullgraph")
+                    model = torch.compile(model, mode="reduce-overhead")
     else:
         print(f"\nResuming from iteration {league_manager.iteration}")
 
