@@ -36,11 +36,17 @@ class LeagueTracker:
     - League diversity metrics
     """
 
-    def __init__(self, log_dir: str, elo_save_path: Optional[str] = None):
+    def __init__(
+        self,
+        log_dir: str,
+        elo_save_path: Optional[str] = None,
+        engine_depths: Optional[List[int]] = None,
+    ):
         """
         Args:
             log_dir: Directory for TensorBoard logs
             elo_save_path: Path to save ELO ratings (optional, defaults to log_dir/elo_ratings.json)
+            engine_depths: List of engine depths to track (optional, defaults to all depths 1-5)
         """
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -50,7 +56,9 @@ class LeagueTracker:
         # ELO tracking
         if elo_save_path is None:
             elo_save_path = str(self.log_dir / "elo_ratings.json")
-        self.elo_tracker = EloTracker(save_path=elo_save_path, k_factor=32)
+        self.elo_tracker = EloTracker(
+            save_path=elo_save_path, k_factor=32, engine_depths=engine_depths
+        )
 
         # Performance history
         self.matchup_history = defaultdict(
@@ -140,9 +148,14 @@ class LeagueTracker:
             f"games/{agent1.name}_vs_{agent2.name}/length", game_length, iteration
         )
 
-        # Log ELO ratings
-        self.writer.add_scalar(f"elo/{agent1.name}", new_elo1, iteration)
-        self.writer.add_scalar(f"elo/{agent2.name}", new_elo2, iteration)
+        # Log ELO ratings - both individual and unified view
+        self.writer.add_scalar(f"elo_individual/{agent1.name}", new_elo1, iteration)
+        self.writer.add_scalar(f"elo_individual/{agent2.name}", new_elo2, iteration)
+
+        # Log to unified ELO graph (all agents on same plot)
+        # Use add_scalars for multi-line plots
+        self.writer.add_scalar(f"elo_unified/{agent1.name}", new_elo1, iteration)
+        self.writer.add_scalar(f"elo_unified/{agent2.name}", new_elo2, iteration)
 
     def log_agent_performance(
         self,
@@ -165,9 +178,11 @@ class LeagueTracker:
         self.writer.add_scalar(f"{prefix}/total_losses", agent.total_losses, iteration)
         self.writer.add_scalar(f"{prefix}/total_draws", agent.total_draws, iteration)
 
-        # ELO rating
+        # ELO rating - both individual and unified view
         elo_rating = self.elo_tracker.get_rating(agent.name)
         self.writer.add_scalar(f"{prefix}/elo", elo_rating, iteration)
+        self.writer.add_scalar(f"elo_individual/{agent.name}", elo_rating, iteration)
+        self.writer.add_scalar(f"elo_unified/{agent.name}", elo_rating, iteration)
 
         # Convergence status for exploiters
         if agent.archetype in [
@@ -466,6 +481,9 @@ class LeagueTracker:
                 agent_name,
                 iteration,
             )
+
+            # Also log to unified ELO graph for complete view
+            self.writer.add_scalar(f"elo_unified/{agent_name}", elo_rating, iteration)
 
     def get_agent_elo(self, agent_name: str) -> float:
         """

@@ -321,12 +321,20 @@ def evaluate_and_update_elo(
                 f"{prefix}/avg_moves", results["avg_moves"], iteration
             )
 
-            # Log ELO ratings
+            # Log ELO ratings - both individual and unified view
             tensorboard_writer.add_scalar(
-                f"elo/{model_name}", new_model_rating, iteration
+                f"elo_individual/{model_name}", new_model_rating, iteration
             )
             tensorboard_writer.add_scalar(
-                f"elo/{engine_name}", new_engine_rating, iteration
+                f"elo_individual/{engine_name}", new_engine_rating, iteration
+            )
+
+            # Log to unified ELO graph (all agents on same plot)
+            tensorboard_writer.add_scalar(
+                f"elo_unified/{model_name}", new_model_rating, iteration
+            )
+            tensorboard_writer.add_scalar(
+                f"elo_unified/{engine_name}", new_engine_rating, iteration
             )
 
     # Save ELO history

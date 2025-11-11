@@ -658,7 +658,9 @@ def main():
     # Initialize league manager and tracker
     league_manager = LeagueManager(config, str(save_dir))
     league_tracker = LeagueTracker(
-        str(save_dir / "logs"), elo_save_path=str(save_dir / "elo_ratings.json")
+        str(save_dir / "logs"),
+        elo_save_path=str(save_dir / "elo_ratings.json"),
+        engine_depths=args.eval_depths,
     )
 
     # Initialize or resume Main Agent
