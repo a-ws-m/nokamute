@@ -277,7 +277,11 @@ class HiveGNNPolicyHetero(nn.Module):
 
         # Initialize action logits with -inf (illegal actions)
         device = list(x_dict_current.values())[0].device
-        action_logits = torch.full((self.num_actions,), float("-inf"), device=device)
+        # Infer dtype from computed logits to handle mixed precision correctly
+        dtype = legal_move_logits.dtype if len(legal_move_logits) > 0 else torch.float32
+        action_logits = torch.full(
+            (self.num_actions,), float("-inf"), device=device, dtype=dtype
+        )
 
         # Map legal move logits to action space using move_to_action_indices
         # Filter out any indices that are -1 (moves not in action space)
