@@ -603,10 +603,9 @@ def main():
 
     # Initialize league manager and tracker
     league_manager = LeagueManager(config, str(save_dir))
-    league_tracker = LeagueTracker(str(save_dir / "logs"))
-
-    # Initialize ELO tracker for engine evaluations
-    elo_tracker = EloTracker(save_path=str(save_dir / "elo_history.json"))
+    league_tracker = LeagueTracker(
+        str(save_dir / "logs"), elo_save_path=str(save_dir / "elo_ratings.json")
+    )
 
     # Initialize or resume Main Agent
     model_config = {
@@ -707,6 +706,10 @@ def main():
             num_converged,
         )
 
+        # Log ELO leaderboard periodically
+        if (iteration + 1) % 10 == 0:
+            league_tracker.log_elo_leaderboard(iteration)
+
         # 6. Periodic evaluation against engine
         if (iteration + 1) % args.eval_interval == 0:
             print(f"\n{'='*60}")
@@ -731,15 +734,22 @@ def main():
             evaluate_and_update_elo(
                 model,
                 main_agent.name,
-                elo_tracker,
+                league_tracker.elo_tracker,
                 engine_depths=args.eval_depths,
                 games_per_depth=args.eval_games,
                 device=config.device,
+                tensorboard_writer=league_tracker.writer,
+                iteration=iteration,
             )
+
+            # Log ELO leaderboard to TensorBoard
+            league_tracker.log_elo_leaderboard(iteration)
 
             # Show current leaderboard
             print("\nCurrent ELO Leaderboard:")
-            for rank, (player, rating) in enumerate(elo_tracker.get_leaderboard(10), 1):
+            for rank, (player, rating) in enumerate(
+                league_tracker.elo_tracker.get_leaderboard(10), 1
+            ):
                 print(f"  {rank}. {player}: {rating:.1f}")
 
     # Final summary

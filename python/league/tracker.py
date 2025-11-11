@@ -3,6 +3,7 @@ Performance tracking and evaluation for league training.
 
 Provides:
 - Win rate tracking between agents
+- ELO rating tracking for all agents
 - Performance visualization via TensorBoard
 - Head-to-head matchup evaluation
 - League strength metrics
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
+from elo_tracker import EloTracker
 from league.manager import AgentArchetype, LeagueAgent
 from model import HiveGNN
 from self_play import SelfPlayGame
@@ -34,15 +36,21 @@ class LeagueTracker:
     - League diversity metrics
     """
 
-    def __init__(self, log_dir: str):
+    def __init__(self, log_dir: str, elo_save_path: Optional[str] = None):
         """
         Args:
             log_dir: Directory for TensorBoard logs
+            elo_save_path: Path to save ELO ratings (optional, defaults to log_dir/elo_ratings.json)
         """
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         self.writer = SummaryWriter(log_dir=str(self.log_dir))
+
+        # ELO tracking
+        if elo_save_path is None:
+            elo_save_path = str(self.log_dir / "elo_ratings.json")
+        self.elo_tracker = EloTracker(save_path=elo_save_path, k_factor=32)
 
         # Performance history
         self.matchup_history = defaultdict(
@@ -92,7 +100,7 @@ class LeagueTracker:
         game_length: int,
     ):
         """
-        Log a game result.
+        Log a game result and update ELO ratings.
 
         Args:
             iteration: Training iteration
@@ -105,6 +113,25 @@ class LeagueTracker:
         matchup_key = (agent1.name, agent2.name)
         self.matchup_history[matchup_key].append((iteration, result))
 
+        # Update ELO ratings
+        # Convert result from [-1, 1] to [0, 1] scale for ELO
+        elo_score = (result + 1.0) / 2.0  # 1.0 -> 1.0, 0.0 -> 0.5, -1.0 -> 0.0
+        new_elo1, new_elo2 = self.elo_tracker.update_ratings(
+            agent1.name,
+            agent2.name,
+            elo_score,
+            game_metadata={
+                "iteration": iteration,
+                "game_length": game_length,
+                "agent1_archetype": agent1.archetype.value,
+                "agent2_archetype": agent2.archetype.value,
+            },
+        )
+
+        # Store ELO history
+        self.agent_elo_history[agent1.name].append((iteration, new_elo1))
+        self.agent_elo_history[agent2.name].append((iteration, new_elo2))
+
         # Log to TensorBoard
         self.writer.add_scalar(
             f"games/{agent1.name}_vs_{agent2.name}/result", result, iteration
@@ -113,13 +140,17 @@ class LeagueTracker:
             f"games/{agent1.name}_vs_{agent2.name}/length", game_length, iteration
         )
 
+        # Log ELO ratings
+        self.writer.add_scalar(f"elo/{agent1.name}", new_elo1, iteration)
+        self.writer.add_scalar(f"elo/{agent2.name}", new_elo2, iteration)
+
     def log_agent_performance(
         self,
         iteration: int,
         agent: LeagueAgent,
     ):
         """
-        Log agent's overall performance metrics.
+        Log agent's overall performance metrics including ELO rating.
 
         Args:
             iteration: Training iteration
@@ -133,6 +164,10 @@ class LeagueTracker:
         self.writer.add_scalar(f"{prefix}/total_wins", agent.total_wins, iteration)
         self.writer.add_scalar(f"{prefix}/total_losses", agent.total_losses, iteration)
         self.writer.add_scalar(f"{prefix}/total_draws", agent.total_draws, iteration)
+
+        # ELO rating
+        elo_rating = self.elo_tracker.get_rating(agent.name)
+        self.writer.add_scalar(f"{prefix}/elo", elo_rating, iteration)
 
         # Convergence status for exploiters
         if agent.archetype in [
@@ -414,6 +449,37 @@ class LeagueTracker:
             wins = sum(1 for _, result in recent_games if result > 0.5)
             return wins / len(recent_games)
 
+    def log_elo_leaderboard(self, iteration: int, top_n: int = 10):
+        """
+        Log the top ELO-rated agents to TensorBoard.
+
+        Args:
+            iteration: Training iteration
+            top_n: Number of top agents to log
+        """
+        leaderboard = self.elo_tracker.get_leaderboard(top_n)
+
+        for rank, (agent_name, elo_rating) in enumerate(leaderboard, 1):
+            self.writer.add_scalar(f"leaderboard/rank_{rank}", elo_rating, iteration)
+            self.writer.add_text(
+                f"leaderboard/rank_{rank}_name",
+                agent_name,
+                iteration,
+            )
+
+    def get_agent_elo(self, agent_name: str) -> float:
+        """
+        Get current ELO rating for an agent.
+
+        Args:
+            agent_name: Name of the agent
+
+        Returns:
+            Current ELO rating
+        """
+        return self.elo_tracker.get_rating(agent_name)
+
     def close(self):
-        """Close TensorBoard writer."""
+        """Close TensorBoard writer and save ELO ratings."""
+        self.elo_tracker.save()
         self.writer.close()
