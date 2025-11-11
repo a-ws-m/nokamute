@@ -1,0 +1,77 @@
+{
+  "description": "Medium-length league training configuration - balanced for ~48-72 hours of training",
+  
+  "training_schedule": {
+    "total_iterations": 500,
+    "main_agent_update_interval": 1,
+    "main_exploiter_spawn_interval": 10,
+    "league_exploiter_spawn_interval": 25
+  },
+  
+  "main_agent": {
+    "games_per_iteration": 20,
+    "epochs_per_update": 15,
+    "batch_size": 64,
+    "learning_rate": 0.0005,
+    "temperature": 1.2
+  },
+  
+  "exploiter": {
+    "games_per_iteration": 30,
+    "epochs_per_update": 20,
+    "batch_size": 64,
+    "learning_rate": 0.0003,
+    "temperature": 1.0,
+    "minimax_reward_weight": 1.5,
+    "minimax_gamma": 0.99
+  },
+  
+  "pfsp": {
+    "exponent": 2.5,
+    "epsilon": 0.15
+  },
+  
+  "convergence": {
+    "main_exploiter_threshold": 0.70,
+    "league_exploiter_threshold": 0.60,
+    "convergence_window": 50
+  },
+  
+  "league_management": {
+    "max_main_exploiters": 3,
+    "max_league_exploiters": 3,
+    "historical_agents_keep_rate": 0.5
+  },
+  
+  "evaluation": {
+    "eval_interval": 25,
+    "eval_games_per_matchup": 30,
+    "engine_eval_games": 30,
+    "engine_eval_depths": [2, 3, 4]
+  },
+  
+  "model": {
+    "hidden_dim": 128,
+    "num_layers": 4
+  },
+  
+  "general": {
+    "max_moves": 400,
+    "enable_branching": true,
+    "gamma": 0.99
+  },
+  
+  "performance": {
+    "inference_batch_size": 512,
+    "use_amp": true,
+    "use_compile": true,
+    "cache_graphs": true
+  },
+  
+  "notes": {
+    "estimated_duration": "48-72 hours on modern GPU",
+    "gpu_memory_required": "8GB+ recommended",
+    "checkpoint_size": "~5-10GB total",
+    "recommended_for": "Getting strong agents with diverse strategies"
+  }
+}
