@@ -270,11 +270,19 @@ class HiveGNNPolicyHetero(nn.Module):
             # we'll use the move_to_action_indices to map directly to action space.
             # Edges with attr == 1.0 are current player's legal moves.
             # We mask out edges with attr != 1.0 by setting their logits to -inf.
-            current_player_mask = all_move_attrs.squeeze(-1) == 1.0  # [total_move_edges]
-            
+            current_player_mask = (
+                all_move_attrs.squeeze(-1) == 1.0
+            )  # [total_move_edges]
+
             # Set non-current-player moves to -inf (will be masked out in action logits)
             masked_logits = torch.where(
-                current_player_mask, all_move_logits, torch.tensor(float('-inf'), device=all_move_logits.device, dtype=all_move_logits.dtype)
+                current_player_mask,
+                all_move_logits,
+                torch.tensor(
+                    float("-inf"),
+                    device=all_move_logits.device,
+                    dtype=all_move_logits.dtype,
+                ),
             )  # [total_move_edges]
         else:
             # No move edges at all (should not happen in a valid position)
@@ -297,22 +305,26 @@ class HiveGNNPolicyHetero(nn.Module):
             # This avoids dynamic control flow
             valid_mask = move_to_action_indices >= 0
             safe_indices = torch.where(
-                valid_mask, 
-                move_to_action_indices, 
-                torch.zeros_like(move_to_action_indices)
+                valid_mask,
+                move_to_action_indices,
+                torch.zeros_like(move_to_action_indices),
             )
-            
+
             # Mask logits for invalid indices to -inf (won't affect scatter max)
             safe_logits = torch.where(
                 valid_mask,
                 masked_logits,
-                torch.tensor(float('-inf'), device=masked_logits.device, dtype=masked_logits.dtype)
+                torch.tensor(
+                    float("-inf"),
+                    device=masked_logits.device,
+                    dtype=masked_logits.dtype,
+                ),
             )
-            
+
             # Use scatter_reduce with 'amax' to handle potential duplicates
             # This is compile-friendly and avoids loops
             action_logits.scatter_reduce_(
-                0, safe_indices, safe_logits, reduce='amax', include_self=True
+                0, safe_indices, safe_logits, reduce="amax", include_self=True
             )
 
         # Add batch dimension

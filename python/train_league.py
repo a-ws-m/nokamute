@@ -695,12 +695,20 @@ def main():
                     if torch.cuda.is_available():
                         capability = torch.cuda.get_device_capability()
                         if capability[0] < 7:
-                            print(f"GPU CUDA capability {capability[0]}.{capability[1]} < 7.0, using eager backend")
-                            model = torch.compile(model, fullgraph=True, backend="eager")
+                            print(
+                                f"GPU CUDA capability {capability[0]}.{capability[1]} < 7.0, using eager backend"
+                            )
+                            model = torch.compile(
+                                model, fullgraph=True, backend="eager"
+                            )
                         else:
-                            model = torch.compile(model, fullgraph=True, mode="reduce-overhead")
+                            model = torch.compile(
+                                model, fullgraph=True, mode="reduce-overhead"
+                            )
                     else:
-                        model = torch.compile(model, fullgraph=True, mode="reduce-overhead")
+                        model = torch.compile(
+                            model, fullgraph=True, mode="reduce-overhead"
+                        )
                     print("✓ Model compiled successfully with fullgraph=True!")
                 except Exception as e:
                     print(f"Warning: Could not compile model: {type(e).__name__}")
