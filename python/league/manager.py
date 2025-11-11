@@ -158,12 +158,20 @@ class LeagueManager:
         agent_name = f"main_v{self.main_agent_version}"
         model_path = self.save_dir / f"{agent_name}.pt"
 
+        # Get state dict and strip torch.compile() prefix if present
+        state_dict = model.state_dict()
+        if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
         # Save initial model
         torch.save(
             {
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": state_dict,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": model_config,
+                "model_type": model_config.get(
+                    "model_type", "policy"
+                ),  # Store at top level for easy access
                 "iteration": self.iteration,
             },
             model_path,
@@ -200,12 +208,20 @@ class LeagueManager:
         agent_name = f"main_v{self.main_agent_version}"
         model_path = self.save_dir / f"{agent_name}.pt"
 
+        # Get state dict and strip torch.compile() prefix if present
+        state_dict = model.state_dict()
+        if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
         # Save updated model
         torch.save(
             {
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": state_dict,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": model_config,
+                "model_type": model_config.get(
+                    "model_type", "policy"
+                ),  # Store at top level for easy access
                 "iteration": self.iteration,
             },
             model_path,
@@ -245,11 +261,19 @@ class LeagueManager:
         agent_name = f"main_exploiter_{self.main_exploiter_count}"
         model_path = self.save_dir / f"{agent_name}.pt"
 
+        # Get state dict and strip torch.compile() prefix if present
+        state_dict = model.state_dict()
+        if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
         torch.save(
             {
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": state_dict,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": model_config,
+                "model_type": model_config.get(
+                    "model_type", "policy"
+                ),  # Store at top level for easy access
                 "iteration": self.iteration,
                 "target_agent": self.current_main_agent.name,  # Track which agent it's exploiting
             },
@@ -298,11 +322,19 @@ class LeagueManager:
         agent_name = f"league_exploiter_{self.league_exploiter_count}"
         model_path = self.save_dir / f"{agent_name}.pt"
 
+        # Get state dict and strip torch.compile() prefix if present
+        state_dict = model.state_dict()
+        if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
+            state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
         torch.save(
             {
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": state_dict,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": model_config,
+                "model_type": model_config.get(
+                    "model_type", "policy"
+                ),  # Store at top level for easy access
                 "iteration": self.iteration,
             },
             model_path,

@@ -93,9 +93,19 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
         batch = batch.to(device)
         optimizer.zero_grad()
 
-        # Forward pass
-        predictions, _ = model(batch.x, batch.edge_index, batch.batch)
-        predictions = predictions.squeeze()
+        # Forward pass - handle both model types
+        output1, output2 = model(batch.x, batch.edge_index, batch.batch)
+
+        # Value model returns (value, node_embeddings)
+        # Policy model returns (policy_logits, value)
+        # Check output shapes to determine which is the value
+        if output1.shape[-1] == 1 or output1.dim() == 1:
+            # output1 is value (shape [batch_size, 1] or [batch_size])
+            predictions = output1.squeeze()
+        else:
+            # output2 is value (policy model case)
+            predictions = output2.squeeze()
+
         targets = batch.y
 
         # MSE loss
@@ -135,12 +145,18 @@ def train_main_agent(
     agent = league_manager.current_main_agent
     checkpoint = torch.load(agent.model_path, map_location=config.device)
     model_type = checkpoint.get(
-        "model_type", "value"
-    )  # Default to value for backward compatibility
+        "model_type", "policy"
+    )  # Default to policy (11x faster than value model)
     model = create_model_by_type(model_type, checkpoint.get("config", {})).to(
         config.device
     )
-    model.load_state_dict(checkpoint["model_state_dict"])
+
+    # Handle torch.compile() state dict keys (strip _orig_mod. prefix)
+    state_dict = checkpoint["model_state_dict"]
+    if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=config.main_agent_lr)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
@@ -173,11 +189,18 @@ def train_main_agent(
         opponent_checkpoint = torch.load(
             opponent_agent.model_path, map_location=config.device
         )
-        opponent_model_type = opponent_checkpoint.get("model_type", "value")
+        opponent_model_type = opponent_checkpoint.get("model_type", "policy")
         opponent_model = create_model_by_type(
             opponent_model_type, opponent_checkpoint.get("config", {})
         ).to(config.device)
-        opponent_model.load_state_dict(opponent_checkpoint["model_state_dict"])
+
+        # Handle torch.compile() state dict keys
+        opponent_state_dict = opponent_checkpoint["model_state_dict"]
+        if any(key.startswith("_orig_mod.") for key in opponent_state_dict.keys()):
+            opponent_state_dict = {
+                k.replace("_orig_mod.", ""): v for k, v in opponent_state_dict.items()
+            }
+        opponent_model.load_state_dict(opponent_state_dict)
         opponent_model.eval()
 
         # Play game (alternating who plays as White)
@@ -273,22 +296,35 @@ def train_main_exploiter(
 
     # Load exploiter model
     checkpoint = torch.load(exploiter.model_path, map_location=config.device)
-    exploiter_model_type = checkpoint.get("model_type", "value")
+    exploiter_model_type = checkpoint.get("model_type", "policy")
     model = create_model_by_type(exploiter_model_type, checkpoint.get("config", {})).to(
         config.device
     )
-    model.load_state_dict(checkpoint["model_state_dict"])
+
+    # Handle torch.compile() state dict keys
+    state_dict = checkpoint["model_state_dict"]
+    if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=config.exploiter_lr)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     # Load target (Main Agent) model
     main_agent = league_manager.current_main_agent
     main_checkpoint = torch.load(main_agent.model_path, map_location=config.device)
-    main_model_type = main_checkpoint.get("model_type", "value")
+    main_model_type = main_checkpoint.get("model_type", "policy")
     main_model = create_model_by_type(
         main_model_type, main_checkpoint.get("config", {})
     ).to(config.device)
-    main_model.load_state_dict(main_checkpoint["model_state_dict"])
+
+    # Handle torch.compile() state dict keys
+    main_state_dict = main_checkpoint["model_state_dict"]
+    if any(key.startswith("_orig_mod.") for key in main_state_dict.keys()):
+        main_state_dict = {
+            k.replace("_orig_mod.", ""): v for k, v in main_state_dict.items()
+        }
+    main_model.load_state_dict(main_state_dict)
     main_model.eval()
 
     # Create exploiter agent
@@ -364,18 +400,25 @@ def train_main_exploiter(
 
     # Save updated exploiter
     model_config = checkpoint.get("config", {})
+
+    # Get state dict and strip torch.compile() prefix if present
+    state_dict = model.state_dict()
+    if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": state_dict,
             "optimizer_state_dict": optimizer.state_dict(),
             "config": model_config,
+            "model_type": model_config.get(
+                "model_type", "policy"
+            ),  # Store at top level for easy access
             "iteration": iteration,
             "target_agent": main_agent.name,
         },
         exploiter.model_path,
-    )
-
-    # Check convergence
+    )  # Check convergence
     win_rate_vs_main = exploiter.get_win_rate_vs(main_agent.name)
     print(f"\nExploiter win rate vs {main_agent.name}: {win_rate_vs_main:.2%}")
 
@@ -582,7 +625,13 @@ def main():
             pretrained = torch.load(args.pretrained_model, map_location=config.device)
             model.load_state_dict(pretrained["model_state_dict"])
 
-        # Apply torch.compile() for faster inference
+        # Create optimizer before compiling (optimizer needs to see original parameters)
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.main_agent_lr)
+
+        # Initialize agent with uncompiled model first (saves clean state dict)
+        league_manager.initialize_main_agent(model, optimizer, model_config)
+
+        # Apply torch.compile() for faster inference AFTER saving initial checkpoint
         if args.use_compile:
             if config.device == "cpu":
                 print("Note: torch.compile() on CPU may not provide speedup")
@@ -593,9 +642,6 @@ def main():
                     print("✓ Model compiled successfully!")
                 except Exception as e:
                     print(f"Warning: Could not compile model: {type(e).__name__}")
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.main_agent_lr)
-        league_manager.initialize_main_agent(model, optimizer, model_config)
     else:
         print(f"\nResuming from iteration {league_manager.iteration}")
 
@@ -669,11 +715,18 @@ def main():
 
             main_agent = league_manager.current_main_agent
             checkpoint = torch.load(main_agent.model_path, map_location=config.device)
-            eval_model_type = checkpoint.get("model_type", "value")
+            eval_model_type = checkpoint.get("model_type", "policy")
             model = create_model_by_type(
                 eval_model_type, checkpoint.get("config", {})
             ).to(config.device)
-            model.load_state_dict(checkpoint["model_state_dict"])
+
+            # Handle torch.compile() state dict keys
+            state_dict = checkpoint["model_state_dict"]
+            if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
+                state_dict = {
+                    k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
+                }
+            model.load_state_dict(state_dict)
 
             evaluate_and_update_elo(
                 model,
