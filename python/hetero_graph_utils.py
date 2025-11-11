@@ -3,12 +3,21 @@ Helper functions to convert board graph representation to PyTorch Geometric form
 """
 
 import torch
+import torch_geometric.transforms as T
 from torch_geometric.data import HeteroData
 
 
 def board_to_hetero_data(graph_dict):
     """
     Convert board graph dictionary from Rust to PyTorch Geometric HeteroData format.
+
+    This function also applies the ToUndirected transform, which adds reverse edges
+    for all edge types. This ensures bidirectional message passing in the GNN,
+    allowing information to flow in both directions along each edge.
+
+    For example:
+    - ('in_play', 'neighbour', 'destination') gets reverse edge ('destination', 'rev_neighbour', 'in_play')
+    - ('out_of_play', 'move', 'destination') gets reverse edge ('destination', 'rev_move', 'out_of_play')
 
     Args:
         graph_dict: Dictionary returned by board.to_graph() with keys like:
@@ -18,7 +27,7 @@ def board_to_hetero_data(graph_dict):
                    - move_to_action (list of move strings)
 
     Returns:
-        data: HeteroData object with node and edge information
+        data: HeteroData object with node and edge information (with reverse edges added)
         move_to_action_indices: Tensor of action space indices for legal moves
     """
     from action_space import string_to_action
@@ -81,6 +90,11 @@ def board_to_hetero_data(graph_dict):
                         data[src_type, edge_type, dst_type].edge_attr = torch.tensor(
                             edge_attr, dtype=torch.float32
                         )
+
+    # Apply ToUndirected transform to add reverse edges
+    # This ensures message passing works in both directions
+    transform = T.ToUndirected()
+    data = transform(data)
 
     # Convert move strings to action indices
     move_to_action_list = graph_dict["move_to_action"]

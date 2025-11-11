@@ -67,14 +67,24 @@ class HiveGNNPolicyHetero(nn.Module):
 
         for layer_idx in range(num_layers):
             # Define convolutions for each edge type
+            # The ToUndirected transform (applied in hetero_graph_utils.py) adds reverse edges
+            # with 'rev_' prefix, so we need to define convolutions for both directions.
+            # This ensures message passing works bidirectionally for all edge types.
             conv_dict = {}
 
-            # Neighbour edges (bidirectional between different node types)
+            # Neighbour edges (all possible combinations after ToUndirected)
+            # Original: in_play <-> in_play, in_play <-> destination
+            # After ToUndirected: both directions are explicit
             neighbour_conv_configs = [
                 ("in_play", "neighbour", "in_play"),
                 ("in_play", "neighbour", "destination"),
                 ("destination", "neighbour", "in_play"),
                 ("destination", "neighbour", "destination"),
+                # Reverse edges added by ToUndirected (with 'rev_' prefix)
+                ("in_play", "rev_neighbour", "in_play"),
+                ("destination", "rev_neighbour", "in_play"),
+                ("in_play", "rev_neighbour", "destination"),
+                ("destination", "rev_neighbour", "destination"),
             ]
 
             for src_type, edge_type, dst_type in neighbour_conv_configs:
@@ -88,9 +98,14 @@ class HiveGNNPolicyHetero(nn.Module):
                 )
 
             # Move edges with edge features
+            # Original: in_play -> destination, out_of_play -> destination
+            # After ToUndirected: reverse edges are added
             move_conv_configs = [
                 ("in_play", "move", "destination"),
                 ("out_of_play", "move", "destination"),
+                # Reverse edges added by ToUndirected
+                ("destination", "rev_move", "in_play"),
+                ("destination", "rev_move", "out_of_play"),
             ]
 
             for src_type, edge_type, dst_type in move_conv_configs:
@@ -171,7 +186,10 @@ class HiveGNNPolicyHetero(nn.Module):
         # Prepare edge attributes with embedded move edge features
         edge_attr_embedded = {}
         for edge_type_tuple, edge_attr in edge_attr_dict.items():
-            if "move" in edge_type_tuple:
+            # Check if this is a move edge (original or reverse)
+            if (
+                "move" in edge_type_tuple[1]
+            ):  # edge_type_tuple[1] is the edge type string
                 # Embed move edge features from binary to hidden_dim
                 edge_attr_embedded[edge_type_tuple] = self.move_edge_embedding(
                     edge_attr
