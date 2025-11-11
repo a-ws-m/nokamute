@@ -257,6 +257,17 @@ class SelfPlayGame:
                 action_mask[action_idx] = 1.0
                 legal_action_indices.append(action_idx)
 
+        # Handle pass-only case (no legal actions in action space)
+        if len(legal_action_indices) == 0:
+            # Only move is pass - just return it without policy evaluation
+            selected_move = legal_moves[0]
+            result = [selected_move]
+            if return_probs:
+                result.append({legal_move_strings[0]: 1.0})
+            if return_value:
+                result.append(0.0)  # Neutral value for pass position
+            return tuple(result) if len(result) > 1 else result[0]
+
         # Get graph representation
         node_features, edge_index = board.to_graph()
 
