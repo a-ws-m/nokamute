@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 static ZOBRIST_TABLE: OnceLock<[u64; GRID_SIZE * 2]> = OnceLock::new();
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Color {
     Black = 1,
     White = 0,

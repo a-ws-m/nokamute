@@ -1,4 +1,4 @@
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Bug {
     Queen = 0,
     Grasshopper = 1,

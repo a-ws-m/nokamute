@@ -200,134 +200,376 @@ impl Board {
         })
     }
 
-    /// Convert board state to a graph representation
+    /// Convert board state to a heterogeneous graph representation
     ///
-    /// Returns (node_features, edge_index) as Python lists.
-    /// The returned graph should be converted to NetworkX format in Python
-    /// using the graph_utils.board_to_networkx() function.
+    /// Returns a dictionary with:
+    ///   - 'node_features': Dict with keys 'in_play', 'out_of_play', 'destination'
+    ///   - 'edge_index': Dict with keys 'neighbour', 'move'
+    ///   - 'edge_attr': Dict with keys 'neighbour', 'move' (edge features)
+    ///   - 'move_to_action': List mapping move edge indices (for current player) to action space indices
     ///
-    /// For position equivalence checking, use graph_utils.graph_hash()
-    /// which implements Weisfeiler-Lehman graph hashing instead of zobrist_hash().
+    /// Node types:
+    ///   - in_play: Pieces currently on the board (color, bug_onehot)
+    ///   - out_of_play: Pieces not yet placed (color, bug_onehot)
+    ///   - destination: Empty spaces where pieces can be placed or moved to
+    ///
+    /// Edge types:
+    ///   - neighbour: Adjacency/stacking relationships (feature: [0.0])
+    ///   - move: Legal moves for both players (feature: [1.0] if current player, [0.0] if opponent)
     fn to_graph(&self, py: Python) -> PyResult<PyObject> {
         use crate::hex_grid::adjacent;
         use std::collections::{HashMap, HashSet};
+        use pyo3::types::PyDict;
 
-        // Map (hex, height) to node indices
-        let mut position_to_node: HashMap<(Hex, u8), usize> = HashMap::new();
-        let mut node_features = Vec::new();
+        // Node indices for each type
+        let mut in_play_nodes = Vec::new();
+        let mut out_of_play_nodes = Vec::new();
+        let mut destination_nodes = Vec::new();
+        
+        // Map pieces/destinations to node indices (within their type)
+        let mut hex_to_in_play: HashMap<Hex, usize> = HashMap::new();
+        let mut hex_to_destination: HashMap<Hex, usize> = HashMap::new();
+        let mut hex_on_top_to_destination: HashMap<Hex, usize> = HashMap::new();
+        let mut bug_color_to_out_of_play: HashMap<(RustBug, RustColor), usize> = HashMap::new();
+        
+        let current_color = self.inner.to_move();
 
-        // Get current player (1.0 for White, 0.0 for Black)
-        let current_player = if self.inner.to_move() == RustColor::White { 1.0f32 } else { 0.0f32 };
-
-        // First pass: collect all occupied positions (hex, height)
-        let mut occupied_positions = Vec::new();
+        // 1. Create in-play nodes (pieces currently on the board)
+        // Features: [color (0/1), bug_onehot (9 values)]
         for color_idx in 0..2 {
+            let color = if color_idx == 0 { RustColor::White } else { RustColor::Black };
             for &hex in self.inner.occupied_hexes[color_idx].iter() {
-                let height = self.inner.height(hex);
-                // Add nodes for each height level (stacked pieces)
-                for h in 1..=height {
-                    occupied_positions.push((hex, h));
+                let node_idx = in_play_nodes.len();
+                hex_to_in_play.insert(hex, node_idx);
+
+                let node = self.inner.node(hex);
+                let bug = node.bug();
+
+                // One-hot encode bug type (8 bug types)
+                let mut bug_onehot = vec![0.0f32; 9];
+                bug_onehot[bug as usize] = 1.0;
+
+                // Node features: [color (0/1), bug_onehot (9 values)]
+                let mut features = vec![color as usize as f32];
+                features.extend(bug_onehot);
+
+                in_play_nodes.push(features);
+            }
+        }
+
+        // 2. Create out-of-play nodes (pieces not yet placed)
+        // Features: [color (0/1), bug_onehot (9 values)]
+        for color_idx in 0..2 {
+            let color = if color_idx == 0 { RustColor::White } else { RustColor::Black };
+            let remaining = &self.inner.remaining[color_idx];
+            
+            for (bug_idx, &count) in remaining.iter().enumerate() {
+                if count > 0 {
+                    let bug = unsafe { std::mem::transmute::<u8, RustBug>(bug_idx as u8) };
+                    let node_idx = out_of_play_nodes.len();
+                    bug_color_to_out_of_play.insert((bug, color), node_idx);
+
+                    // One-hot encode bug type
+                    let mut bug_onehot = vec![0.0f32; 9];
+                    bug_onehot[bug as usize] = 1.0;
+
+                    // Node features: [color (0/1), bug_onehot (9 values)]
+                    let mut features = vec![color as usize as f32];
+                    features.extend(bug_onehot);
+
+                    out_of_play_nodes.push(features);
                 }
             }
         }
 
+        // 3. Create destination nodes
+        // These are empty spaces where pieces can be placed or moved to
+        // Also includes on-top-of-piece destinations
+        // Features: [on_top (0/1), padding to match 10 features total]
+        
         // Collect empty spaces adjacent to pieces
         let mut empty_spaces = HashSet::new();
-        for &(hex, _) in &occupied_positions {
-            for &adj_hex in adjacent(hex).iter() {
-                // Only add empty space at height 1 if no piece exists there
-                if self.inner.height(adj_hex) == 0 {
-                    empty_spaces.insert(adj_hex);
+        
+        // Special case: if board is empty, add the starting hex as a destination
+        let board_is_empty = self.inner.occupied_hexes[0].is_empty() && self.inner.occupied_hexes[1].is_empty();
+        if board_is_empty {
+            empty_spaces.insert(crate::hex_grid::START_HEX);
+        }
+        
+        for color_idx in 0..2 {
+            for &hex in self.inner.occupied_hexes[color_idx].iter() {
+                // Add destination on top of this piece (unless something is already on top)
+                let height = self.inner.height(hex);
+                if height == 1 {  // Only one piece, so top is accessible
+                    let node_idx = destination_nodes.len();
+                    hex_on_top_to_destination.insert(hex, node_idx);
+                    
+                    // Features: [1.0 for on_top, then 9 zeros for padding]
+                    let mut features = vec![1.0f32];
+                    features.extend(vec![0.0f32; 9]);
+                    destination_nodes.push(features);
                 }
-            }
-        }
-
-        // Create nodes for occupied positions
-        for &(hex, h) in &occupied_positions {
-            let node_idx = position_to_node.len();
-            position_to_node.insert((hex, h), node_idx);
-
-            let node = self.inner.node(hex);
-            let color = node.color();
-            let bug = node.bug();
-
-            // One-hot encode bug type (8 bug types + 1 for empty = 9 total)
-            // Queen=0, Grasshopper=1, Spider=2, Ant=3, Beetle=4, Mosquito=5, Ladybug=6, Pillbug=7, Empty=8
-            let mut bug_onehot = vec![0.0f32; 9];
-            bug_onehot[bug as usize] = 1.0;
-
-            // Node features: [color (0/1), bug_onehot (9 values), height, current_player (1/0)]
-            let mut features = vec![color as usize as f32];
-            features.extend(bug_onehot);
-            features.push(h as f32);
-            features.push(current_player);
-
-            node_features.push(features);
-        }
-
-        // Create nodes for empty spaces
-        for &hex in &empty_spaces {
-            let node_idx = position_to_node.len();
-            position_to_node.insert((hex, 1), node_idx);
-
-            // Empty space: color=0, bug_type=Empty (index 8), height=1
-            let mut bug_onehot = vec![0.0f32; 9];
-            bug_onehot[8] = 1.0; // Empty space
-
-            let mut features = vec![0.0]; // color doesn't matter for empty
-            features.extend(bug_onehot);
-            features.push(1.0); // height=1 for empty spaces
-            features.push(current_player);
-
-            node_features.push(features);
-        }
-
-        // Create edges
-        let mut edges_from = Vec::new();
-        let mut edges_to = Vec::new();
-
-        // Iterate through all positions
-        for &(hex, h) in position_to_node.keys() {
-            let i = position_to_node[&(hex, h)];
-
-            // 1. Vertical edges (same hex, different heights)
-            if let Some(&j) = position_to_node.get(&(hex, h + 1)) {
-                edges_from.push(i);
-                edges_to.push(j);
-                // Add reverse edge for undirected graph
-                edges_from.push(j);
-                edges_to.push(i);
-            }
-
-            // 2. Horizontal edges (adjacent hexes at same height)
-            for &adj_hex in adjacent(hex).iter() {
-                if let Some(&j) = position_to_node.get(&(adj_hex, h)) {
-                    edges_from.push(i);
-                    edges_to.push(j);
-                }
-            }
-
-            // 3. Edges to adjacent hexes at different heights
-            for &adj_hex in adjacent(hex).iter() {
-                // Check all height levels at the adjacent hex
-                for dh in 1..=self.inner.height(adj_hex).max(1) {
-                    if dh != h {
-                        if let Some(&j) = position_to_node.get(&(adj_hex, dh)) {
-                            edges_from.push(i);
-                            edges_to.push(j);
-                        }
+                
+                // Add empty adjacent spaces
+                for &adj_hex in adjacent(hex).iter() {
+                    if self.inner.height(adj_hex) == 0 {
+                        empty_spaces.insert(adj_hex);
                     }
                 }
             }
         }
 
-        // Convert to Python objects
-        let node_features_py = PyList::new(py, node_features.iter().map(|f| PyList::new(py, f)));
-        let edge_index_py =
-            PyList::new(py, vec![PyList::new(py, &edges_from), PyList::new(py, &edges_to)]);
+        // Create nodes for empty spaces
+        for hex in empty_spaces.iter() {
+            let node_idx = destination_nodes.len();
+            hex_to_destination.insert(*hex, node_idx);
 
-        // Return as tuple
-        Ok((node_features_py, edge_index_py).into_py(py))
+            // Features: [0.0 for on_bottom, then 9 zeros for padding]
+            let mut features = vec![0.0f32];
+            features.extend(vec![0.0f32; 9]);
+            destination_nodes.push(features);
+        }
+
+        // 4. Create neighbour edges (adjacency/stacking relationships)
+        // Track edges by their type tuple (src_type, edge_type, dst_type)
+        let mut neighbour_edges: HashMap<(&str, &str, &str), (Vec<usize>, Vec<usize>)> = HashMap::new();
+
+        // Initialize edge type collections
+        let edge_types = vec![
+            ("in_play", "neighbour", "in_play"),
+            ("in_play", "neighbour", "destination"),
+            ("destination", "neighbour", "in_play"),
+            ("destination", "neighbour", "destination"),
+        ];
+        
+        for &edge_type in &edge_types {
+            neighbour_edges.insert(edge_type, (Vec::new(), Vec::new()));
+        }
+
+        // Edges between in-play nodes (pieces)
+        for color_idx in 0..2 {
+            for &hex in self.inner.occupied_hexes[color_idx].iter() {
+                let i = hex_to_in_play[&hex];
+                
+                // Edges to adjacent pieces
+                for &adj_hex in adjacent(hex).iter() {
+                    if let Some(&j) = hex_to_in_play.get(&adj_hex) {
+                        let (from_vec, to_vec) = neighbour_edges.get_mut(&("in_play", "neighbour", "in_play")).unwrap();
+                        from_vec.push(i);
+                        to_vec.push(j);
+                    }
+                }
+
+                // Edge to destination on top (if it exists)
+                if let Some(&dest_idx) = hex_on_top_to_destination.get(&hex) {
+                    let (from_vec, to_vec) = neighbour_edges.get_mut(&("in_play", "neighbour", "destination")).unwrap();
+                    from_vec.push(i);
+                    to_vec.push(dest_idx);
+                    // Bidirectional
+                    let (from_vec, to_vec) = neighbour_edges.get_mut(&("destination", "neighbour", "in_play")).unwrap();
+                    from_vec.push(dest_idx);
+                    to_vec.push(i);
+                }
+            }
+        }
+
+        // Edges between destination nodes (adjacent empty spaces)
+        for &hex1 in empty_spaces.iter() {
+            let i = hex_to_destination[&hex1];
+            for &adj_hex in adjacent(hex1).iter() {
+                if let Some(&j) = hex_to_destination.get(&adj_hex) {
+                    let (from_vec, to_vec) = neighbour_edges.get_mut(&("destination", "neighbour", "destination")).unwrap();
+                    from_vec.push(i);
+                    to_vec.push(j);
+                }
+            }
+        }
+
+        // Edges from destination nodes to adjacent in-play nodes
+        for &hex in empty_spaces.iter() {
+            let dest_idx = hex_to_destination[&hex];
+            for &adj_hex in adjacent(hex).iter() {
+                if let Some(&piece_idx) = hex_to_in_play.get(&adj_hex) {
+                    let (from_vec, to_vec) = neighbour_edges.get_mut(&("destination", "neighbour", "in_play")).unwrap();
+                    from_vec.push(dest_idx);
+                    to_vec.push(piece_idx);
+                    // Bidirectional
+                    let (from_vec, to_vec) = neighbour_edges.get_mut(&("in_play", "neighbour", "destination")).unwrap();
+                    from_vec.push(piece_idx);
+                    to_vec.push(dest_idx);
+                }
+            }
+        }
+
+        // 5. Create move edges (legal moves for both players)
+        // Track edges by their type tuple and whether they're for current player
+        let mut move_edges_in_play: (Vec<usize>, Vec<usize>, Vec<f32>) = (Vec::new(), Vec::new(), Vec::new());
+        let mut move_edges_out_of_play: (Vec<usize>, Vec<usize>, Vec<f32>) = (Vec::new(), Vec::new(), Vec::new());
+        let mut move_to_action = Vec::new();
+
+        // Generate legal moves for current player
+        let mut current_moves = Vec::new();
+        Rules::generate_moves(&self.inner, &mut current_moves);
+
+        // Generate legal moves for opponent (simulate switching player)
+        let mut board_copy = self.inner.clone();
+        board_copy.apply(RustTurn::Pass);  // Switch to opponent
+        let mut opponent_moves = Vec::new();
+        Rules::generate_moves(&board_copy, &mut opponent_moves);
+        board_copy.undo(RustTurn::Pass);  // Restore
+
+        // Process current player's moves
+        for &turn in current_moves.iter() {
+            match turn {
+                RustTurn::Place(hex, bug) => {
+                    // Edge from out-of-play node to destination node
+                    if let Some(&out_idx) = bug_color_to_out_of_play.get(&(bug, current_color)) {
+                        let dest_idx = hex_to_destination.get(&hex)
+                            .or_else(|| hex_on_top_to_destination.get(&hex));
+                        if let Some(&d_idx) = dest_idx {
+                            move_edges_out_of_play.0.push(out_idx);
+                            move_edges_out_of_play.1.push(d_idx);
+                            move_edges_out_of_play.2.push(1.0);  // Current player
+                            // Map this move edge to action space
+                            let move_str = self.inner.to_move_string(turn);
+                            move_to_action.push(move_str);
+                        }
+                    }
+                }
+                RustTurn::Move(from_hex, to_hex) => {
+                    // Edge from in-play node to destination node
+                    if let Some(&from_idx) = hex_to_in_play.get(&from_hex) {
+                        let dest_idx = hex_to_destination.get(&to_hex)
+                            .or_else(|| hex_on_top_to_destination.get(&to_hex));
+                        if let Some(&d_idx) = dest_idx {
+                            move_edges_in_play.0.push(from_idx);
+                            move_edges_in_play.1.push(d_idx);
+                            move_edges_in_play.2.push(1.0);  // Current player
+                            // Map this move edge to action space
+                            let move_str = self.inner.to_move_string(turn);
+                            move_to_action.push(move_str);
+                        }
+                    }
+                }
+                RustTurn::Pass => {
+                    // Pass move - no edge, but add to action mapping
+                    move_to_action.push("pass".to_string());
+                }
+            }
+        }
+
+        // Process opponent's moves (marked as is_current=false)
+        let opponent_color = if current_color == RustColor::White {
+            RustColor::Black
+        } else {
+            RustColor::White
+        };
+        
+        for &turn in opponent_moves.iter() {
+            match turn {
+                RustTurn::Place(hex, bug) => {
+                    if let Some(&out_idx) = bug_color_to_out_of_play.get(&(bug, opponent_color)) {
+                        let dest_idx = hex_to_destination.get(&hex)
+                            .or_else(|| hex_on_top_to_destination.get(&hex));
+                        if let Some(&d_idx) = dest_idx {
+                            move_edges_out_of_play.0.push(out_idx);
+                            move_edges_out_of_play.1.push(d_idx);
+                            move_edges_out_of_play.2.push(0.0);  // Opponent
+                        }
+                    }
+                }
+                RustTurn::Move(from_hex, to_hex) => {
+                    if let Some(&from_idx) = hex_to_in_play.get(&from_hex) {
+                        let dest_idx = hex_to_destination.get(&to_hex)
+                            .or_else(|| hex_on_top_to_destination.get(&to_hex));
+                        if let Some(&d_idx) = dest_idx {
+                            move_edges_in_play.0.push(from_idx);
+                            move_edges_in_play.1.push(d_idx);
+                            move_edges_in_play.2.push(0.0);  // Opponent
+                        }
+                    }
+                }
+                RustTurn::Pass => {}
+            }
+        }
+
+        // Convert to Python dictionary in PyTorch Geometric HeteroData format
+        // Return separate variables for each node type and edge type
+        let result = PyDict::new(py);
+
+        // Node features - separate variable for each node type
+        result.set_item(
+            "x_in_play",
+            PyList::new(py, in_play_nodes.iter().map(|f| PyList::new(py, f)))
+        )?;
+        result.set_item(
+            "x_out_of_play",
+            PyList::new(py, out_of_play_nodes.iter().map(|f| PyList::new(py, f)))
+        )?;
+        result.set_item(
+            "x_destination",
+            PyList::new(py, destination_nodes.iter().map(|f| PyList::new(py, f)))
+        )?;
+
+        // Edge indices - separate variable for each edge type
+        // Format: edge_index_{src}_{edge}_{dst}
+        for &(src_type, edge_type, dst_type) in &edge_types {
+            let key = format!("edge_index_{}_{}_{}", src_type, edge_type, dst_type);
+            if let Some((from_vec, to_vec)) = neighbour_edges.get(&(src_type, edge_type, dst_type)) {
+                result.set_item(
+                    key,
+                    PyList::new(py, vec![
+                        PyList::new(py, from_vec),
+                        PyList::new(py, to_vec)
+                    ])
+                )?;
+            }
+        }
+        
+        // Move edge indices
+        result.set_item(
+            "edge_index_in_play_move_destination",
+            PyList::new(py, vec![
+                PyList::new(py, &move_edges_in_play.0),
+                PyList::new(py, &move_edges_in_play.1)
+            ])
+        )?;
+        result.set_item(
+            "edge_index_out_of_play_move_destination",
+            PyList::new(py, vec![
+                PyList::new(py, &move_edges_out_of_play.0),
+                PyList::new(py, &move_edges_out_of_play.1)
+            ])
+        )?;
+
+        // Edge attributes - separate variable for each edge type
+        // Format: edge_attr_{src}_{edge}_{dst}
+        // Neighbour edges all have zero features
+        for &(src_type, edge_type, dst_type) in &edge_types {
+            let key = format!("edge_attr_{}_{}_{}", src_type, edge_type, dst_type);
+            if let Some((from_vec, _)) = neighbour_edges.get(&(src_type, edge_type, dst_type)) {
+                let attrs: Vec<Vec<f32>> = vec![vec![0.0f32]; from_vec.len()];
+                result.set_item(
+                    key,
+                    PyList::new(py, attrs.iter().map(|f| PyList::new(py, f)))
+                )?;
+            }
+        }
+        
+        // Move edge attributes have binary features (current player = 1.0, opponent = 0.0)
+        result.set_item(
+            "edge_attr_in_play_move_destination",
+            PyList::new(py, move_edges_in_play.2.iter().map(|&f| PyList::new(py, &[f])))
+        )?;
+        result.set_item(
+            "edge_attr_out_of_play_move_destination",
+            PyList::new(py, move_edges_out_of_play.2.iter().map(|&f| PyList::new(py, &[f])))
+        )?;
+
+        // Move to action mapping (list of move strings for current player's legal moves)
+        result.set_item("move_to_action", PyList::new(py, &move_to_action))?;
+
+        Ok(result.into())
     }
 
     /// Get board state as a compact representation for features

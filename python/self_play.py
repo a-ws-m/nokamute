@@ -173,9 +173,9 @@ class SelfPlayGame:
         self, board, legal_moves, return_probs=False, return_value=False
     ):
         """
-        Select a move using the policy-based model (fixed action space with action mask).
-        This is an alternative to select_move() that uses a policy head instead of
-        evaluating each move separately.
+        Select a move using the policy-based model (heterogeneous graph with fixed action space).
+        Uses the new heterogeneous graph representation with destination/in-play/out-of-play nodes
+        and move edges.
 
         Args:
             board: Current board state
@@ -186,7 +186,8 @@ class SelfPlayGame:
         Returns:
             Selected move (and optionally move probabilities dict and/or position value)
         """
-        from action_space import get_action_space, string_to_action
+        from action_space import get_action_space
+        from hetero_graph_utils import board_to_hetero_data, prepare_model_inputs
 
         if len(legal_moves) == 1:
             move = legal_moves[0]
@@ -196,15 +197,26 @@ class SelfPlayGame:
             if return_value:
                 # Evaluate position if requested
                 if self.model is not None:
-                    node_features, edge_index = board.to_graph()
-                    x = torch.tensor(
-                        node_features, dtype=torch.float32, device=self.device
+                    graph_dict = board.to_graph()
+                    data, move_to_action_indices = board_to_hetero_data(graph_dict)
+                    x_dict, edge_index_dict, edge_attr_dict, move_indices = (
+                        prepare_model_inputs(data, move_to_action_indices)
                     )
-                    edge_index_tensor = torch.tensor(
-                        edge_index, dtype=torch.long, device=self.device
-                    )
+
+                    # Move to device
+                    x_dict = {k: v.to(self.device) for k, v in x_dict.items()}
+                    edge_index_dict = {
+                        k: v.to(self.device) for k, v in edge_index_dict.items()
+                    }
+                    edge_attr_dict = {
+                        k: v.to(self.device) for k, v in edge_attr_dict.items()
+                    }
+                    move_indices = move_indices.to(self.device)
+
                     with torch.no_grad():
-                        _, value = self.model(x, edge_index_tensor)
+                        _, value = self.model(
+                            x_dict, edge_index_dict, edge_attr_dict, move_indices
+                        )
                     result.append(value.item())
                 else:
                     result.append(0.0)
@@ -241,67 +253,59 @@ class SelfPlayGame:
                 result.append(0.0)
             return tuple(result) if len(result) > 1 else result[0]
 
-        # Build action mask for legal moves
-        action_to_str, str_to_action, action_space_size = get_action_space()
-        action_mask = torch.zeros(
-            action_space_size, dtype=torch.float32, device=self.device
-        )
+        # Build mapping from legal moves to action indices
+        action_to_str, _str_to_action, _action_space_size = get_action_space()
 
         legal_move_strings = []
-        legal_action_indices = []
         for move in legal_moves:
             move_str = board.to_move_string(move)  # Convert to UHP format
             legal_move_strings.append(move_str)
-            action_idx = string_to_action(move_str)
-            if action_idx != -1:
-                action_mask[action_idx] = 1.0
-                legal_action_indices.append(action_idx)
 
-        # Handle pass-only case (no legal actions in action space)
-        if len(legal_action_indices) == 0:
-            # Only move is pass - just return it without policy evaluation
-            selected_move = legal_moves[0]
+        # Get heterogeneous graph representation
+        graph_dict = board.to_graph()
+        data, move_to_action_indices = board_to_hetero_data(graph_dict)
+
+        # Prepare model inputs
+        x_dict, edge_index_dict, edge_attr_dict, move_indices = prepare_model_inputs(
+            data, move_to_action_indices
+        )
+
+        # Move to device
+        x_dict = {k: v.to(self.device) for k, v in x_dict.items()}
+        edge_index_dict = {k: v.to(self.device) for k, v in edge_index_dict.items()}
+        edge_attr_dict = {k: v.to(self.device) for k, v in edge_attr_dict.items()}
+        move_indices = move_indices.to(self.device)
+
+        # Handle case where no moves map to action space
+        valid_move_mask = move_indices >= 0
+        if valid_move_mask.sum() == 0:
+            # No moves in action space - fall back to random
+            selected_move = random.choice(legal_moves)
             result = [selected_move]
             if return_probs:
-                result.append({legal_move_strings[0]: 1.0})
-            if return_value:
-                result.append(0.0)  # Neutral value for pass position
-            return tuple(result) if len(result) > 1 else result[0]
-
-        # Get graph representation
-        node_features, edge_index = board.to_graph()
-
-        # Handle empty board case
-        if len(node_features) == 0:
-            # Empty board - uniform distribution
-            prob = 1.0 / len(legal_moves)
-            result = [random.choice(legal_moves)]
-            if return_probs:
+                prob = 1.0 / len(legal_moves)
                 result.append({move_str: prob for move_str in legal_move_strings})
             if return_value:
                 result.append(0.0)
             return tuple(result) if len(result) > 1 else result[0]
 
-        x = torch.tensor(node_features, dtype=torch.float32, device=self.device)
-        edge_index_tensor = torch.tensor(
-            edge_index, dtype=torch.long, device=self.device
-        )
-
-        # Forward pass through policy model
+        # Forward pass through heterogeneous policy model
         with torch.no_grad():
             if self.use_amp:
                 with torch.cuda.amp.autocast():
                     probs = self.model.predict_action_probs(
-                        x,
-                        edge_index_tensor,
-                        action_mask=action_mask.unsqueeze(0),
+                        x_dict,
+                        edge_index_dict,
+                        edge_attr_dict,
+                        move_indices,
                         temperature=self.temperature,
                     )
             else:
                 probs = self.model.predict_action_probs(
-                    x,
-                    edge_index_tensor,
-                    action_mask=action_mask.unsqueeze(0),
+                    x_dict,
+                    edge_index_dict,
+                    edge_attr_dict,
+                    move_indices,
                     temperature=self.temperature,
                 )
 
@@ -311,40 +315,51 @@ class SelfPlayGame:
             position_value = None
             if return_value:
                 _, position_value = self.model(
-                    x, edge_index_tensor, action_mask=action_mask.unsqueeze(0)
+                    x_dict, edge_index_dict, edge_attr_dict, move_indices
                 )
                 position_value = position_value.item()
 
-        # Sample action from probabilities
+        # Get probabilities for valid actions only
+        valid_indices = move_indices[valid_move_mask]
         probs_np = probs.cpu().numpy()
-        legal_probs = probs_np[legal_action_indices]
+        legal_probs = probs_np[valid_indices.cpu().numpy()]
 
         # Check for invalid probabilities (NaN or all zeros)
         if np.isnan(legal_probs).any() or legal_probs.sum() == 0:
-            # Fallback to uniform distribution over legal actions
-            legal_probs = np.ones(len(legal_action_indices)) / len(legal_action_indices)
+            # Fallback to uniform distribution
+            legal_probs = np.ones(len(valid_indices)) / len(valid_indices)
         else:
-            # Normalize (should already be normalized, but ensure)
+            # Normalize (should already be normalized)
             legal_probs = legal_probs / legal_probs.sum()
 
         # Sample action index
-        selected_action_idx = np.random.choice(legal_action_indices, p=legal_probs)
+        selected_action_idx = np.random.choice(
+            valid_indices.cpu().numpy(), p=legal_probs
+        )
         selected_move_str = action_to_str[selected_action_idx]
 
         # Find the corresponding move object
         selected_move = None
-        for move in legal_moves:
+        for i, move in enumerate(legal_moves):
             if board.to_move_string(move) == selected_move_str:
                 selected_move = move
                 break
+
+        # Fallback if move not found (shouldn't happen)
+        if selected_move is None:
+            selected_move = random.choice(legal_moves)
 
         # Build return value
         result = [selected_move]
         if return_probs:
             # Build move probability dict
             move_probs = {}
-            for move_str, action_idx in zip(legal_move_strings, legal_action_indices):
-                move_probs[move_str] = float(probs_np[action_idx])
+            for i, move_str in enumerate(legal_move_strings):
+                if valid_move_mask[i]:
+                    action_idx = move_indices[i].item()
+                    move_probs[move_str] = float(probs_np[action_idx])
+                else:
+                    move_probs[move_str] = 0.0
             result.append(move_probs)
         if return_value:
             result.append(position_value if position_value is not None else 0.0)
