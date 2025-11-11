@@ -79,34 +79,49 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
     is_hetero = hasattr(model, "node_embedding")
 
     if is_hetero:
-        # Handle heterogeneous data - process one at a time (batching hetero graphs is complex)
-        for hetero_data, move_to_action_indices, target in tqdm(
-            training_data, desc="Training", leave=False, unit="sample"
-        ):
+        # Handle heterogeneous data - batch using PyTorch Geometric's DataLoader
+        from torch_geometric.loader import DataLoader as PyGDataLoader
+
+        # Prepare data list for batching
+        data_list = []
+        for hetero_data, move_to_action_indices, target in training_data:
             if not isinstance(hetero_data, HeteroData):
                 continue
 
-            # Move to device
-            hetero_data = hetero_data.to(device)
-            move_to_action_indices = move_to_action_indices.to(device)
+            # Attach target to hetero_data for batching
+            hetero_data.y = torch.tensor([target], dtype=torch.float32)
+            # Note: move_to_action_indices will be concatenated across batch
+            # We only use value head in batch training (not policy head)
+            hetero_data.move_to_action_indices = move_to_action_indices
+            data_list.append(hetero_data)
 
-            # Prepare inputs
-            x_dict, edge_index_dict, edge_attr_dict, _ = prepare_model_inputs(
-                hetero_data, move_to_action_indices
-            )
+        if len(data_list) == 0:
+            return 0.0
 
+        # Create DataLoader for batching heterogeneous graphs
+        loader = PyGDataLoader(data_list, batch_size=batch_size, shuffle=True)
+
+        for batch in tqdm(loader, desc="Training batches", leave=False, unit="batch"):
+            batch = batch.to(device)
             optimizer.zero_grad()
 
-            # Forward pass - heterogeneous policy model
-            _, value = model(
-                x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices
+            # Prepare inputs from batch (preserves batch information)
+            x_dict, edge_index_dict, edge_attr_dict, _ = prepare_model_inputs(
+                batch, batch.move_to_action_indices
             )
 
-            prediction = value.squeeze()
-            target_tensor = torch.tensor(target, dtype=torch.float32, device=device)
+            # Forward pass - heterogeneous policy model
+            # action_logits is not used in batch training (only value)
+            _, value = model(
+                x_dict, edge_index_dict, edge_attr_dict, batch.move_to_action_indices
+            )
+
+            # value shape: [batch_size, 1] or [batch_size]
+            predictions = value.squeeze()
+            targets = batch.y.squeeze()
 
             # MSE loss
-            loss = F.mse_loss(prediction, target_tensor)
+            loss = F.mse_loss(predictions, targets)
 
             # Backward pass
             loss.backward()

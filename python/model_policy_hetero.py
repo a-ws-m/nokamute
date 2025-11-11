@@ -223,34 +223,57 @@ class HiveGNNPolicyHetero(nn.Module):
 
                     x_dict_current[node_type] = h
 
-        # Generate policy logits from move edge features
+        # Detect batch size early to decide if we compute policy logits
+        # Check if this is a batched graph by looking for batch attribute
+        batch_size_detected = 1
+        batch_dict = {}
+        for node_type in x_dict.keys():
+            # Check the original input x_dict for batch information
+            if hasattr(x_dict[node_type], "batch"):
+                batch_dict[node_type] = x_dict[node_type].batch
+                batch_size_detected = max(
+                    batch_size_detected, int(batch_dict[node_type].max().item()) + 1
+                )
+
+        is_batched = batch_size_detected > 1
+
+        # Generate policy logits from move edge features (skip for batched training)
         # Strategy: For each move edge, compute edge representation by combining
         # source and destination node features, then apply policy head MLP
 
-        all_move_edge_features = []
-        all_move_edge_attrs = []
+        # For batched graphs, policy head is problematic because move_to_action_indices
+        # are concatenated and don't align with per-graph action spaces
+        # We skip policy computation for batched training (only compute value)
 
-        # Collect move edges from all edge types (including reverse edges from ToUndirected)
-        for edge_type_tuple in edge_index_dict.keys():
-            src_type, edge_type, dst_type = edge_type_tuple
-            if "move" in edge_type or "rev_move" in edge_type:
-                edge_idx = edge_index_dict[edge_type_tuple]
+        if not is_batched:
+            all_move_edge_features = []
+            all_move_edge_attrs = []
 
-                if edge_idx.shape[1] > 0:  # Has edges of this type
-                    # Get source and destination node features
-                    src_features = x_dict_current[src_type][
-                        edge_idx[0]
-                    ]  # [num_edges, hidden_dim]
-                    dst_features = x_dict_current[dst_type][
-                        edge_idx[1]
-                    ]  # [num_edges, hidden_dim]
+            # Collect move edges from all edge types (including reverse edges from ToUndirected)
+            for edge_type_tuple in edge_index_dict.keys():
+                src_type, edge_type, dst_type = edge_type_tuple
+                if "move" in edge_type or "rev_move" in edge_type:
+                    edge_idx = edge_index_dict[edge_type_tuple]
 
-                    # Combine source and destination (average)
-                    edge_features = (src_features + dst_features) / 2.0
-                    all_move_edge_features.append(edge_features)
+                    if edge_idx.shape[1] > 0:  # Has edges of this type
+                        # Get source and destination node features
+                        src_features = x_dict_current[src_type][
+                            edge_idx[0]
+                        ]  # [num_edges, hidden_dim]
+                        dst_features = x_dict_current[dst_type][
+                            edge_idx[1]
+                        ]  # [num_edges, hidden_dim]
 
-                    # Keep track of which edges belong to current player
-                    all_move_edge_attrs.append(edge_attr_dict[edge_type_tuple])
+                        # Combine source and destination (average)
+                        edge_features = (src_features + dst_features) / 2.0
+                        all_move_edge_features.append(edge_features)
+
+                        # Keep track of which edges belong to current player
+                        all_move_edge_attrs.append(edge_attr_dict[edge_type_tuple])
+        else:
+            # Batched training - skip policy head
+            all_move_edge_features = []
+            all_move_edge_attrs = []
 
         if all_move_edge_features:
             # Concatenate all move edge features
@@ -327,23 +350,72 @@ class HiveGNNPolicyHetero(nn.Module):
                 0, safe_indices, safe_logits, reduce="amax", include_self=True
             )
 
-        # Add batch dimension
-        action_logits = action_logits.unsqueeze(0)  # [1, num_actions]
+        # Use the batch_size and is_batched detected earlier
+        batch_size = batch_size_detected
 
-        # Compute value through global pooling over all node types
-        pooled_features = []
-        for node_type in ["in_play", "out_of_play", "destination"]:
-            if node_type in x_dict_current and x_dict_current[node_type].shape[0] > 0:
-                # Mean pool over nodes of this type
-                pooled = torch.mean(x_dict_current[node_type], dim=0, keepdim=True)
-            else:
-                # No nodes of this type - use zeros
-                pooled = torch.zeros(1, self.hidden_dim, device=device)
-            pooled_features.append(pooled)
+        if not is_batched:
+            # Single graph - add batch dimension
+            action_logits = action_logits.unsqueeze(0)  # [1, num_actions]
 
-        # Concatenate pooled features from all node types
-        graph_embedding = torch.cat(pooled_features, dim=-1)  # [1, hidden_dim * 3]
-        value = self.value_head(graph_embedding)  # [1, 1]
+            # Compute value through global pooling over all node types
+            pooled_features = []
+            for node_type in ["in_play", "out_of_play", "destination"]:
+                if (
+                    node_type in x_dict_current
+                    and x_dict_current[node_type].shape[0] > 0
+                ):
+                    # Mean pool over nodes of this type
+                    pooled = torch.mean(x_dict_current[node_type], dim=0, keepdim=True)
+                else:
+                    # No nodes of this type - use zeros
+                    pooled = torch.zeros(1, self.hidden_dim, device=device)
+                pooled_features.append(pooled)
+
+            # Concatenate pooled features from all node types
+            graph_embedding = torch.cat(pooled_features, dim=-1)  # [1, hidden_dim * 3]
+            value = self.value_head(graph_embedding)  # [1, 1]
+        else:
+            # Batched graphs - we need to handle action_logits per graph
+            # For now, return action_logits as-is (will need special handling in training)
+            # and compute value per-graph using batch indices
+            from torch_geometric.utils import scatter
+
+            # Compute per-graph pooling for value head
+            pooled_features_list = []
+            for node_type in ["in_play", "out_of_play", "destination"]:
+                if (
+                    node_type in x_dict_current
+                    and x_dict_current[node_type].shape[0] > 0
+                ):
+                    if node_type in batch_dict:
+                        # Per-graph mean pooling
+                        pooled = scatter(
+                            x_dict_current[node_type],
+                            batch_dict[node_type],
+                            dim=0,
+                            reduce="mean",
+                            dim_size=batch_size,
+                        )  # [batch_size, hidden_dim]
+                    else:
+                        # Fallback: no batch info, assume single graph replicated
+                        pooled = torch.mean(
+                            x_dict_current[node_type], dim=0, keepdim=True
+                        )
+                        pooled = pooled.expand(batch_size, -1)
+                else:
+                    # No nodes of this type - use zeros
+                    pooled = torch.zeros(batch_size, self.hidden_dim, device=device)
+                pooled_features_list.append(pooled)
+
+            # Concatenate pooled features from all node types
+            graph_embedding = torch.cat(
+                pooled_features_list, dim=-1
+            )  # [batch_size, hidden_dim * 3]
+            value = self.value_head(graph_embedding)  # [batch_size, 1]
+
+            # Note: action_logits is still concatenated across all graphs in batch
+            # This needs special handling - for batched training, we only use value
+            action_logits = action_logits.unsqueeze(0)  # [1, num_actions] - placeholder
 
         return action_logits, value
 

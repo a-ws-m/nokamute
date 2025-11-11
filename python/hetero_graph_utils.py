@@ -139,19 +139,24 @@ def prepare_model_inputs(data, move_to_action_indices):
     Prepare inputs for the heterogeneous GNN model from HeteroData.
 
     Args:
-        data: HeteroData object from board_to_hetero_data
+        data: HeteroData object from board_to_hetero_data (can be batched)
         move_to_action_indices: Tensor of action indices for legal moves
 
     Returns:
-        x_dict: Dictionary of node features by node type
+        x_dict: Dictionary of node features by node type (with batch attr if batched)
         edge_index_dict: Dictionary of edge indices by edge type tuple
         edge_attr_dict: Dictionary of edge attributes by edge type tuple
         move_to_action_indices: Passed through unchanged
     """
-    # Extract x_dict
+    # Extract x_dict - preserve batch information if present
     x_dict = {}
     for node_type in data.node_types:
-        x_dict[node_type] = data[node_type].x
+        node_data = data[node_type]
+        x_dict[node_type] = node_data.x
+
+        # Attach batch information if this is a batched graph
+        if hasattr(node_data, "batch"):
+            x_dict[node_type].batch = node_data.batch
 
     # Extract edge_index_dict and edge_attr_dict
     edge_index_dict = {}
