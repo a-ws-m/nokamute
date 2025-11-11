@@ -32,6 +32,7 @@ from model import create_model
 from self_play import SelfPlayGame, prepare_training_data
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
+from tqdm import tqdm
 
 
 def train_epoch_standard(model, training_data, optimizer, batch_size=32, device="cpu"):
@@ -70,7 +71,7 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
 
     loader = DataLoader(data_list, batch_size=batch_size, shuffle=True)
 
-    for batch in loader:
+    for batch in tqdm(loader, desc="Training batches", leave=False, unit="batch"):
         batch = batch.to(device)
         optimizer.zero_grad()
 
@@ -135,7 +136,9 @@ def train_main_agent(
         cache_graphs=args.cache_graphs if args else True,
     )
 
-    for game_idx in range(config.main_agent_games_per_iter):
+    for game_idx in tqdm(
+        range(config.main_agent_games_per_iter), desc="Generating games", unit="game"
+    ):
         # Sample opponent using PFSP
         opponent_agent = league_manager.sample_opponent_for_main_agent()
         opponent_sample_counts[opponent_agent.name] = (
@@ -172,11 +175,6 @@ def train_main_agent(
 
         games.append((game_data, result, branch_id))
 
-        if (game_idx + 1) % 10 == 0:
-            print(
-                f"  Generated {game_idx + 1}/{config.main_agent_games_per_iter} games"
-            )
-
     # Log PFSP statistics
     league_tracker.log_pfsp_stats(iteration, opponent_sample_counts)
 
@@ -187,7 +185,9 @@ def train_main_agent(
 
     # Train for multiple epochs
     print(f"\nTraining for {config.main_agent_epochs} epochs...")
-    for epoch in range(config.main_agent_epochs):
+    for epoch in tqdm(
+        range(config.main_agent_epochs), desc="Training epochs", unit="epoch"
+    ):
         loss = train_epoch_standard(
             model,
             training_data,
@@ -206,7 +206,9 @@ def train_main_agent(
         )
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  Epoch {epoch+1}/{config.main_agent_epochs}: Loss = {loss:.6f}")
+            tqdm.write(
+                f"  Epoch {epoch+1}/{config.main_agent_epochs}: Loss = {loss:.6f}"
+            )
 
     # Update Main Agent
     model_config = checkpoint.get("config", {})
@@ -301,7 +303,9 @@ def train_main_exploiter(
 
     # Train for multiple epochs
     print(f"\nTraining for {config.exploiter_epochs} epochs...")
-    for epoch in range(config.exploiter_epochs):
+    for epoch in tqdm(
+        range(config.exploiter_epochs), desc="Training epochs", unit="epoch"
+    ):
         loss = train_epoch_standard(
             model,
             training_data,
@@ -322,7 +326,9 @@ def train_main_exploiter(
         )
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  Epoch {epoch+1}/{config.exploiter_epochs}: Loss = {loss:.6f}")
+            tqdm.write(
+                f"  Epoch {epoch+1}/{config.exploiter_epochs}: Loss = {loss:.6f}"
+            )
 
     # Save updated exploiter
     model_config = checkpoint.get("config", {})
@@ -443,7 +449,7 @@ def main():
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
-    
+
     # Performance optimization arguments
     parser.add_argument(
         "--use-compile",
@@ -518,7 +524,7 @@ def main():
             print(f"Loading pretrained model from {args.pretrained_model}...")
             pretrained = torch.load(args.pretrained_model, map_location=config.device)
             model.load_state_dict(pretrained["model_state_dict"])
-        
+
         # Apply torch.compile() for faster inference
         if args.use_compile:
             if config.device == "cpu":
@@ -539,12 +545,14 @@ def main():
     # Main training loop
     start_iteration = league_manager.iteration
 
-    for iteration in range(start_iteration, args.iterations):
+    for iteration in tqdm(
+        range(start_iteration, args.iterations), desc="League iterations", unit="iter"
+    ):
         league_manager.iteration = iteration
 
-        print(f"\n{'='*80}")
-        print(f"LEAGUE ITERATION {iteration + 1}/{args.iterations}")
-        print(f"{'='*80}")
+        tqdm.write(f"\n{'='*80}")
+        tqdm.write(f"LEAGUE ITERATION {iteration + 1}/{args.iterations}")
+        tqdm.write(f"{'='*80}")
 
         # 1. Train Main Agent
         if iteration % config.main_agent_update_interval == 0:

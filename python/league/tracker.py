@@ -18,6 +18,7 @@ from league.manager import AgentArchetype, LeagueAgent
 from model import HiveGNN
 from self_play import SelfPlayGame
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 import nokamute
 
@@ -270,7 +271,11 @@ class LeagueTracker:
         total_moves = 0
         start_time = time.time()
 
-        for game_idx in range(num_games):
+        for game_idx in tqdm(
+            range(num_games),
+            desc=f"Evaluating {agent1.name} vs {agent2.name}",
+            unit="game",
+        ):
             board = nokamute.Board()
             agent1_is_white = game_idx % 2 == 0
             move_count = 0

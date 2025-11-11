@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from graph_utils import board_to_networkx, graph_hash
 from torch_geometric.data import Batch, Data
+from tqdm import tqdm
 
 import nokamute
 
@@ -266,10 +267,10 @@ class SelfPlayGame:
 
             # Convert to graph (with optional caching)
             node_features, edge_index = board_copy.to_graph()
-            
+
             # Get graph hash for deduplication
             pos_hash = graph_hash(node_features, edge_index)
-            
+
             # Check cache if enabled
             if self.cache_graphs and pos_hash in self._graph_cache:
                 node_features, edge_index = self._graph_cache[pos_hash]
@@ -300,7 +301,9 @@ class SelfPlayGame:
                 node_features, edge_index = graph_data
                 # OPTIMIZATION: Create tensors directly on device (avoid CPU→GPU transfer)
                 x = torch.tensor(node_features, dtype=torch.float32, device=self.device)
-                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long, device=self.device)
+                edge_index_tensor = torch.tensor(
+                    edge_index, dtype=torch.long, device=self.device
+                )
 
                 data = Data(x=x, edge_index=edge_index_tensor)
                 data_list.append(data)
@@ -328,7 +331,7 @@ class SelfPlayGame:
                     predictions, _ = self.model(batch.x, batch.edge_index, batch.batch)
             else:
                 predictions, _ = self.model(batch.x, batch.edge_index, batch.batch)
-            
+
             values = predictions.squeeze()
 
             # Keep on device for now - we'll map back to moves in PyTorch
@@ -510,12 +513,9 @@ class SelfPlayGame:
         """
         games = []
 
-        for i in range(num_games):
+        for i in tqdm(range(num_games), desc="Generating games", unit="game"):
             game_data, result, _ = self.play_game(branch_id=f"seq_{i}")
             games.append((game_data, result, f"seq_{i}"))
-
-            if (i + 1) % 10 == 0:
-                print(f"Generated {i + 1}/{num_games} games...")
 
         return games
 
@@ -543,15 +543,9 @@ class SelfPlayGame:
 
         # Phase 1: Generate initial games from scratch to build branch points
         print(f"Generating {num_from_start} games from start position...")
-        for i in range(num_from_start):
+        for i in tqdm(range(num_from_start), desc="Initial games", unit="game"):
             game_data, result, _ = self.play_game(branch_id=f"root_{i}")
             games.append((game_data, result, f"root_{i}"))
-
-            if (i + 1) % 10 == 0:
-                print(
-                    f"  {i + 1}/{num_from_start} initial games, "
-                    f"{len(self.branch_points)} branch points collected..."
-                )
 
         # Phase 2: Branch from collected positions
         if num_from_branches > 0 and len(self.branch_points) > 0:
@@ -559,7 +553,7 @@ class SelfPlayGame:
                 f"\nGenerating {num_from_branches} games from {len(self.branch_points)} branch points..."
             )
 
-            for i in range(num_from_branches):
+            for i in tqdm(range(num_from_branches), desc="Branched games", unit="game"):
                 # Select a branch point (weighted by move probabilities)
                 board, node, depth, branch_id = self._select_branch_point()
 
@@ -568,9 +562,6 @@ class SelfPlayGame:
                     start_board=board, start_depth=depth, branch_id=branch_id
                 )
                 games.append((game_data, result, branch_id))
-
-                if (i + 1) % 10 == 0:
-                    print(f"  {i + 1}/{num_from_branches} branched games...")
 
         return games
 
@@ -628,13 +619,13 @@ class SelfPlayGame:
         """
         self.game_tree.clear()
         self.branch_points.clear()
-    
+
     def clear_graph_cache(self):
         """
         Clear the graph conversion cache.
         """
         self._graph_cache.clear()
-    
+
     def get_cache_stats(self):
         """Get statistics about cache usage."""
         return {
@@ -665,7 +656,9 @@ def prepare_training_data(games):
     position_targets = {}  # pos_hash -> list of target values
     position_data = {}  # pos_hash -> (node_features, edge_index)
 
-    for game_data, final_result, branch_id in games:
+    for game_data, final_result, branch_id in tqdm(
+        games, desc="Preparing training data", unit="game"
+    ):
         # Assign values to each position based on final result
         for item in game_data:
             # New format with move_value: (nx_graph, legal_moves, selected_move, player, pos_hash, move_value)
