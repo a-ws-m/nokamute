@@ -134,6 +134,7 @@ def train_main_agent(
         max_moves=config.max_moves,
         use_amp=args.use_amp if args else False,
         cache_graphs=args.cache_graphs if args else True,
+        inference_batch_size=config.inference_batch_size,
     )
 
     for game_idx in tqdm(
@@ -270,6 +271,7 @@ def train_main_exploiter(
         gamma=config.minimax_gamma,
         enable_branching=config.enable_branching,
         max_moves=config.max_moves,
+        inference_batch_size=config.inference_batch_size,
     )
 
     # Generate training games with minimax rewards
@@ -475,6 +477,14 @@ def main():
         default=True,
         help="Disable graph caching",
     )
+    parser.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for position evaluation during game generation. "
+        "None = evaluate all positions in single batch. "
+        "Set to your GPU's max capacity (e.g., 256, 512, 1024) for optimal performance.",
+    )
 
     args = parser.parse_args()
 
@@ -487,6 +497,7 @@ def main():
             main_agent_games_per_iter=args.main_games,
             exploiter_games_per_iter=args.exploiter_games,
             device=args.device,
+            inference_batch_size=args.inference_batch_size,
         )
 
     print("\n" + "=" * 60)
@@ -497,6 +508,10 @@ def main():
     print(f"Exploiter games/iter: {config.exploiter_games_per_iter}")
     print(f"Minimax reward weight: {config.minimax_reward_weight}")
     print(f"PFSP exponent: {config.pfsp_exponent}")
+    if config.inference_batch_size is not None:
+        print(f"Inference batch size: {config.inference_batch_size}")
+    else:
+        print(f"Inference batch size: Dynamic (all positions in single batch)")
 
     # Setup directories
     save_dir = Path(args.resume) if args.resume else Path(args.save_dir)

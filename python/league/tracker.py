@@ -237,6 +237,7 @@ class LeagueTracker:
         num_games: int,
         device: str = "cpu",
         iteration: Optional[int] = None,
+        inference_batch_size: Optional[int] = None,
     ) -> Dict:
         """
         Evaluate two agents head-to-head.
@@ -247,6 +248,7 @@ class LeagueTracker:
             num_games: Number of games to play
             device: Device for models
             iteration: Training iteration (for logging)
+            inference_batch_size: Batch size for position evaluation during inference
 
         Returns:
             Results dictionary with win rates and game statistics
@@ -258,8 +260,18 @@ class LeagueTracker:
         model2 = self._load_model(agent2, device)
 
         # Create players
-        player1 = SelfPlayGame(model=model1, temperature=0, device=device)
-        player2 = SelfPlayGame(model=model2, temperature=0, device=device)
+        player1 = SelfPlayGame(
+            model=model1,
+            temperature=0,
+            device=device,
+            inference_batch_size=inference_batch_size,
+        )
+        player2 = SelfPlayGame(
+            model=model2,
+            temperature=0,
+            device=device,
+            inference_batch_size=inference_batch_size,
+        )
 
         results = {
             "agent1_wins": 0,

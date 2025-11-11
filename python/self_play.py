@@ -54,6 +54,7 @@ class SelfPlayGame:
         max_moves=400,
         use_amp=False,
         cache_graphs=True,
+        inference_batch_size=None,
     ):
         """
         Args:
@@ -64,6 +65,9 @@ class SelfPlayGame:
             max_moves: Maximum number of moves before declaring a draw (default: 400)
             use_amp: Whether to use Automatic Mixed Precision (GPU only)
             cache_graphs: Whether to cache graph conversions to avoid redundant work
+            inference_batch_size: Maximum batch size for position evaluation during inference.
+                                 If None, evaluates all positions in a single batch.
+                                 Set this to your GPU's maximum capacity for optimal performance.
         """
         self.model = model
         self.temperature = temperature
@@ -72,6 +76,7 @@ class SelfPlayGame:
         self.max_moves = max_moves
         self.use_amp = use_amp and device != "cpu"
         self.cache_graphs = cache_graphs
+        self.inference_batch_size = inference_batch_size
         self._graph_cache: Dict[str, tuple] = {}
 
         # Branching MCMC state
@@ -320,29 +325,68 @@ class SelfPlayGame:
         valid_data = [d for d in data_list if d is not None]
         valid_hashes = [h for h, d in zip(unique_hashes, data_list) if d is not None]
 
-        # Create batch from all data (already on device)
-        batch = Batch.from_data_list(valid_data)
+        # Evaluate positions - either in one batch or in chunks based on inference_batch_size
+        all_values = []
 
-        # Evaluate all positions in a single forward pass with optional AMP
-        with torch.no_grad():
-            if self.use_amp:
-                # OPTIMIZATION: Use Automatic Mixed Precision for faster GPU inference
-                with torch.autocast(device_type=self.device, dtype=torch.float16):
+        if (
+            self.inference_batch_size is None
+            or len(valid_data) <= self.inference_batch_size
+        ):
+            # Single batch evaluation (original behavior)
+            batch = Batch.from_data_list(valid_data)
+
+            with torch.no_grad():
+                if self.use_amp:
+                    # OPTIMIZATION: Use Automatic Mixed Precision for faster GPU inference
+                    with torch.autocast(device_type=self.device, dtype=torch.float16):
+                        predictions, _ = self.model(
+                            batch.x, batch.edge_index, batch.batch
+                        )
+                else:
                     predictions, _ = self.model(batch.x, batch.edge_index, batch.batch)
-            else:
-                predictions, _ = self.model(batch.x, batch.edge_index, batch.batch)
 
-            values = predictions.squeeze()
+                values = predictions.squeeze()
 
-            # Keep on device for now - we'll map back to moves in PyTorch
-            if len(valid_data) == 1:
-                values = values.unsqueeze(0)  # Make sure it's 1D
+                # Keep on device for now - we'll map back to moves in PyTorch
+                if len(valid_data) == 1:
+                    values = values.unsqueeze(0)  # Make sure it's 1D
+
+                all_values = values
+        else:
+            # Chunked evaluation for large position sets
+            for i in range(0, len(valid_data), self.inference_batch_size):
+                chunk = valid_data[i : i + self.inference_batch_size]
+                batch = Batch.from_data_list(chunk)
+
+                with torch.no_grad():
+                    if self.use_amp:
+                        with torch.autocast(
+                            device_type=self.device, dtype=torch.float16
+                        ):
+                            predictions, _ = self.model(
+                                batch.x, batch.edge_index, batch.batch
+                            )
+                    else:
+                        predictions, _ = self.model(
+                            batch.x, batch.edge_index, batch.batch
+                        )
+
+                    chunk_values = predictions.squeeze()
+
+                    # Ensure 1D tensor
+                    if len(chunk) == 1:
+                        chunk_values = chunk_values.unsqueeze(0)
+
+                    all_values.append(chunk_values)
+
+            # Concatenate all chunks
+            all_values = torch.cat(all_values)
 
         # Map values to graph hashes (keep as tensors on device)
         # Values are absolute (positive = White winning, negative = Black winning)
         hash_to_value = {}
         for i, graph_hash_val in enumerate(valid_hashes):
-            hash_to_value[graph_hash_val] = values[i]
+            hash_to_value[graph_hash_val] = all_values[i]
 
         # Handle None positions
         for graph_hash_val, graph_data in hash_to_data.items():

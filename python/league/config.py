@@ -60,6 +60,13 @@ class LeagueConfig:
     gamma: float = 0.99  # TD discount factor
     enable_branching: bool = True
 
+    # Inference settings
+    inference_batch_size: Optional[int] = (
+        None  # Batch size for position evaluation during game generation
+    )
+    # None = evaluate all positions in single batch
+    # Set to GPU capacity for optimal performance
+
     def __post_init__(self):
         """Validate configuration."""
         assert 0.0 <= self.main_exploiter_convergence_threshold <= 1.0
