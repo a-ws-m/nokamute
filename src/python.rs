@@ -287,40 +287,80 @@ impl Board {
         // Also includes on-top-of-piece destinations
         // Features: [on_top (0/1), padding to match 10 features total]
         
-        // Collect empty spaces adjacent to pieces
-        let mut empty_spaces = HashSet::new();
+        // We need to generate destination nodes that account for BOTH players' possible moves
+        // Generate legal moves for current player to find all destination hexes
+        let mut current_moves = Vec::new();
+        Rules::generate_moves(&self.inner, &mut current_moves);
         
-        // Special case: if board is empty, add the starting hex as a destination
-        let board_is_empty = self.inner.occupied_hexes[0].is_empty() && self.inner.occupied_hexes[1].is_empty();
-        if board_is_empty {
-            empty_spaces.insert(crate::hex_grid::START_HEX);
-        }
-        
-        for color_idx in 0..2 {
-            for &hex in self.inner.occupied_hexes[color_idx].iter() {
-                // Add destination on top of this piece (unless something is already on top)
-                let height = self.inner.height(hex);
-                if height == 1 {  // Only one piece, so top is accessible
-                    let node_idx = destination_nodes.len();
-                    hex_on_top_to_destination.insert(hex, node_idx);
-                    
-                    // Features: [1.0 for on_top, then 9 zeros for padding]
-                    let mut features = vec![1.0f32];
-                    features.extend(vec![0.0f32; 9]);
-                    destination_nodes.push(features);
-                }
-                
-                // Add empty adjacent spaces
-                for &adj_hex in adjacent(hex).iter() {
-                    if self.inner.height(adj_hex) == 0 {
-                        empty_spaces.insert(adj_hex);
+        // Generate legal moves for opponent to find their destination hexes
+        // Special case: on turn 0, both players have the same placement options (START_HEX only)
+        // Using Pass would advance to turn 1 and give incorrect placement options
+        let mut opponent_moves = Vec::new();
+        if self.inner.turn_num == 0 {
+            // On turn 0, opponent has same placement options as current player (just START_HEX)
+            // Generate moves for the opponent color
+            let opponent_color = if self.inner.to_move() == RustColor::White {
+                RustColor::Black
+            } else {
+                RustColor::White
+            };
+            
+            // Opponent can place any non-Queen piece on START_HEX
+            for (bug_idx, &count) in self.inner.remaining[opponent_color as usize].iter().enumerate() {
+                if count > 0 {
+                    let bug = unsafe { std::mem::transmute::<u8, RustBug>(bug_idx as u8) };
+                    if bug != RustBug::Queen {
+                        opponent_moves.push(RustTurn::Place(crate::hex_grid::START_HEX, bug));
                     }
                 }
             }
+        } else {
+            // After turn 0, use Pass to simulate opponent's turn
+            let mut board_copy = self.inner.clone();
+            board_copy.apply(RustTurn::Pass);  // Switch to opponent
+            Rules::generate_moves(&board_copy, &mut opponent_moves);
+            board_copy.undo(RustTurn::Pass);  // Restore
         }
-
-        // Create nodes for empty spaces
-        for hex in empty_spaces.iter() {
+        
+        // Collect all destination hexes from legal moves
+        let mut destination_hexes = HashSet::new();
+        let mut destination_on_top_hexes = HashSet::new();
+        
+        for &turn in current_moves.iter().chain(opponent_moves.iter()) {
+            match turn {
+                RustTurn::Place(hex, _) => {
+                    // Check if this is placement on top of an existing piece
+                    if self.inner.height(hex) > 0 {
+                        destination_on_top_hexes.insert(hex);
+                    } else {
+                        destination_hexes.insert(hex);
+                    }
+                }
+                RustTurn::Move(_, to_hex) => {
+                    // Check if this is a move on top of an existing piece
+                    if self.inner.height(to_hex) > 0 {
+                        destination_on_top_hexes.insert(to_hex);
+                    } else {
+                        destination_hexes.insert(to_hex);
+                    }
+                }
+                RustTurn::Pass => {}
+            }
+        }
+        
+        // Create destination nodes for on-top hexes
+        for hex in destination_on_top_hexes.iter() {
+            let node_idx = destination_nodes.len();
+            hex_on_top_to_destination.insert(*hex, node_idx);
+            
+            // Features: [1.0 for on_top, then 9 zeros for padding]
+            let mut features = vec![1.0f32];
+            features.extend(vec![0.0f32; 9]);
+            destination_nodes.push(features);
+        }
+        
+        // Create destination nodes for empty space hexes
+        for hex in destination_hexes.iter() {
             let node_idx = destination_nodes.len();
             hex_to_destination.insert(*hex, node_idx);
 
@@ -374,49 +414,42 @@ impl Board {
         }
 
         // Edges between destination nodes (adjacent empty spaces)
-        for &hex1 in empty_spaces.iter() {
-            let i = hex_to_destination[&hex1];
-            for &adj_hex in adjacent(hex1).iter() {
-                if let Some(&j) = hex_to_destination.get(&adj_hex) {
-                    let (from_vec, to_vec) = neighbour_edges.get_mut(&("destination", "neighbour", "destination")).unwrap();
-                    from_vec.push(i);
-                    to_vec.push(j);
+        for &hex1 in destination_hexes.iter() {
+            if let Some(&i) = hex_to_destination.get(&hex1) {
+                for &adj_hex in adjacent(hex1).iter() {
+                    if let Some(&j) = hex_to_destination.get(&adj_hex) {
+                        let (from_vec, to_vec) = neighbour_edges.get_mut(&("destination", "neighbour", "destination")).unwrap();
+                        from_vec.push(i);
+                        to_vec.push(j);
+                    }
                 }
             }
         }
 
         // Edges from destination nodes to adjacent in-play nodes
-        for &hex in empty_spaces.iter() {
-            let dest_idx = hex_to_destination[&hex];
-            for &adj_hex in adjacent(hex).iter() {
-                if let Some(&piece_idx) = hex_to_in_play.get(&adj_hex) {
-                    let (from_vec, to_vec) = neighbour_edges.get_mut(&("destination", "neighbour", "in_play")).unwrap();
-                    from_vec.push(dest_idx);
-                    to_vec.push(piece_idx);
-                    // Bidirectional
-                    let (from_vec, to_vec) = neighbour_edges.get_mut(&("in_play", "neighbour", "destination")).unwrap();
-                    from_vec.push(piece_idx);
-                    to_vec.push(dest_idx);
+        // Use all destination hexes (both regular and on-top)
+        for &hex in destination_hexes.iter() {
+            if let Some(&dest_idx) = hex_to_destination.get(&hex) {
+                for &adj_hex in adjacent(hex).iter() {
+                    if let Some(&piece_idx) = hex_to_in_play.get(&adj_hex) {
+                        let (from_vec, to_vec) = neighbour_edges.get_mut(&("destination", "neighbour", "in_play")).unwrap();
+                        from_vec.push(dest_idx);
+                        to_vec.push(piece_idx);
+                        // Bidirectional
+                        let (from_vec, to_vec) = neighbour_edges.get_mut(&("in_play", "neighbour", "destination")).unwrap();
+                        from_vec.push(piece_idx);
+                        to_vec.push(dest_idx);
+                    }
                 }
             }
         }
 
         // 5. Create move edges (legal moves for both players)
+        // We already generated these moves above when creating destination nodes
         // Track edges by their type tuple and whether they're for current player
         let mut move_edges_in_play: (Vec<usize>, Vec<usize>, Vec<f32>) = (Vec::new(), Vec::new(), Vec::new());
         let mut move_edges_out_of_play: (Vec<usize>, Vec<usize>, Vec<f32>) = (Vec::new(), Vec::new(), Vec::new());
         let mut move_to_action = Vec::new();
-
-        // Generate legal moves for current player
-        let mut current_moves = Vec::new();
-        Rules::generate_moves(&self.inner, &mut current_moves);
-
-        // Generate legal moves for opponent (simulate switching player)
-        let mut board_copy = self.inner.clone();
-        board_copy.apply(RustTurn::Pass);  // Switch to opponent
-        let mut opponent_moves = Vec::new();
-        Rules::generate_moves(&board_copy, &mut opponent_moves);
-        board_copy.undo(RustTurn::Pass);  // Restore
 
         // Process current player's moves
         for &turn in current_moves.iter() {

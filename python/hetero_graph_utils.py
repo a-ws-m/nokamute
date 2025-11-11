@@ -91,17 +91,45 @@ def board_to_hetero_data(graph_dict):
                             edge_attr, dtype=torch.float32
                         )
 
+    # Convert move strings to action indices BEFORE ToUndirected
+    move_to_action_list = graph_dict["move_to_action"]
+    current_player_action_indices = torch.tensor(
+        [string_to_action(move_str) for move_str in move_to_action_list],
+        dtype=torch.long,
+    )
+
+    # Build full action index tensor that matches ALL move edges (current + opponent)
+    # We need to match the order of edges in the graph with their action indices
+    # Current player moves have action indices, opponent moves get -1 (will be masked)
+    move_to_action_indices_list = []
+    current_idx = 0
+
+    for edge_type in data.edge_types:
+        if "move" in edge_type:
+            # Get edge attributes for this edge type
+            attr_key = f"edge_attr_{edge_type[0]}_{edge_type[1]}_{edge_type[2]}"
+            if attr_key in graph_dict:
+                edge_attrs = graph_dict[attr_key]
+                for attr in edge_attrs:
+                    if attr[0] == 1.0:  # Current player's move
+                        move_to_action_indices_list.append(
+                            current_player_action_indices[current_idx].item()
+                        )
+                        current_idx += 1
+                    else:  # Opponent's move
+                        move_to_action_indices_list.append(-1)  # Will be masked out
+
+    move_to_action_indices = torch.tensor(move_to_action_indices_list, dtype=torch.long)
+
     # Apply ToUndirected transform to add reverse edges
     # This ensures message passing works in both directions
     transform = T.ToUndirected()
     data = transform(data)
 
-    # Convert move strings to action indices
-    move_to_action_list = graph_dict["move_to_action"]
-    move_to_action_indices = torch.tensor(
-        [string_to_action(move_str) for move_str in move_to_action_list],
-        dtype=torch.long,
-    )
+    # After ToUndirected, move edges are duplicated (forward + reverse)
+    # We need to duplicate move_to_action_indices to match
+    # The order is: [original edges, then reverse edges]
+    move_to_action_indices = torch.cat([move_to_action_indices, move_to_action_indices])
 
     return data, move_to_action_indices
 

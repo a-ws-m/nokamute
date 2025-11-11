@@ -230,10 +230,10 @@ class HiveGNNPolicyHetero(nn.Module):
         all_move_edge_features = []
         all_move_edge_attrs = []
 
-        # Collect move edges from all edge types
+        # Collect move edges from all edge types (including reverse edges from ToUndirected)
         for edge_type_tuple in edge_index_dict.keys():
-            if "move" in edge_type_tuple:
-                src_type, _, dst_type = edge_type_tuple
+            src_type, edge_type, dst_type = edge_type_tuple
+            if "move" in edge_type or "rev_move" in edge_type:
                 edge_idx = edge_index_dict[edge_type_tuple]
 
                 if edge_idx.shape[1] > 0:  # Has edges of this type
