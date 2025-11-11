@@ -105,7 +105,7 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
             )
 
             prediction = value.squeeze()
-            target_tensor = torch.tensor([target], dtype=torch.float32, device=device)
+            target_tensor = torch.tensor(target, dtype=torch.float32, device=device)
 
             # MSE loss
             loss = F.mse_loss(prediction, target_tensor)
