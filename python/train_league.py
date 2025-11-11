@@ -29,8 +29,7 @@ from league import (
     prepare_exploiter_training_data,
 )
 from model import create_model
-from model_policy import create_policy_model
-from model_policy_hetero import create_policy_model as create_policy_model_hetero
+from model_policy_hetero import create_policy_model
 from self_play import SelfPlayGame, prepare_training_data
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
@@ -49,9 +48,8 @@ def create_model_by_type(model_type, model_config):
         Model instance
     """
     if model_type == "policy":
+        # Policy now means heterogeneous policy model
         return create_policy_model(model_config)
-    elif model_type == "policy_hetero":
-        return create_policy_model_hetero(model_config)
     else:
         return create_model(model_config)
 
@@ -201,6 +199,9 @@ def train_main_agent(
         state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
 
+    # Ensure model is on correct device after loading state dict
+    model = model.to(config.device)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=config.main_agent_lr)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
@@ -245,6 +246,9 @@ def train_main_agent(
                 k.replace("_orig_mod.", ""): v for k, v in opponent_state_dict.items()
             }
         opponent_model.load_state_dict(opponent_state_dict)
+
+        # Ensure model is on correct device after loading state dict
+        opponent_model = opponent_model.to(config.device)
         opponent_model.eval()
 
         # Play game (alternating who plays as White)
@@ -351,6 +355,9 @@ def train_main_exploiter(
         state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
 
+    # Ensure model is on correct device after loading state dict
+    model = model.to(config.device)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=config.exploiter_lr)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
@@ -369,6 +376,9 @@ def train_main_exploiter(
             k.replace("_orig_mod.", ""): v for k, v in main_state_dict.items()
         }
     main_model.load_state_dict(main_state_dict)
+
+    # Ensure model is on correct device after loading state dict
+    main_model = main_model.to(config.device)
     main_model.eval()
 
     # Create exploiter agent
@@ -774,6 +784,9 @@ def main():
                     k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
                 }
             model.load_state_dict(state_dict)
+
+            # Ensure model is on correct device after loading state dict
+            model = model.to(config.device)
 
             evaluate_and_update_elo(
                 model,
