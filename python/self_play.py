@@ -96,10 +96,23 @@ class SelfPlayGame:
     def _get_board_state_key(self, board):
         """
         Get a hashable representation of the board state.
-        Uses Weisfeiler-Lehman graph hashing for structural equivalence.
+        Uses a hash of the heterogeneous graph structure.
         """
-        node_features, edge_index = board.to_graph()
-        return graph_hash(node_features, edge_index)
+        import hashlib
+
+        from hetero_graph_utils import board_to_hetero_data
+
+        graph_dict = board.to_graph()
+        data, _ = board_to_hetero_data(graph_dict)
+
+        # Create a hash from all node and edge data
+        hash_input = []
+        for node_type in data.node_types:
+            hash_input.append(data[node_type].x.cpu().numpy().tobytes())
+        for edge_type in data.edge_types:
+            hash_input.append(data[edge_type].edge_index.cpu().numpy().tobytes())
+
+        return hashlib.md5(b"".join(hash_input)).hexdigest()
 
     def _compute_move_probabilities(self, board, legal_moves, move_values=None):
         """
@@ -676,11 +689,13 @@ class SelfPlayGame:
 
             # Store board state before move
             current_player = board.to_move()
-            board_graph = board.to_graph()
-            # Convert to NetworkX graph for storage
-            node_features, edge_index = board_graph
-            nx_graph = board_to_networkx(node_features, edge_index)
-            pos_hash = graph_hash(node_features, edge_index)
+
+            # Convert to heterogeneous graph for storage
+            from hetero_graph_utils import board_to_hetero_data
+
+            graph_dict = board.to_graph()
+            hetero_data, move_to_action_indices = board_to_hetero_data(graph_dict)
+            pos_hash = self._get_board_state_key(board)
 
             # Select move and get probabilities and value
             if self.enable_branching:
@@ -715,10 +730,11 @@ class SelfPlayGame:
                             (board.clone(), node, current_depth, branch_id)
                         )
 
-                # Store with move value for TD learning
+                # Store with move value for TD learning (using HeteroData + move_to_action_indices)
                 game_data.append(
                     (
-                        nx_graph,
+                        hetero_data,
+                        move_to_action_indices,
                         legal_moves,
                         selected_move,
                         current_player,
@@ -734,7 +750,8 @@ class SelfPlayGame:
                     )
                     game_data.append(
                         (
-                            nx_graph,
+                            hetero_data,
+                            move_to_action_indices,
                             legal_moves,
                             selected_move,
                             current_player,
@@ -747,7 +764,8 @@ class SelfPlayGame:
                     # No model, so no value - use 0.0 as placeholder
                     game_data.append(
                         (
-                            nx_graph,
+                            hetero_data,
+                            move_to_action_indices,
                             legal_moves,
                             selected_move,
                             current_player,
@@ -916,43 +934,40 @@ def prepare_training_data(games):
 
     Args:
         games: List of (game_data, result, branch_id) tuples from self-play
-              Each game_data contains (nx_graph, legal_moves, selected_move, player, pos_hash, move_value)
+              Each game_data contains (hetero_data, move_to_action_indices, legal_moves, selected_move, player, pos_hash, move_value)
 
     Returns:
-        training_examples: List of (node_features, edge_index, target_value)
+        training_examples: List of (hetero_data, move_to_action_indices, target_value)
     """
-    from graph_utils import networkx_to_pyg
+    from hetero_graph_utils import board_to_hetero_data
 
     # First pass: collect all (position_hash, target_value) pairs
     position_targets = {}  # pos_hash -> list of target values
-    position_data = {}  # pos_hash -> (node_features, edge_index)
+    position_data = {}  # pos_hash -> HeteroData
 
     for game_data, final_result, branch_id in tqdm(
         games, desc="Preparing training data", unit="game"
     ):
         # Assign values to each position based on final result
         for item in game_data:
-            # New format with move_value: (nx_graph, legal_moves, selected_move, player, pos_hash, move_value)
-            if len(item) == 6:
-                nx_graph, legal_moves, selected_move, player, pos_hash, move_value = (
-                    item
-                )
-            elif len(item) == 5:
-                # Old format without move_value (for backward compatibility)
-                nx_graph, legal_moves, selected_move, player, pos_hash = item
+            # Format: (hetero_data, move_to_action_indices, legal_moves, selected_move, player, pos_hash, move_value)
+            if len(item) == 7:
+                (
+                    hetero_data,
+                    move_to_action_indices,
+                    legal_moves,
+                    selected_move,
+                    player,
+                    pos_hash,
+                    move_value,
+                ) = item
             else:
                 # Unknown format - skip
                 continue
 
-            # Convert NetworkX graph to PyG format (once per unique position)
+            # Store HeteroData and move_to_action_indices (once per unique position)
             if pos_hash not in position_data:
-                node_features, edge_index = networkx_to_pyg(nx_graph)
-
-                # Skip empty boards
-                if len(node_features) == 0:
-                    continue
-
-                position_data[pos_hash] = (node_features, edge_index)
+                position_data[pos_hash] = (hetero_data, move_to_action_indices)
 
             # Use absolute result (no player-based flipping)
             # final_result is already absolute: White win = +1, Black win = -1, Draw = 0
@@ -965,10 +980,11 @@ def prepare_training_data(games):
 
     # Second pass: average targets for positions with multiple outcomes
     training_examples = []
-    for pos_hash, (node_features, edge_index) in position_data.items():
+    for pos_hash, (hetero_data, move_to_action_indices) in position_data.items():
         targets = position_targets[pos_hash]
         avg_target = sum(targets) / len(targets)
-        training_examples.append((node_features, edge_index, avg_target))
+        # Store HeteroData + move_to_action_indices + target
+        training_examples.append((hetero_data, move_to_action_indices, avg_target))
 
     return training_examples
 

@@ -30,6 +30,7 @@ from league import (
 )
 from model import create_model
 from model_policy import create_policy_model
+from model_policy_hetero import create_policy_model as create_policy_model_hetero
 from self_play import SelfPlayGame, prepare_training_data
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
@@ -41,7 +42,7 @@ def create_model_by_type(model_type, model_config):
     Create model based on type selection.
 
     Args:
-        model_type: "value" or "policy"
+        model_type: "value", "policy", or "policy_hetero"
         model_config: Model configuration dict
 
     Returns:
@@ -49,6 +50,8 @@ def create_model_by_type(model_type, model_config):
     """
     if model_type == "policy":
         return create_policy_model(model_config)
+    elif model_type == "policy_hetero":
+        return create_policy_model_hetero(model_config)
     else:
         return create_model(model_config)
 
@@ -58,8 +61,8 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
     Train model for one epoch using standard supervised learning on game outcomes.
 
     Args:
-        model: GNN model
-        training_data: List of (node_features, edge_index, target_value)
+        model: GNN model (can be heterogeneous policy model)
+        training_data: List of (hetero_data, move_to_action_indices, target_value) for heterogeneous models
         optimizer: Optimizer
         batch_size: Batch size
         device: Device
@@ -67,56 +70,97 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
     Returns:
         Average loss
     """
+    from hetero_graph_utils import prepare_model_inputs
+    from torch_geometric.data import HeteroData
+
     model.train()
     total_loss = 0
     num_batches = 0
 
-    # Prepare data
-    data_list = []
-    for node_features, edge_index, target in training_data:
-        if len(node_features) == 0:
-            continue
+    # Check if this is a heterogeneous model
+    is_hetero = hasattr(model, "node_embedding")
 
-        x = torch.tensor(node_features, dtype=torch.float32)
-        edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
+    if is_hetero:
+        # Handle heterogeneous data - process one at a time (batching hetero graphs is complex)
+        for hetero_data, move_to_action_indices, target in tqdm(
+            training_data, desc="Training", leave=False, unit="sample"
+        ):
+            if not isinstance(hetero_data, HeteroData):
+                continue
 
-        data = Data(x=x, edge_index=edge_index_tensor)
-        data.y = torch.tensor([target], dtype=torch.float32)
-        data_list.append(data)
+            # Move to device
+            hetero_data = hetero_data.to(device)
+            move_to_action_indices = move_to_action_indices.to(device)
 
-    if len(data_list) == 0:
-        return 0.0
+            # Prepare inputs
+            x_dict, edge_index_dict, edge_attr_dict, _ = prepare_model_inputs(
+                hetero_data, move_to_action_indices
+            )
 
-    loader = DataLoader(data_list, batch_size=batch_size, shuffle=True)
+            optimizer.zero_grad()
 
-    for batch in tqdm(loader, desc="Training batches", leave=False, unit="batch"):
-        batch = batch.to(device)
-        optimizer.zero_grad()
+            # Forward pass - heterogeneous policy model
+            _, value = model(
+                x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices
+            )
 
-        # Forward pass - handle both model types
-        output1, output2 = model(batch.x, batch.edge_index, batch.batch)
+            prediction = value.squeeze()
+            target_tensor = torch.tensor([target], dtype=torch.float32, device=device)
 
-        # Value model returns (value, node_embeddings)
-        # Policy model returns (policy_logits, value)
-        # Check output shapes to determine which is the value
-        if output1.shape[-1] == 1 or output1.dim() == 1:
-            # output1 is value (shape [batch_size, 1] or [batch_size])
-            predictions = output1.squeeze()
-        else:
-            # output2 is value (policy model case)
-            predictions = output2.squeeze()
+            # MSE loss
+            loss = F.mse_loss(prediction, target_tensor)
 
-        targets = batch.y
+            # Backward pass
+            loss.backward()
+            optimizer.step()
 
-        # MSE loss
-        loss = F.mse_loss(predictions, targets)
+            total_loss += loss.item()
+            num_batches += 1
+    else:
+        # Handle homogeneous data (old format - shouldn't be used anymore)
+        data_list = []
+        for item in training_data:
+            if len(item) == 3:
+                node_features, edge_index, target = item
+                if len(node_features) == 0:
+                    continue
 
-        # Backward pass
-        loss.backward()
-        optimizer.step()
+                x = torch.tensor(node_features, dtype=torch.float32)
+                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
 
-        total_loss += loss.item()
-        num_batches += 1
+                data = Data(x=x, edge_index=edge_index_tensor)
+                data.y = torch.tensor([target], dtype=torch.float32)
+                data_list.append(data)
+
+        if len(data_list) == 0:
+            return 0.0
+
+        loader = DataLoader(data_list, batch_size=batch_size, shuffle=True)
+
+        for batch in tqdm(loader, desc="Training batches", leave=False, unit="batch"):
+            batch = batch.to(device)
+            optimizer.zero_grad()
+
+            # Forward pass
+            output1, output2 = model(batch.x, batch.edge_index, batch.batch)
+
+            # Check output shapes to determine which is the value
+            if output1.shape[-1] == 1 or output1.dim() == 1:
+                predictions = output1.squeeze()
+            else:
+                predictions = output2.squeeze()
+
+            targets = batch.y
+
+            # MSE loss
+            loss = F.mse_loss(predictions, targets)
+
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            num_batches += 1
 
     return total_loss / max(num_batches, 1)
 

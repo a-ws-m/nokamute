@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from league import ExploiterAgent, LeagueConfig, LeagueManager, LeagueTracker
 from league.exploiter import prepare_exploiter_training_data
-from model import create_model
+from model_policy_hetero import create_policy_model
 
 
 def test_league_initialization():
@@ -36,9 +36,9 @@ def test_league_initialization():
     manager = LeagueManager(config, "test_league")
     tracker = LeagueTracker("test_league/logs")
 
-    # Create initial Main Agent
-    model_config = {"hidden_dim": 32, "num_layers": 2}
-    model = create_model(model_config)
+    # Create initial Main Agent with heterogeneous policy model
+    model_config = {"hidden_dim": 32, "num_layers": 2, "model_type": "policy_hetero"}
+    model = create_policy_model(model_config)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     agent = manager.initialize_main_agent(model, optimizer, model_config)
@@ -60,8 +60,8 @@ def test_exploiter_spawning(manager, config):
     print("TEST 2: Exploiter Spawning")
     print("=" * 60)
 
-    model_config = {"hidden_dim": 32, "num_layers": 2}
-    model = create_model(model_config)
+    model_config = {"hidden_dim": 32, "num_layers": 2, "model_type": "policy_hetero"}
+    model = create_policy_model(model_config)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     exploiter = manager.spawn_main_exploiter(model, optimizer, model_config)
@@ -95,8 +95,8 @@ def test_minimax_reward():
         board.apply(moves[0])
 
     # Create opponent model
-    model_config = {"hidden_dim": 32, "num_layers": 2}
-    opponent_model = create_model(model_config)
+    model_config = {"hidden_dim": 32, "num_layers": 2, "model_type": "policy_hetero"}
+    opponent_model = create_policy_model(model_config)
     opponent_model.eval()
 
     # Apply another move and compute minimax reward
@@ -128,10 +128,10 @@ def test_exploiter_game_generation():
     print("TEST 4: Exploiter Game Generation")
     print("=" * 60)
 
-    model_config = {"hidden_dim": 32, "num_layers": 2}
+    model_config = {"hidden_dim": 32, "num_layers": 2, "model_type": "policy_hetero"}
 
-    exploiter_model = create_model(model_config)
-    opponent_model = create_model(model_config)
+    exploiter_model = create_policy_model(model_config)
+    opponent_model = create_policy_model(model_config)
 
     exploiter_agent = ExploiterAgent(
         model=exploiter_model,
@@ -186,15 +186,15 @@ def test_pfsp_sampling():
     manager = LeagueManager(config, "test_league_pfsp")
 
     # Create Main Agent and a few historical versions
-    model_config = {"hidden_dim": 32, "num_layers": 2}
-    model = create_model(model_config)
+    model_config = {"hidden_dim": 32, "num_layers": 2, "model_type": "policy_hetero"}
+    model = create_policy_model(model_config)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     agent = manager.initialize_main_agent(model, optimizer, model_config)
 
     # Add a couple more versions
     for i in range(2):
-        model = create_model(model_config)
+        model = create_policy_model(model_config)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         manager.update_main_agent(model, optimizer, model_config)
 
