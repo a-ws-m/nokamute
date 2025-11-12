@@ -71,10 +71,16 @@ def main():
     from train_league import train_epoch_standard
 
     for epoch in range(2):
-        loss = train_epoch_standard(
+        result = train_epoch_standard(
             model, training_data, optimizer, batch_size=32, device=config.device
         )
-        print(f"   Epoch {epoch+1}: loss = {loss:.4f}")
+        if isinstance(result, tuple):
+            loss_total, loss_td, loss_pv = result
+            print(
+                f"   Epoch {epoch+1}: total={loss_total:.4f}, TD={loss_td:.4f}, PV={loss_pv:.4f}"
+            )
+        else:
+            print(f"   Epoch {epoch+1}: loss={result:.4f}")
 
     print("\n5. Spawning Main Exploiter...")
     exploiter_model = create_policy_model(model_config)

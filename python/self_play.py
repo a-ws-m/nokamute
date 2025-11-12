@@ -312,6 +312,7 @@ class SelfPlayGame:
                         edge_attr_dict,
                         move_indices,
                         temperature=self.temperature,
+                        current_player=current_player,  # Pass current player for proper value conversion
                     )
             else:
                 probs = self.model.predict_action_probs(
@@ -320,6 +321,7 @@ class SelfPlayGame:
                     edge_attr_dict,
                     move_indices,
                     temperature=self.temperature,
+                    current_player=current_player,  # Pass current player for proper value conversion
                 )
 
             probs = probs.squeeze(0)  # Remove batch dimension
@@ -697,6 +699,9 @@ class SelfPlayGame:
             hetero_data, move_to_action_indices = board_to_hetero_data(graph_dict)
             pos_hash = self._get_board_state_key(board)
 
+            # Get UHP move strings from graph_dict
+            uhp_move_strings = graph_dict["move_to_action"]
+
             # Select move and get probabilities and value
             if self.enable_branching:
                 selected_move, move_probs, move_value = self.select_move(
@@ -731,6 +736,14 @@ class SelfPlayGame:
                         )
 
                 # Store with move value for TD learning (using HeteroData + move_to_action_indices)
+                # Also store UHP move string for action space mapping
+                selected_move_idx = legal_moves.index(selected_move)
+                selected_move_uhp = (
+                    uhp_move_strings[selected_move_idx]
+                    if selected_move_idx < len(uhp_move_strings)
+                    else ""
+                )
+
                 game_data.append(
                     (
                         hetero_data,
@@ -740,6 +753,7 @@ class SelfPlayGame:
                         current_player,
                         pos_hash,
                         move_value,
+                        selected_move_uhp,  # Add UHP string
                     )
                 )
             else:
@@ -748,6 +762,13 @@ class SelfPlayGame:
                     selected_move, move_value = self.select_move(
                         board, legal_moves, return_value=True
                     )
+                    selected_move_idx = legal_moves.index(selected_move)
+                    selected_move_uhp = (
+                        uhp_move_strings[selected_move_idx]
+                        if selected_move_idx < len(uhp_move_strings)
+                        else ""
+                    )
+
                     game_data.append(
                         (
                             hetero_data,
@@ -757,10 +778,17 @@ class SelfPlayGame:
                             current_player,
                             pos_hash,
                             move_value,
+                            selected_move_uhp,
                         )
                     )
                 else:
                     selected_move = self.select_move(board, legal_moves)
+                    selected_move_idx = legal_moves.index(selected_move)
+                    selected_move_uhp = (
+                        uhp_move_strings[selected_move_idx]
+                        if selected_move_idx < len(uhp_move_strings)
+                        else ""
+                    )
                     # No model, so no value - use 0.0 as placeholder
                     game_data.append(
                         (
@@ -771,6 +799,7 @@ class SelfPlayGame:
                             current_player,
                             pos_hash,
                             0.0,
+                            selected_move_uhp,
                         )
                     )
 
@@ -932,26 +961,46 @@ def prepare_training_data(games):
     Handles multiple results for the same position by averaging the target values.
     This can occur when branching from the same position leads to different outcomes.
 
+    Now also includes transition information for policy-value consistency training:
+    For each position, we store the selected action and the next state's graph.
+
     Args:
         games: List of (game_data, result, branch_id) tuples from self-play
               Each game_data contains (hetero_data, move_to_action_indices, legal_moves, selected_move, player, pos_hash, move_value)
 
     Returns:
-        training_examples: List of (hetero_data, move_to_action_indices, target_value)
+        training_examples: List of (hetero_data, move_to_action_indices, target_value, selected_action_idx, next_hetero_data, next_move_to_action_indices)
+                          where selected_action_idx is the action taken, and next_* are the resulting state
+                          (next_* are None for terminal positions)
     """
+    from action_space import string_to_action
     from hetero_graph_utils import board_to_hetero_data
 
-    # First pass: collect all (position_hash, target_value) pairs
+    # First pass: collect all (position_hash, target_value) pairs and transitions
     position_targets = {}  # pos_hash -> list of target values
-    position_data = {}  # pos_hash -> HeteroData
+    position_data = (
+        {}
+    )  # pos_hash -> (HeteroData, move_to_action_indices, selected_action_idx, next_state_tuple)
 
     for game_data, final_result, branch_id in tqdm(
         games, desc="Preparing training data", unit="game"
     ):
         # Assign values to each position based on final result
-        for item in game_data:
-            # Format: (hetero_data, move_to_action_indices, legal_moves, selected_move, player, pos_hash, move_value)
-            if len(item) == 7:
+        for idx, item in enumerate(game_data):
+            # Format: (hetero_data, move_to_action_indices, legal_moves, selected_move, player, pos_hash, move_value, uhp_move_string)
+            if len(item) == 8:
+                (
+                    hetero_data,
+                    move_to_action_indices,
+                    legal_moves,
+                    selected_move,
+                    player,
+                    pos_hash,
+                    move_value,
+                    uhp_move_string,
+                ) = item
+            elif len(item) == 7:
+                # Old format without UHP string
                 (
                     hetero_data,
                     move_to_action_indices,
@@ -961,13 +1010,35 @@ def prepare_training_data(games):
                     pos_hash,
                     move_value,
                 ) = item
+                uhp_move_string = ""
             else:
                 # Unknown format - skip
                 continue
 
+            # Get selected action index from UHP string
+            selected_action_idx = (
+                string_to_action(uhp_move_string) if uhp_move_string else -1
+            )
+
+            # Get next state (if not terminal)
+            next_state_tuple = None
+            if idx + 1 < len(game_data):
+                next_item = game_data[idx + 1]
+                if len(next_item) >= 7:  # Handle both old (7) and new (8) formats
+                    next_hetero_data, next_move_to_action_indices = (
+                        next_item[0],
+                        next_item[1],
+                    )
+                    next_state_tuple = (next_hetero_data, next_move_to_action_indices)
+
             # Store HeteroData and move_to_action_indices (once per unique position)
             if pos_hash not in position_data:
-                position_data[pos_hash] = (hetero_data, move_to_action_indices)
+                position_data[pos_hash] = (
+                    hetero_data,
+                    move_to_action_indices,
+                    selected_action_idx,
+                    next_state_tuple,
+                )
 
             # Use absolute result (no player-based flipping)
             # final_result is already absolute: White win = +1, Black win = -1, Draw = 0
@@ -980,11 +1051,32 @@ def prepare_training_data(games):
 
     # Second pass: average targets for positions with multiple outcomes
     training_examples = []
-    for pos_hash, (hetero_data, move_to_action_indices) in position_data.items():
+    for pos_hash, (
+        hetero_data,
+        move_to_action_indices,
+        selected_action_idx,
+        next_state_tuple,
+    ) in position_data.items():
         targets = position_targets[pos_hash]
         avg_target = sum(targets) / len(targets)
-        # Store HeteroData + move_to_action_indices + target
-        training_examples.append((hetero_data, move_to_action_indices, avg_target))
+
+        # Unpack next state tuple
+        if next_state_tuple is not None:
+            next_hetero_data, next_move_to_action_indices = next_state_tuple
+        else:
+            next_hetero_data, next_move_to_action_indices = None, None
+
+        # Store HeteroData + move_to_action_indices + target + action + next_state
+        training_examples.append(
+            (
+                hetero_data,
+                move_to_action_indices,
+                avg_target,
+                selected_action_idx,
+                next_hetero_data,
+                next_move_to_action_indices,
+            )
+        )
 
     return training_examples
 

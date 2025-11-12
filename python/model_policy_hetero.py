@@ -18,19 +18,21 @@ from torch_geometric.nn import GATv2Conv, HeteroConv, Linear
 
 class HiveGNNPolicyHetero(nn.Module):
     """
-    Heterogeneous Graph Neural Network for Hive with fixed action space and policy head.
+    Heterogeneous Graph Neural Network for Hive with separate policy and value networks.
 
     Architecture:
     - Input: Heterogeneous graph with 3 node types and 2 edge types
     - Multiple GAT layers for message passing on neighbour edges
     - Move edge features are updated through the layers
-    - Policy head: reads move edge features to generate action logits
-    - Value head: pools graph to predict position evaluation
+    - Policy head: reads move edge features to generate action logits (ONE logit per legal move)
+    - Value head: pools entire graph to predict position evaluation (scalar output)
 
     Output:
     - Policy logits: [batch_size, num_actions] unnormalized logits for each action
-    - Value: [batch_size, 1] position evaluation on absolute scale
+                     OR [num_legal_moves] for single position
+    - Value: [batch_size, 1] position evaluation on ABSOLUTE scale
             (+1 = White winning, -1 = Black winning, 0 = neutral)
+            Value is always from White's perspective, regardless of current player
     """
 
     def __init__(
@@ -156,7 +158,7 @@ class HiveGNNPolicyHetero(nn.Module):
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices):
         """
-        Forward pass.
+        Forward pass through both policy and value networks.
 
         Args:
             x_dict: Dictionary of node features for each node type
@@ -171,10 +173,12 @@ class HiveGNNPolicyHetero(nn.Module):
                     [num_legal_moves] where each entry is the action space index
 
         Returns:
-            policy_logits: Action logits [1, num_actions]
+            policy_logits: Action logits [1, num_actions] or [batch_size, num_actions]
                           Legal actions have computed logits, others have -inf
-            value: Position evaluation in [-1, 1] on ABSOLUTE scale
+            value: Position evaluation in [-1, 1] on ABSOLUTE scale (White's perspective)
+                   [1, 1] or [batch_size, 1]
                    +1 = White winning, -1 = Black winning, 0 = neutral
+                   IMPORTANT: Always from White's perspective, not relative to current player
         """
         # Initial embedding for each node type
         x_dict_embedded = {}
@@ -231,9 +235,11 @@ class HiveGNNPolicyHetero(nn.Module):
             # Check the original input x_dict for batch information
             if hasattr(x_dict[node_type], "batch"):
                 batch_dict[node_type] = x_dict[node_type].batch
-                batch_size_detected = max(
-                    batch_size_detected, int(batch_dict[node_type].max().item()) + 1
-                )
+                # Only compute max if there are nodes of this type
+                if x_dict[node_type].batch.numel() > 0:
+                    batch_size_detected = max(
+                        batch_size_detected, int(batch_dict[node_type].max().item()) + 1
+                    )
 
         is_batched = batch_size_detected > 1
 
@@ -426,13 +432,19 @@ class HiveGNNPolicyHetero(nn.Module):
         edge_attr_dict,
         move_to_action_indices,
         temperature=1.0,
+        current_player=None,
     ):
         """
         Predict action probabilities with temperature scaling.
 
+        IMPORTANT: Policy logits represent the VALUE of resulting positions on an absolute scale.
+        For move selection, we need to convert to player-relative utilities before applying softmax.
+
         Args:
             x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices: Same as forward()
             temperature: Temperature for softmax (higher = more uniform)
+            current_player: "White" or "Black" - needed to convert absolute values to relative utilities.
+                          If None, assumes policy logits are already appropriate for softmax.
 
         Returns:
             probs: Action probabilities [1, num_actions]
@@ -441,6 +453,19 @@ class HiveGNNPolicyHetero(nn.Module):
         policy_logits, _ = self.forward(
             x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices
         )
+
+        # Convert absolute values to player-relative utilities
+        # Policy logits represent V(s') on absolute scale (+1 = White winning)
+        # For move selection:
+        #   - White wants to maximize value (keep as-is)
+        #   - Black wants to minimize value (negate)
+        if current_player == "Black":
+            # Black wants negative values, so negate the logits
+            # But preserve -inf for illegal moves (they become inf, which we need to restore to -inf)
+            illegal_mask = torch.isinf(policy_logits) & (policy_logits < 0)
+            policy_logits = -policy_logits
+            policy_logits[illegal_mask] = float("-inf")
+        # If current_player is "White" or None, use logits as-is
 
         # Apply temperature
         if temperature != 1.0:
@@ -455,7 +480,10 @@ class HiveGNNPolicyHetero(nn.Module):
         self, x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices
     ):
         """
-        Predict only the position value.
+        Predict only the position value (on ABSOLUTE scale from White's perspective).
+
+        Returns:
+            value: [batch_size, 1] where +1 = White winning, -1 = Black winning, 0 = neutral
         """
         _, value = self.forward(
             x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices
