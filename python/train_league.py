@@ -116,9 +116,12 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
                 if not isinstance(hetero_data, HeteroData):
                     continue
 
-                # Attach metadata for batching
+                # Ensure hetero_data is on CPU (in case it was moved to device in previous epoch)
+                hetero_data = hetero_data.cpu()
+
+                # Attach metadata for batching (ensure all on CPU for PyG DataLoader)
                 hetero_data.y = torch.tensor([target], dtype=torch.float32)
-                hetero_data.move_to_action_indices = move_to_action_indices
+                hetero_data.move_to_action_indices = move_to_action_indices.cpu()
                 hetero_data.selected_action_idx = torch.tensor(
                     [selected_action_idx], dtype=torch.long
                 )
@@ -129,6 +132,9 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
                 data_list.append(hetero_data)
 
                 # Store next state info (keep original index for alignment)
+                # Ensure next state is also on CPU if it exists
+                if next_hetero_data is not None:
+                    next_hetero_data = next_hetero_data.cpu()
                 next_state_list.append((next_hetero_data, next_move_to_action_indices))
 
             elif len(item) == 3:
@@ -137,8 +143,11 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
                 if not isinstance(hetero_data, HeteroData):
                     continue
 
+                # Ensure hetero_data is on CPU
+                hetero_data = hetero_data.cpu()
+
                 hetero_data.y = torch.tensor([target], dtype=torch.float32)
-                hetero_data.move_to_action_indices = move_to_action_indices
+                hetero_data.move_to_action_indices = move_to_action_indices.cpu()
                 hetero_data.has_next_state = torch.tensor([False], dtype=torch.bool)
                 hetero_data.selected_action_idx = torch.tensor(
                     [-1], dtype=torch.long
@@ -158,6 +167,9 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
         batch_idx = 0
         for batch in tqdm(loader, desc="Training batches", leave=False, unit="batch"):
             batch = batch.to(device)
+            # Explicitly move custom tensor attributes
+            if hasattr(batch, "move_to_action_indices"):
+                batch.move_to_action_indices = batch.move_to_action_indices.to(device)
             batch_size_actual = batch.y.shape[0]
 
             optimizer.zero_grad()
@@ -242,7 +254,8 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
                         action_idx = action_indices_in_batch[idx]
 
                         # Individual forward pass to get proper action space mapping
-                        current_data_single = current_data.to(device)
+                        # Clone to avoid modifying original data in data_list
+                        current_data_single = current_data.clone().to(device)
                         (
                             x_dict_curr,
                             edge_index_dict_curr,
@@ -724,9 +737,9 @@ def main():
     )
 
     # Model architecture
-    parser.add_argument("--hidden-dim", type=int, default=128, help="Hidden dimension")
+    parser.add_argument("--hidden-dim", type=int, default=32, help="Hidden dimension")
     parser.add_argument(
-        "--num-layers", type=int, default=4, help="Number of GNN layers"
+        "--num-layers", type=int, default=3, help="Number of GNN layers"
     )
 
     # Paths
