@@ -1038,6 +1038,7 @@ def prepare_training_data(games):
                     move_to_action_indices,
                     selected_action_idx,
                     next_state_tuple,
+                    player,  # Store current player (White=0, Black=1)
                 )
 
             # Use absolute result (no player-based flipping)
@@ -1056,6 +1057,7 @@ def prepare_training_data(games):
         move_to_action_indices,
         selected_action_idx,
         next_state_tuple,
+        player,
     ) in position_data.items():
         targets = position_targets[pos_hash]
         avg_target = sum(targets) / len(targets)
@@ -1066,7 +1068,7 @@ def prepare_training_data(games):
         else:
             next_hetero_data, next_move_to_action_indices = None, None
 
-        # Store HeteroData + move_to_action_indices + target + action + next_state
+        # Store HeteroData + move_to_action_indices + target + action + next_state + player
         training_examples.append(
             (
                 hetero_data,
@@ -1075,6 +1077,7 @@ def prepare_training_data(games):
                 selected_action_idx,
                 next_hetero_data,
                 next_move_to_action_indices,
+                player,
             )
         )
 

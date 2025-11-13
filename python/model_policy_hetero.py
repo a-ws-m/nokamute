@@ -164,11 +164,11 @@ class HiveGNNPolicyHetero(nn.Module):
                     [num_legal_moves] where each entry is the action space index
 
         Returns:
-            policy_logits: Action values [1, num_actions] or [batch_size, num_actions]
-                          Legal actions have computed values in [-1, 1], others have -inf
-            value: Position evaluation in [-1, 1] = max(action_values)
-                   [1, 1] or [batch_size, 1]
-                   Represents the value of the best available move
+            policy_logits: Action values [1, num_actions] in ABSOLUTE scale
+                          +1 = White winning, -1 = Black winning, -inf for illegal actions
+                          NOTE: For move selection, convert to player-relative before softmax!
+            white_value: Best value for White (max of action values) [1, 1] or [batch_size, 1]
+            black_value: Best value for Black (min of action values) [1, 1] or [batch_size, 1]
         """
         # Initial embedding for each node type
         x_dict_embedded = {}
@@ -353,16 +353,24 @@ class HiveGNNPolicyHetero(nn.Module):
             # Single graph - add batch dimension
             action_logits = action_values.unsqueeze(0)  # [1, num_actions]
 
-            # Compute value as max of action values (best available move)
-            # Only consider legal moves (those with finite values)
+            # Compute value assuming optimal play
+            # Action values are absolute: +1 = White winning, -1 = Black winning
+            # White wants to maximize (pick best move) -> white_value = max
+            # Black wants to minimize (pick best move) -> black_value = min
+
             legal_mask = torch.isfinite(action_values)
             if legal_mask.any():
-                value = (
-                    action_values[legal_mask].max().unsqueeze(0).unsqueeze(0)
-                )  # [1, 1]
+                legal_values = action_values[legal_mask]
+
+                # White value: best outcome for White (maximum)
+                white_value = legal_values.max().unsqueeze(0).unsqueeze(0)  # [1, 1]
+
+                # Black value: best outcome for Black (minimum)
+                black_value = legal_values.min().unsqueeze(0).unsqueeze(0)  # [1, 1]
             else:
                 # No legal moves - neutral value
-                value = torch.zeros(1, 1, device=device, dtype=dtype)
+                white_value = torch.zeros(1, 1, device=device, dtype=dtype)
+                black_value = torch.zeros(1, 1, device=device, dtype=dtype)
         else:
             # Batched graphs - need to compute per-graph values
             # The key insight: move edges have a batch assignment we can use
@@ -401,31 +409,46 @@ class HiveGNNPolicyHetero(nn.Module):
                     # Concatenate batch assignments for all move edges
                     all_move_batch = torch.cat(move_edge_batch)  # [num_move_edges]
 
-                    # Compute max action value per graph
+                    # Compute white_value (max) and black_value (min) per graph
+                    # Action values are absolute: +1 = White winning, -1 = Black winning
                     from torch_geometric.utils import scatter
 
-                    value = scatter(
-                        masked_values.unsqueeze(-1),  # [num_moves, 1]
-                        all_move_batch,  # [num_moves]
+                    white_value = scatter(
+                        masked_values.unsqueeze(-1),
+                        all_move_batch,
                         dim=0,
                         reduce="max",
                         dim_size=batch_size,
                     )  # [batch_size, 1]
+
+                    black_value = scatter(
+                        masked_values.unsqueeze(-1),
+                        all_move_batch,
+                        dim=0,
+                        reduce="min",
+                        dim_size=batch_size,
+                    )  # [batch_size, 1]
                 else:
                     # No move edges - return zeros (should not happen in valid positions)
-                    value = torch.zeros(
+                    white_value = torch.zeros(
+                        batch_size, 1, device=device, dtype=dtype, requires_grad=True
+                    )
+                    black_value = torch.zeros(
                         batch_size, 1, device=device, dtype=dtype, requires_grad=True
                     )
             else:
                 # No legal moves at all
-                value = torch.zeros(
+                white_value = torch.zeros(
+                    batch_size, 1, device=device, dtype=dtype, requires_grad=True
+                )
+                black_value = torch.zeros(
                     batch_size, 1, device=device, dtype=dtype, requires_grad=True
                 )
 
             # For batched training, action_logits is not used (return placeholder)
             action_logits = action_values.unsqueeze(0)  # [1, num_actions]
 
-        return action_logits, value
+        return action_logits, white_value, black_value
 
     def predict_action_probs(
         self,
@@ -439,21 +462,34 @@ class HiveGNNPolicyHetero(nn.Module):
         """
         Predict action probabilities with temperature scaling.
 
-        Action values are in [-1, 1] and represent the value of each move.
-        We apply softmax to convert these to probabilities.
+        Action values from the model are on an ABSOLUTE scale (+1 = White winning, -1 = Black winning).
+        For move selection, we need to convert to player-relative utilities:
+        - White wants to maximize absolute value (keep as-is)
+        - Black wants to minimize absolute value (negate before softmax)
 
         Args:
             x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices: Same as forward()
             temperature: Temperature for softmax (higher = more uniform)
-            current_player: Unused (kept for API compatibility)
+            current_player: "White" or "Black" - needed to convert absolute values to utilities
 
         Returns:
             probs: Action probabilities [1, num_actions]
                    Sums to 1 over legal actions, 0 for illegal actions
         """
-        action_values, _ = self.forward(
+        action_values, _, _ = self.forward(
             x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices
         )
+
+        # Convert absolute action values to player-relative utilities
+        # Action values are on absolute scale: +1 = White winning, -1 = Black winning
+        # For move selection:
+        #   White wants to maximize (keep as-is)
+        #   Black wants to minimize (negate)
+        if current_player == "Black":
+            # Negate for Black player, but preserve -inf for illegal moves
+            illegal_mask = torch.isinf(action_values) & (action_values < 0)
+            action_values = -action_values
+            action_values[illegal_mask] = float("-inf")
 
         # Apply temperature
         if temperature != 1.0:
@@ -465,18 +501,33 @@ class HiveGNNPolicyHetero(nn.Module):
         return probs
 
     def predict_value(
-        self, x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices
+        self,
+        x_dict,
+        edge_index_dict,
+        edge_attr_dict,
+        move_to_action_indices,
+        current_player=None,
     ):
         """
-        Predict only the position value (on ABSOLUTE scale from White's perspective).
+        Predict position value from current player's perspective.
+
+        Args:
+            current_player: "White" or "Black" - if None, returns white_value
 
         Returns:
-            value: [batch_size, 1] where +1 = White winning, -1 = Black winning, 0 = neutral
+            value: [batch_size, 1] - best achievable value for current player on ABSOLUTE scale
+                   Returns white_value (max) if current_player="White"
+                   Returns black_value (min) if current_player="Black"
         """
-        _, value = self.forward(
+        _, white_value, black_value = self.forward(
             x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices
         )
-        return value
+
+        if current_player == "Black":
+            return black_value
+        else:
+            # Default to White or when current_player is None
+            return white_value
 
     def select_action(
         self,

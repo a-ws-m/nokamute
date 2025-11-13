@@ -93,68 +93,50 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
         from torch_geometric.loader import DataLoader as PyGDataLoader
 
         # Prepare data list for batching
-        # New format includes transitions: (hetero_data, move_to_action_indices, target, action_idx, next_data, next_indices)
+        # Format: (hetero_data, move_to_action_indices, target, action_idx, next_data, next_indices, player)
         data_list = []
-        next_state_list = (
-            []
-        )  # Store next states separately for policy-value consistency
+        next_state_list = []
 
         for item in training_data:
-            if len(item) == 6:
-                # New format with transitions
-                (
-                    hetero_data,
-                    move_to_action_indices,
-                    target,
-                    selected_action_idx,
-                    next_hetero_data,
-                    next_move_to_action_indices,
-                ) = item
-                if not isinstance(hetero_data, HeteroData):
-                    continue
+            (
+                hetero_data,
+                move_to_action_indices,
+                target,
+                selected_action_idx,
+                next_hetero_data,
+                next_move_to_action_indices,
+                current_player,
+            ) = item
 
-                # Ensure hetero_data is on CPU (in case it was moved to device in previous epoch)
-                hetero_data = hetero_data.cpu()
+            if not isinstance(hetero_data, HeteroData):
+                continue
 
-                # Attach metadata for batching (ensure all on CPU for PyG DataLoader)
-                hetero_data.y = torch.tensor([target], dtype=torch.float32)
-                hetero_data.move_to_action_indices = move_to_action_indices.cpu()
-                hetero_data.selected_action_idx = torch.tensor(
-                    [selected_action_idx], dtype=torch.long
-                )
-                hetero_data.has_next_state = torch.tensor(
-                    [next_hetero_data is not None], dtype=torch.bool
-                )
+            # Ensure hetero_data is on CPU (in case it was moved to device in previous epoch)
+            hetero_data = hetero_data.cpu()
 
-                data_list.append(hetero_data)
+            # Attach metadata for batching (ensure all on CPU for PyG DataLoader)
+            hetero_data.y = torch.tensor([target], dtype=torch.float32)
+            hetero_data.move_to_action_indices = move_to_action_indices.cpu()
+            hetero_data.selected_action_idx = torch.tensor(
+                [selected_action_idx], dtype=torch.long
+            )
+            hetero_data.has_next_state = torch.tensor(
+                [next_hetero_data is not None], dtype=torch.bool
+            )
+            # current_player is Color enum: convert to int (White=0, Black=1)
+            player_int = 0 if current_player.name == "White" else 1
+            hetero_data.current_player = torch.tensor([player_int], dtype=torch.long)
 
-                # Store next state info (keep original index for alignment)
-                # Ensure next state is also on CPU if it exists
-                if next_hetero_data is not None:
-                    next_hetero_data = next_hetero_data.cpu()
-                next_state_list.append((next_hetero_data, next_move_to_action_indices))
+            data_list.append(hetero_data)
 
-            elif len(item) == 3:
-                # Old format without transitions (backward compatibility) - TD loss only
-                hetero_data, move_to_action_indices, target = item
-                if not isinstance(hetero_data, HeteroData):
-                    continue
-
-                # Ensure hetero_data is on CPU
-                hetero_data = hetero_data.cpu()
-
-                hetero_data.y = torch.tensor([target], dtype=torch.float32)
-                hetero_data.move_to_action_indices = move_to_action_indices.cpu()
-                hetero_data.has_next_state = torch.tensor([False], dtype=torch.bool)
-                hetero_data.selected_action_idx = torch.tensor(
-                    [-1], dtype=torch.long
-                )  # Invalid
-
-                data_list.append(hetero_data)
-                next_state_list.append((None, None))
+            # Store next state info (keep original index for alignment)
+            # Ensure next state is also on CPU if it exists
+            if next_hetero_data is not None:
+                next_hetero_data = next_hetero_data.cpu()
+            next_state_list.append((next_hetero_data, next_move_to_action_indices))
 
         if len(data_list) == 0:
-            return 0.0, 0.0, 0.0
+            return 0.0
 
         # Create DataLoader for batching heterogeneous graphs
         loader = PyGDataLoader(
@@ -178,12 +160,20 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
 
             # Forward pass - heterogeneous policy model
             # For batched training, action_logits is a placeholder (not used)
-            _, value_current = model(
+            _, white_value, black_value = model(
                 x_dict, edge_index_dict, edge_attr_dict, batch.move_to_action_indices
             )
 
-            # value shape: [batch_size, 1]
-            predictions = value_current.squeeze()
+            # Select appropriate value based on current player
+            # current_player: 0=White, 1=Black
+            # White uses white_value (max), Black uses black_value (min)
+            value_current = torch.where(
+                batch.current_player == 0,
+                white_value.squeeze(-1),
+                black_value.squeeze(-1),
+            )  # [batch_size]
+
+            predictions = value_current
             targets = batch.y.squeeze()
 
             # TD Loss (value network supervised by game outcome)
@@ -248,8 +238,7 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
             num_batches += 1
 
     avg_loss = total_loss / max(num_batches, 1)
-    # For backward compatibility, return tuple
-    return avg_loss, avg_loss, 0.0
+    return avg_loss
 
 
 def train_main_agent(
