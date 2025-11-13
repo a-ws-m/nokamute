@@ -80,6 +80,7 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
     from hetero_graph_utils import prepare_model_inputs
     from torch_geometric.data import HeteroData
 
+    model = model.to(device)  # <-- Ensure model is on the correct device
     model.train()
     total_loss = 0
     num_batches = 0
@@ -146,9 +147,37 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
         batch_idx = 0
         for batch in tqdm(loader, desc="Training batches", leave=False, unit="batch"):
             batch = batch.to(device)
+
             # Explicitly move custom tensor attributes
+            def recursive_to(obj, device):
+                if torch.is_tensor(obj):
+                    return obj.to(device)
+                elif isinstance(obj, list):
+                    return [recursive_to(x, device) for x in obj]
+                elif isinstance(obj, dict):
+                    return {k: recursive_to(v, device) for k, v in obj.items()}
+                else:
+                    return obj
+
             if hasattr(batch, "move_to_action_indices"):
-                batch.move_to_action_indices = batch.move_to_action_indices.to(device)
+                batch.move_to_action_indices = recursive_to(
+                    batch.move_to_action_indices, device
+                )
+            if hasattr(batch, "selected_action_idx"):
+                batch.selected_action_idx = batch.selected_action_idx.to(device)
+            if hasattr(batch, "current_player"):
+                batch.current_player = batch.current_player.to(device)
+            if hasattr(batch, "has_next_state"):
+                batch.has_next_state = batch.has_next_state.to(device)
+            # Move all node and edge tensors inside batch to device
+            for node_type in batch.node_types:
+                if hasattr(batch[node_type], "x"):
+                    batch[node_type].x = batch[node_type].x.to(device)
+            for edge_type in batch.edge_types:
+                if hasattr(batch[edge_type], "edge_index"):
+                    batch[edge_type].edge_index = batch[edge_type].edge_index.to(device)
+                if hasattr(batch[edge_type], "edge_attr"):
+                    batch[edge_type].edge_attr = batch[edge_type].edge_attr.to(device)
             batch_size_actual = batch.y.shape[0]
 
             optimizer.zero_grad()
@@ -157,6 +186,11 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
             x_dict, edge_index_dict, edge_attr_dict, _ = prepare_model_inputs(
                 batch, batch.move_to_action_indices
             )
+
+            # Move all x_dict, edge_index_dict, edge_attr_dict to device
+            x_dict = {k: v.to(device) for k, v in x_dict.items()}
+            edge_index_dict = {k: v.to(device) for k, v in edge_index_dict.items()}
+            edge_attr_dict = {k: v.to(device) for k, v in edge_attr_dict.items()}
 
             # Forward pass - heterogeneous policy model
             # For batched training, action_logits is a placeholder (not used)
