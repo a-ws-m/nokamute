@@ -20,6 +20,8 @@ from tqdm import tqdm
 
 import nokamute
 
+PASS_PLACEHOLDER_VALUE = -9999.0
+
 
 @dataclass
 class GameNode:
@@ -697,6 +699,33 @@ class SelfPlayGame:
             # Get UHP move strings from graph_dict
             uhp_move_strings = graph_dict["move_to_action"]
 
+            # Check for pass move
+            if (
+                len(legal_moves) == 1
+                and hasattr(legal_moves[0], "is_pass")
+                and legal_moves[0].is_pass()
+            ):
+                selected_move = legal_moves[0]
+                move_probs = {str(selected_move): 1.0}
+                move_value = PASS_PLACEHOLDER_VALUE
+                selected_move_idx = 0
+                selected_move_uhp = "--"
+                # Store with placeholder value
+                game_data.append(
+                    (
+                        hetero_data,
+                        move_to_action_indices,
+                        legal_moves,
+                        selected_move,
+                        current_player,
+                        pos_hash,
+                        move_value,
+                        selected_move_uhp,
+                    )
+                )
+                board.pass_turn()
+                continue
+
             # Select move and get probabilities and value
 
             # Always select move and compute value for the resulting state, even for random moves
@@ -954,6 +983,17 @@ def prepare_training_data(games):
                 continue
 
             move_values.append(move_value)
+
+        # Replace placeholder values with subsequent move's value
+        for i in range(len(move_values)):
+            if move_values[i] == PASS_PLACEHOLDER_VALUE:
+                # Find next non-placeholder value
+                for j in range(i + 1, len(move_values)):
+                    if move_values[j] != PASS_PLACEHOLDER_VALUE:
+                        move_values[i] = move_values[j]
+                        break
+                else:
+                    move_values[i] = final_result
 
         # For each position, compute TD-lambda target
         T = len(game_data)
