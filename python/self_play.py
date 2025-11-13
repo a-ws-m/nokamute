@@ -698,106 +698,52 @@ class SelfPlayGame:
             uhp_move_strings = graph_dict["move_to_action"]
 
             # Select move and get probabilities and value
-            if self.enable_branching:
-                selected_move, move_probs, move_value = self.select_move(
-                    board, legal_moves, return_probs=True, return_value=True
-                )
 
-                # Track this position in the game tree
+            # Always select move and compute value for the resulting state, even for random moves
+            selected_move, move_probs, move_value = self.select_move(
+                board, legal_moves, return_probs=True, return_value=True
+            )
+
+            # Track this position in the game tree (branching only)
+            if self.enable_branching:
                 current_depth = start_depth + move_num
                 board_key = self._get_board_state_key(board)
-
                 if board_key not in self.game_tree:
                     node = GameNode(board_state=board_key, move_probs=move_probs)
                     self.game_tree[board_key] = node
                 else:
                     node = self.game_tree[board_key]
-                    node.move_probs = move_probs  # Update with latest probabilities
-
+                    node.move_probs = move_probs
                 node.visit_count += 1
-
-                # Record potential branch point if there are multiple viable moves
-                # (probability > threshold indicates a meaningful alternative)
                 branch_threshold = 0.15
                 num_viable_moves = sum(
                     1 for p in move_probs.values() if p > branch_threshold
                 )
                 if num_viable_moves > 1 and current_depth < max_moves // 2:
-                    # Only keep branch points from early/mid game
-                    # Use branch_id if available, otherwise this shouldn't be a branch point
                     if branch_id is not None:
                         self.branch_points.append(
                             (board.clone(), node, current_depth, branch_id)
                         )
 
-                # Store with move value for TD learning (using HeteroData + move_to_action_indices)
-                # Also store UHP move string for action space mapping
-                selected_move_idx = legal_moves.index(selected_move)
-                selected_move_uhp = (
-                    uhp_move_strings[selected_move_idx]
-                    if selected_move_idx < len(uhp_move_strings)
-                    else ""
+            # Store with move value for TD learning (using HeteroData + move_to_action_indices)
+            selected_move_idx = legal_moves.index(selected_move)
+            selected_move_uhp = (
+                uhp_move_strings[selected_move_idx]
+                if selected_move_idx < len(uhp_move_strings)
+                else ""
+            )
+            game_data.append(
+                (
+                    hetero_data,
+                    move_to_action_indices,
+                    legal_moves,
+                    selected_move,
+                    current_player,
+                    pos_hash,
+                    move_value,
+                    selected_move_uhp,
                 )
-
-                game_data.append(
-                    (
-                        hetero_data,
-                        move_to_action_indices,
-                        legal_moves,
-                        selected_move,
-                        current_player,
-                        pos_hash,
-                        move_value,
-                        selected_move_uhp,  # Add UHP string
-                    )
-                )
-            else:
-                # Standard play without branching - also get move value for TD learning
-                if self.model is not None:
-                    selected_move, move_value = self.select_move(
-                        board, legal_moves, return_value=True
-                    )
-                    selected_move_idx = legal_moves.index(selected_move)
-                    selected_move_uhp = (
-                        uhp_move_strings[selected_move_idx]
-                        if selected_move_idx < len(uhp_move_strings)
-                        else ""
-                    )
-
-                    game_data.append(
-                        (
-                            hetero_data,
-                            move_to_action_indices,
-                            legal_moves,
-                            selected_move,
-                            current_player,
-                            pos_hash,
-                            move_value,
-                            selected_move_uhp,
-                        )
-                    )
-                else:
-                    selected_move = self.select_move(board, legal_moves)
-                    selected_move_idx = legal_moves.index(selected_move)
-                    selected_move_uhp = (
-                        uhp_move_strings[selected_move_idx]
-                        if selected_move_idx < len(uhp_move_strings)
-                        else ""
-                    )
-                    # No model, so no value - use 0.0 as placeholder
-                    game_data.append(
-                        (
-                            hetero_data,
-                            move_to_action_indices,
-                            legal_moves,
-                            selected_move,
-                            current_player,
-                            pos_hash,
-                            0.0,
-                            selected_move_uhp,
-                        )
-                    )
-
+            )
             board.apply(selected_move)
 
         # Max moves reached - draw
@@ -971,18 +917,17 @@ def prepare_training_data(games):
     from action_space import string_to_action
     from hetero_graph_utils import board_to_hetero_data
 
-    # First pass: collect all (position_hash, target_value) pairs and transitions
-    position_targets = {}  # pos_hash -> list of target values
-    position_data = (
-        {}
-    )  # pos_hash -> (HeteroData, move_to_action_indices, selected_action_idx, next_state_tuple)
+    # TD-lambda implementation (lambda=0.2)
+    lambda_ = 0.2
+    gamma = 0.99
 
+    training_examples = []
     for game_data, final_result, branch_id in tqdm(
         games, desc="Preparing training data", unit="game"
     ):
-        # Assign values to each position based on final result
+        # Collect all move_values for this trajectory
+        move_values = []
         for idx, item in enumerate(game_data):
-            # Format: (hetero_data, move_to_action_indices, legal_moves, selected_move, player, pos_hash, move_value, uhp_move_string)
             if len(item) == 8:
                 (
                     hetero_data,
@@ -995,7 +940,6 @@ def prepare_training_data(games):
                     uhp_move_string,
                 ) = item
             elif len(item) == 7:
-                # Old format without UHP string
                 (
                     hetero_data,
                     move_to_action_indices,
@@ -1007,74 +951,76 @@ def prepare_training_data(games):
                 ) = item
                 uhp_move_string = ""
             else:
-                # Unknown format - skip
                 continue
 
+            move_values.append(move_value)
+
+        # For each position, compute TD-lambda target
+        T = len(game_data)
+        for t in range(T):
             # Get selected action index from UHP string
+            item = game_data[t]
+            if len(item) == 8:
+                (
+                    hetero_data,
+                    move_to_action_indices,
+                    legal_moves,
+                    selected_move,
+                    player,
+                    pos_hash,
+                    move_value,
+                    uhp_move_string,
+                ) = item
+            elif len(item) == 7:
+                (
+                    hetero_data,
+                    move_to_action_indices,
+                    legal_moves,
+                    selected_move,
+                    player,
+                    pos_hash,
+                    move_value,
+                ) = item
+                uhp_move_string = ""
+            else:
+                continue
+
             selected_action_idx = (
                 string_to_action(uhp_move_string) if uhp_move_string else -1
             )
 
-            # Get next state (if not terminal)
-            next_state_tuple = None
-            if idx + 1 < len(game_data):
-                next_item = game_data[idx + 1]
-                if len(next_item) >= 7:  # Handle both old (7) and new (8) formats
-                    next_hetero_data, next_move_to_action_indices = (
-                        next_item[0],
-                        next_item[1],
-                    )
-                    next_state_tuple = (next_hetero_data, next_move_to_action_indices)
+            # Next state
+            if t + 1 < T:
+                next_item = game_data[t + 1]
+                next_hetero_data = next_item[0]
+                next_move_to_action_indices = next_item[1]
+            else:
+                next_hetero_data, next_move_to_action_indices = None, None
 
-            # Store HeteroData and move_to_action_indices (once per unique position)
-            if pos_hash not in position_data:
-                position_data[pos_hash] = (
+            # Compute TD-lambda target for position t
+            # n-step returns: G_t^{(n)} = sum_{k=0}^{n-1} gamma^k * r_{t+k} + gamma^n * V_{t+n}
+            # Here, r_{t+k} = 0 for all steps except the last, which is final_result
+            # V_{t+n} is move_value at t+n (except for terminal, which is final_result)
+            td_lambda = 0.0
+            for n in range(1, T - t):
+                # n-step return: use move_value at t+n
+                v_tp_n = move_values[t + n] if (t + n) < T else final_result
+                g_n = (gamma**n) * v_tp_n
+                td_lambda += (1 - lambda_) * (lambda_ ** (n - 1)) * g_n
+            # Add final MC return
+            td_lambda += (lambda_ ** (T - t - 1)) * final_result
+
+            training_examples.append(
+                (
                     hetero_data,
                     move_to_action_indices,
+                    td_lambda,
                     selected_action_idx,
-                    next_state_tuple,
-                    player,  # Store current player (White=0, Black=1)
+                    next_hetero_data,
+                    next_move_to_action_indices,
+                    player,
                 )
-
-            # Use absolute result (no player-based flipping)
-            # final_result is already absolute: White win = +1, Black win = -1, Draw = 0
-            target_value = final_result
-
-            # Collect target for this position
-            if pos_hash not in position_targets:
-                position_targets[pos_hash] = []
-            position_targets[pos_hash].append(target_value)
-
-    # Second pass: average targets for positions with multiple outcomes
-    training_examples = []
-    for pos_hash, (
-        hetero_data,
-        move_to_action_indices,
-        selected_action_idx,
-        next_state_tuple,
-        player,
-    ) in position_data.items():
-        targets = position_targets[pos_hash]
-        avg_target = sum(targets) / len(targets)
-
-        # Unpack next state tuple
-        if next_state_tuple is not None:
-            next_hetero_data, next_move_to_action_indices = next_state_tuple
-        else:
-            next_hetero_data, next_move_to_action_indices = None, None
-
-        # Store HeteroData + move_to_action_indices + target + action + next_state + player
-        training_examples.append(
-            (
-                hetero_data,
-                move_to_action_indices,
-                avg_target,
-                selected_action_idx,
-                next_hetero_data,
-                next_move_to_action_indices,
-                player,
             )
-        )
 
     return training_examples
 
