@@ -56,36 +56,33 @@ def create_model_by_type(model_type, model_config):
 
 def train_epoch_standard(model, training_data, optimizer, batch_size=32, device="cpu"):
     """
-    Train model for one epoch using combined TD loss and policy-value consistency loss.
+    Train model for one epoch using TD loss only.
 
-    The loss has two components:
-    1. TD Loss (value network): MSE between predicted value V(S_t) and target value from game outcome
-    2. Policy-Value Consistency Loss: For each state S_t with action a leading to S_{t+1},
-       the policy logit P_a should match the value V(S_{t+1}).
+    With the new architecture, both policy and value heads derive from the same action values:
+    - Value = max(action_values)
+    - Policy = softmax(action_values)
 
-    Total Loss = TD_loss + lambda * Policy_Value_Consistency_loss
+    Since they share the same parameters (action_value_head), we only need to train on the value target.
+    The policy automatically learns to assign higher probabilities to better moves.
+
+    Loss: TD Loss (value network) = MSE between predicted value V(S_t) and target value
 
     Args:
-        model: GNN model (heterogeneous policy model with separate policy and value heads)
-        training_data: List of (hetero_data, move_to_action_indices, target_value) for heterogeneous models
+        model: GNN model (heterogeneous policy model with action_value_head)
+        training_data: List of (hetero_data, move_to_action_indices, target_value)
         optimizer: Optimizer
         batch_size: Batch size
         device: Device
 
     Returns:
-        Average loss (total_loss), average TD loss, average policy-value consistency loss
+        Average TD loss
     """
     from hetero_graph_utils import prepare_model_inputs
     from torch_geometric.data import HeteroData
 
     model.train()
     total_loss = 0
-    total_td_loss = 0
-    total_policy_value_loss = 0
     num_batches = 0
-
-    # Loss weight for policy-value consistency term
-    policy_value_weight = 1.0
 
     # Check if this is a heterogeneous model
     is_hetero = hasattr(model, "node_embedding")
@@ -190,129 +187,19 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
             targets = batch.y.squeeze()
 
             # TD Loss (value network supervised by game outcome)
-            td_loss = F.mse_loss(predictions, targets)
-
-            # Policy-Value Consistency Loss
-            # For each state S_t with action a leading to S_{t+1}:
-            # The policy logit for action a should match V(S_{t+1})
-            policy_value_loss = torch.tensor(0.0, device=device)
-
-            # Get which examples in this batch have next states
-            has_next_mask = batch.has_next_state.squeeze()
-
-            if has_next_mask.any():
-                # Extract next states and actions for this batch
-                next_states_in_batch = []
-                action_indices_in_batch = []
-                current_data_in_batch = []
-
-                for i in range(batch_size_actual):
-                    global_idx = batch_idx * batch_size + i
-                    if global_idx < len(next_state_list) and has_next_mask[i]:
-                        next_data, next_indices = next_state_list[global_idx]
-                        if next_data is not None:
-                            next_states_in_batch.append((next_data, next_indices))
-                            action_indices_in_batch.append(
-                                batch.selected_action_idx[i].item()
-                            )
-                            # Store current data for individual evaluation
-                            current_data_in_batch.append(
-                                (data_list[global_idx], global_idx)
-                            )
-
-                if len(next_states_in_batch) > 0:
-                    # Step 1: Batch evaluate next states to get V(S_{t+1})
-                    next_data_list = [nd for nd, _ in next_states_in_batch]
-                    next_loader = PyGDataLoader(
-                        next_data_list, batch_size=len(next_data_list), shuffle=False
-                    )
-                    next_batch = next(iter(next_loader)).to(device)
-
-                    next_move_indices = torch.cat(
-                        [ni for _, ni in next_states_in_batch]
-                    ).to(device)
-
-                    x_dict_next, edge_index_dict_next, edge_attr_dict_next, _ = (
-                        prepare_model_inputs(next_batch, next_move_indices)
-                    )
-
-                    with torch.no_grad():
-                        _, value_next = model(
-                            x_dict_next,
-                            edge_index_dict_next,
-                            edge_attr_dict_next,
-                            next_move_indices,
-                        )
-
-                    value_next = value_next.squeeze()  # [num_transitions]
-
-                    # Step 2: Get policy logits for each current state individually
-                    # We evaluate individually because batching mixes move edges
-                    policy_logits_for_actions = []
-
-                    for idx, (current_data, _) in enumerate(current_data_in_batch):
-                        action_idx = action_indices_in_batch[idx]
-
-                        # Individual forward pass to get proper action space mapping
-                        # Clone to avoid modifying original data in data_list
-                        current_data_single = current_data.clone().to(device)
-                        (
-                            x_dict_curr,
-                            edge_index_dict_curr,
-                            edge_attr_dict_curr,
-                            move_indices_curr,
-                        ) = prepare_model_inputs(
-                            current_data_single,
-                            current_data.move_to_action_indices.to(device),
-                        )
-
-                        # Forward pass (no grad needed for policy logits in this context)
-                        policy_logits, _ = model(
-                            x_dict_curr,
-                            edge_index_dict_curr,
-                            edge_attr_dict_curr,
-                            move_indices_curr,
-                        )
-
-                        # Extract logit for the selected action
-                        # policy_logits shape: [1, action_space_size]
-                        if action_idx >= 0 and action_idx < policy_logits.shape[1]:
-                            policy_logit = policy_logits[0, action_idx]
-                            policy_logits_for_actions.append(policy_logit)
-                        else:
-                            # Invalid action index, skip this transition
-                            continue
-
-                    if len(policy_logits_for_actions) > 0:
-                        policy_logits_tensor = torch.stack(policy_logits_for_actions)
-
-                        # Trim value_next to match valid transitions
-                        value_next_valid = value_next[: len(policy_logits_for_actions)]
-
-                        # Policy-value consistency: policy logit should match next state value
-                        # We use MSE between the logit and the value
-                        policy_value_loss = F.mse_loss(
-                            policy_logits_tensor, value_next_valid
-                        )
-
-            # Total loss
-            loss = td_loss + policy_value_weight * policy_value_loss
+            loss = F.mse_loss(predictions, targets)
 
             # Backward pass
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
-            total_td_loss += td_loss.item()
-            total_policy_value_loss += policy_value_loss.item()
             num_batches += 1
             batch_idx += 1
 
-        # Return tuple of losses
-        avg_total = total_loss / max(num_batches, 1)
-        avg_td = total_td_loss / max(num_batches, 1)
-        avg_pv = total_policy_value_loss / max(num_batches, 1)
-        return avg_total, avg_td, avg_pv
+        # Return average TD loss
+        avg_loss = total_loss / max(num_batches, 1)
+        return avg_loss
 
     else:
         # Handle homogeneous data (old format - shouldn't be used anymore)
@@ -488,7 +375,7 @@ def train_main_agent(
     for epoch in tqdm(
         range(config.main_agent_epochs), desc="Training epochs", unit="epoch"
     ):
-        loss_total, loss_td, loss_pv = train_epoch_standard(
+        loss = train_epoch_standard(
             model,
             training_data,
             optimizer,
@@ -500,14 +387,14 @@ def train_main_agent(
         league_tracker.log_training_metrics(
             iteration * config.main_agent_epochs + epoch,
             agent.name,
-            loss_total,
+            loss,
             optimizer.param_groups[0]["lr"],
             epoch=epoch,
         )
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
             tqdm.write(
-                f"  Epoch {epoch+1}/{config.main_agent_epochs}: Loss = {loss_total:.6f} (TD: {loss_td:.4f}, PV: {loss_pv:.4f})"
+                f"  Epoch {epoch+1}/{config.main_agent_epochs}: TD Loss = {loss:.6f}"
             )
 
     # Update Main Agent
@@ -636,7 +523,7 @@ def train_main_exploiter(
     for epoch in tqdm(
         range(config.exploiter_epochs), desc="Training epochs", unit="epoch"
     ):
-        loss_total, loss_td, loss_pv = train_epoch_standard(
+        loss = train_epoch_standard(
             model,
             training_data,
             optimizer,
@@ -650,14 +537,14 @@ def train_main_exploiter(
         league_tracker.log_training_metrics(
             iteration * config.exploiter_epochs + epoch,
             exploiter.name,
-            loss_total,
+            loss,
             optimizer.param_groups[0]["lr"],
             epoch=epoch,
         )
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
             tqdm.write(
-                f"  Epoch {epoch+1}/{config.exploiter_epochs}: Loss = {loss_total:.6f} (TD: {loss_td:.4f}, PV: {loss_pv:.4f})"
+                f"  Epoch {epoch+1}/{config.exploiter_epochs}: TD Loss = {loss:.6f}"
             )
 
     # Save updated exploiter
