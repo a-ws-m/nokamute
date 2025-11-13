@@ -387,7 +387,9 @@ def train_main_agent(
 
     # Load current Main Agent model
     agent = league_manager.current_main_agent
-    checkpoint = torch.load(agent.model_path, map_location=config.device)
+    checkpoint = torch.load(
+        agent.model_path, map_location=config.device, weights_only=False
+    )
     model_type = checkpoint.get(
         "model_type", "policy"
     )  # Default to policy (11x faster than value model)
@@ -434,7 +436,7 @@ def train_main_agent(
 
         # Load opponent model
         opponent_checkpoint = torch.load(
-            opponent_agent.model_path, map_location=config.device
+            opponent_agent.model_path, map_location=config.device, weights_only=False
         )
         opponent_model_type = opponent_checkpoint.get("model_type", "policy")
         opponent_model = create_model_by_type(
@@ -545,7 +547,9 @@ def train_main_exploiter(
         return None
 
     # Load exploiter model
-    checkpoint = torch.load(exploiter.model_path, map_location=config.device)
+    checkpoint = torch.load(
+        exploiter.model_path, map_location=config.device, weights_only=False
+    )
     exploiter_model_type = checkpoint.get("model_type", "policy")
     model = create_model_by_type(exploiter_model_type, checkpoint.get("config", {})).to(
         config.device
@@ -565,7 +569,9 @@ def train_main_exploiter(
 
     # Load target (Main Agent) model
     main_agent = league_manager.current_main_agent
-    main_checkpoint = torch.load(main_agent.model_path, map_location=config.device)
+    main_checkpoint = torch.load(
+        main_agent.model_path, map_location=config.device, weights_only=False
+    )
     main_model_type = main_checkpoint.get("model_type", "policy")
     main_model = create_model_by_type(
         main_model_type, main_checkpoint.get("config", {})
@@ -879,7 +885,9 @@ def main():
         # Load pretrained weights if specified
         if args.pretrained_model:
             print(f"Loading pretrained model from {args.pretrained_model}...")
-            pretrained = torch.load(args.pretrained_model, map_location=config.device)
+            pretrained = torch.load(
+                args.pretrained_model, map_location=config.device, weights_only=False
+            )
             model.load_state_dict(pretrained["model_state_dict"])
 
         # Create optimizer before compiling (optimizer needs to see original parameters)
@@ -994,7 +1002,9 @@ def main():
             print(f"{'='*60}")
 
             main_agent = league_manager.current_main_agent
-            checkpoint = torch.load(main_agent.model_path, map_location=config.device)
+            checkpoint = torch.load(
+                main_agent.model_path, map_location=config.device, weights_only=False
+            )
             eval_model_type = checkpoint.get("model_type", "policy")
             model = create_model_by_type(
                 eval_model_type, checkpoint.get("config", {})
