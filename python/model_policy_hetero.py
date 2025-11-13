@@ -673,6 +673,52 @@ class HiveGNNPolicyHetero(nn.Module):
 
         return action_idx, action_prob
 
+    def predict_action_info(
+        self,
+        x_dict,
+        edge_index_dict,
+        edge_attr_dict,
+        move_to_action_indices,
+        current_player=None,
+    ):
+        """
+        Compute action_values, value (best achievable for current_player), and action_idx in one pass.
+
+        Args:
+            x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices: Model inputs
+            current_player: "White" or "Black"
+
+        Returns:
+            action_values: [1, num_actions] absolute values (+1=White win, -1=Black win, -inf illegal)
+            action_probs: [1, num_actions] softmax probabilities for current_player
+            value: [1, 1] best achievable value for current_player
+            action_idx: [1] index of best action for current_player
+        """
+        action_values, white_value, black_value, white_action_idx, black_action_idx = (
+            self.forward(
+                x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices
+            )
+        )
+
+        # Convert absolute action values to player-relative utilities
+        if current_player == "Black":
+            # Negate for Black player
+            action_values = torch.where(
+                torch.isfinite(action_values),
+                -action_values,
+                action_values,
+            )
+            value = black_value
+            action_idx = black_action_idx
+        else:
+            # Default to White or when current_player is None
+            value = white_value
+            action_idx = white_action_idx
+
+        action_probs = F.softmax(action_values, dim=-1)
+
+        return action_values, action_probs, value, action_idx
+
 
 def create_policy_model(config=None):
     """

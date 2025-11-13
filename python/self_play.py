@@ -305,43 +305,38 @@ class SelfPlayGame:
                 result.append(0.0)
             return tuple(result) if len(result) > 1 else result[0]
 
-        # Forward pass through heterogeneous policy model
+        # Forward pass through heterogeneous policy model (single call)
         with torch.no_grad():
             if self.use_amp:
                 with torch.cuda.amp.autocast():
-                    probs = self.model.predict_action_probs(
+                    action_values, action_probs, value, action_idx = (
+                        self.model.predict_action_info(
+                            x_dict,
+                            edge_index_dict,
+                            edge_attr_dict,
+                            move_indices,
+                            current_player=current_player,
+                        )
+                    )
+            else:
+                action_values, action_probs, value, action_idx = (
+                    self.model.predict_action_info(
                         x_dict,
                         edge_index_dict,
                         edge_attr_dict,
                         move_indices,
-                        current_player=current_player,  # Pass current player for proper value conversion
+                        current_player=current_player,
                     )
-            else:
-                probs = self.model.predict_action_probs(
-                    x_dict,
-                    edge_index_dict,
-                    edge_attr_dict,
-                    move_indices,
-                    current_player=current_player,  # Pass current player for proper value conversion
                 )
 
-            probs = probs.squeeze(0)  # Remove batch dimension
-
-            # Also get position value if requested
-            position_value = None
-            if return_value:
-                position_value = self.model.predict_value(
-                    x_dict,
-                    edge_index_dict,
-                    edge_attr_dict,
-                    move_indices,
-                    current_player=current_player,
-                )
-                position_value = position_value.item()
+            action_values = action_values.squeeze(
+                0
+            )  # Remove batch dimension if present
+            # Get probabilities for valid actions only
+            probs_np = action_probs.squeeze(0).cpu().numpy()
 
         # Get probabilities for valid actions only
         valid_indices = move_indices[valid_move_mask]
-        probs_np = probs.cpu().numpy()
         legal_probs = probs_np[valid_indices.cpu().numpy()]
 
         # Check for invalid probabilities (NaN or all zeros)
@@ -367,7 +362,11 @@ class SelfPlayGame:
 
         # Fallback if move not found (shouldn't happen)
         if selected_move is None:
-            selected_move = random.choice(legal_moves)
+            raise RuntimeError(
+                "Selected move not found in legal moves - this should not happen.\n"
+                f"Selected move string: {selected_move_str}\n"
+                f"Legal move strings: {legal_move_strings}\n"
+            )
 
         # Build return value
         result = [selected_move]
@@ -376,13 +375,13 @@ class SelfPlayGame:
             move_probs = {}
             for i, move_str in enumerate(legal_move_strings):
                 if valid_move_mask[i]:
-                    action_idx = move_indices[i].item()
-                    move_probs[move_str] = float(probs_np[action_idx])
+                    action_idx_val = move_indices[i].item()
+                    move_probs[move_str] = float(probs_np[action_idx_val])
                 else:
                     move_probs[move_str] = 0.0
             result.append(move_probs)
         if return_value:
-            result.append(position_value if position_value is not None else 0.0)
+            result.append(value.item() if value is not None else 0.0)
 
         return tuple(result) if len(result) > 1 else result[0]
 
