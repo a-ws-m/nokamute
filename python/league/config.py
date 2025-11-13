@@ -53,7 +53,9 @@ class LeagueConfig:
     eval_games_per_matchup: int = 20  # Games to play per agent matchup for evaluation
 
     # General
-    device: str = "cuda"
+    gen_device: str = "cpu"  # Device for self-play game generation
+    train_device: str = "cuda"  # Device for model training
+
     max_moves: int = 400
     gamma: float = 0.99  # TD discount factor
     enable_branching: bool = True

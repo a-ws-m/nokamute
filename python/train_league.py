@@ -264,13 +264,13 @@ def train_main_agent(
     # Load current Main Agent model
     agent = league_manager.current_main_agent
     checkpoint = torch.load(
-        agent.model_path, map_location=config.device, weights_only=False
+        agent.model_path, map_location=config.train_device, weights_only=False
     )
     model_type = checkpoint.get(
         "model_type", "policy"
     )  # Default to policy (11x faster than value model)
     model = create_model_by_type(model_type, checkpoint.get("config", {})).to(
-        config.device
+        config.train_device
     )
 
     # Handle torch.compile() state dict keys (strip _orig_mod. prefix)
@@ -280,7 +280,7 @@ def train_main_agent(
     model.load_state_dict(state_dict)
 
     # Ensure model is on correct device after loading state dict
-    model = model.to(config.device)
+    model = model.to(config.train_device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.main_agent_lr)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -292,8 +292,8 @@ def train_main_agent(
 
     player = SelfPlayGame(
         model=model,
-        epsilon=0.1,  # Epsilon-greedy exploration for training
-        device=config.device,
+        epsilon=0.1,
+        device=config.gen_device,  # <-- use gen_device for game generation
         enable_branching=config.enable_branching,
         max_moves=config.max_moves,
         use_amp=args.use_amp if args else False,
@@ -312,12 +312,14 @@ def train_main_agent(
 
         # Load opponent model
         opponent_checkpoint = torch.load(
-            opponent_agent.model_path, map_location=config.device, weights_only=False
+            opponent_agent.model_path,
+            map_location=config.gen_device,
+            weights_only=False,
         )
         opponent_model_type = opponent_checkpoint.get("model_type", "policy")
         opponent_model = create_model_by_type(
             opponent_model_type, opponent_checkpoint.get("config", {})
-        ).to(config.device)
+        ).to(config.gen_device)
 
         # Handle torch.compile() state dict keys
         opponent_state_dict = opponent_checkpoint["model_state_dict"]
@@ -328,7 +330,7 @@ def train_main_agent(
         opponent_model.load_state_dict(opponent_state_dict)
 
         # Ensure model is on correct device after loading state dict
-        opponent_model = opponent_model.to(config.device)
+        opponent_model = opponent_model.to(config.gen_device)
         opponent_model.eval()
 
         # Play game (alternating who plays as White)
@@ -369,7 +371,7 @@ def train_main_agent(
             training_data,
             optimizer,
             batch_size=config.main_agent_batch_size,
-            device=config.device,
+            device=config.train_device,  # <-- use train_device for training
         )
 
         # Log metrics
@@ -424,11 +426,11 @@ def train_main_exploiter(
 
     # Load exploiter model
     checkpoint = torch.load(
-        exploiter.model_path, map_location=config.device, weights_only=False
+        exploiter.model_path, map_location=config.train_device, weights_only=False
     )
     exploiter_model_type = checkpoint.get("model_type", "policy")
     model = create_model_by_type(exploiter_model_type, checkpoint.get("config", {})).to(
-        config.device
+        config.train_device
     )
 
     # Handle torch.compile() state dict keys
@@ -438,7 +440,7 @@ def train_main_exploiter(
     model.load_state_dict(state_dict)
 
     # Ensure model is on correct device after loading state dict
-    model = model.to(config.device)
+    model = model.to(config.train_device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.exploiter_lr)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -446,12 +448,12 @@ def train_main_exploiter(
     # Load target (Main Agent) model
     main_agent = league_manager.current_main_agent
     main_checkpoint = torch.load(
-        main_agent.model_path, map_location=config.device, weights_only=False
+        main_agent.model_path, map_location=config.gen_device, weights_only=False
     )
     main_model_type = main_checkpoint.get("model_type", "policy")
     main_model = create_model_by_type(
         main_model_type, main_checkpoint.get("config", {})
-    ).to(config.device)
+    ).to(config.gen_device)
 
     # Handle torch.compile() state dict keys
     main_state_dict = main_checkpoint["model_state_dict"]
@@ -462,15 +464,15 @@ def train_main_exploiter(
     main_model.load_state_dict(main_state_dict)
 
     # Ensure model is on correct device after loading state dict
-    main_model = main_model.to(config.device)
+    main_model = main_model.to(config.gen_device)
     main_model.eval()
 
     # Create exploiter agent
     exploiter_player = ExploiterAgent(
         model=model,
         opponent_model=main_model,
-        device=config.device,
-        epsilon=0.1,  # Exploiter uses epsilon-greedy, opponent is greedy
+        device=config.gen_device,  # <-- use gen_device for game generation
+        epsilon=0.1,
         minimax_reward_weight=config.minimax_reward_weight,
         gamma=config.minimax_gamma,
         enable_branching=config.enable_branching,
@@ -517,7 +519,7 @@ def train_main_exploiter(
             training_data,
             optimizer,
             batch_size=config.exploiter_batch_size,
-            device=config.device,
+            device=config.train_device,  # <-- use train_device for training
         )
 
         exploiter.training_epochs += 1
@@ -660,7 +662,16 @@ def main():
 
     # Device
     parser.add_argument(
-        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+        "--gen-device",
+        type=str,
+        default="cpu",
+        help="Device for self-play game generation (default: cpu)",
+    )
+    parser.add_argument(
+        "--train-device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device for model training (default: cuda if available, else cpu)",
     )
 
     # Model type
@@ -717,14 +728,16 @@ def main():
         config = LeagueConfig(
             main_agent_games_per_iter=args.main_games,
             exploiter_games_per_iter=args.exploiter_games,
-            device=args.device,
+            gen_device=args.gen_device,  # <-- add to config
+            train_device=args.train_device,  # <-- add to config
             inference_batch_size=args.inference_batch_size,
         )
 
     print("\n" + "=" * 60)
     print("LEAGUE TRAINING SYSTEM")
     print("=" * 60)
-    print(f"Device: {config.device}")
+    print(f"Game generation device: {config.gen_device}")
+    print(f"Training device: {config.train_device}")
     print(f"Model type: {args.model_type}")
     print(f"Main Agent games/iter: {config.main_agent_games_per_iter}")
     print(f"Exploiter games/iter: {config.exploiter_games_per_iter}")
@@ -751,35 +764,35 @@ def main():
     model_config = {
         "hidden_dim": args.hidden_dim,
         "num_layers": args.num_layers,
-        "model_type": args.model_type,  # Store model type for future loading
+        "model_type": args.model_type,
     }
 
     if league_manager.current_main_agent is None:
         print("\nInitializing Main Agent...")
-        model = create_model_by_type(args.model_type, model_config).to(config.device)
+        model = create_model_by_type(args.model_type, model_config).to(
+            config.train_device
+        )
 
         # Load pretrained weights if specified
         if args.pretrained_model:
             print(f"Loading pretrained model from {args.pretrained_model}...")
             pretrained = torch.load(
-                args.pretrained_model, map_location=config.device, weights_only=False
+                args.pretrained_model,
+                map_location=config.train_device,
+                weights_only=False,
             )
             model.load_state_dict(pretrained["model_state_dict"])
 
-        # Create optimizer before compiling (optimizer needs to see original parameters)
         optimizer = torch.optim.Adam(model.parameters(), lr=config.main_agent_lr)
-
-        # Initialize agent with uncompiled model first (saves clean state dict)
         league_manager.initialize_main_agent(model, optimizer, model_config)
 
         # Apply torch.compile() for faster inference AFTER saving initial checkpoint
         if args.use_compile:
-            if config.device == "cpu":
+            if config.train_device == "cpu":
                 print("Note: torch.compile() on CPU may not provide speedup")
             else:
                 try:
                     print("Compiling model with torch.compile(fullgraph=True)...")
-                    # For older GPUs (CUDA < 7.0), fallback to eager backend
                     if torch.cuda.is_available():
                         capability = torch.cuda.get_device_capability()
                         if capability[0] < 7:
@@ -831,7 +844,7 @@ def main():
 
             # Create fresh model for exploiter
             model = create_model_by_type(args.model_type, model_config).to(
-                config.device
+                config.train_device
             )
             optimizer = torch.optim.Adam(model.parameters(), lr=config.exploiter_lr)
             league_manager.spawn_main_exploiter(model, optimizer, model_config)
@@ -848,7 +861,7 @@ def main():
             print(f"{'='*60}")
 
             model = create_model_by_type(args.model_type, model_config).to(
-                config.device
+                config.train_device
             )
             optimizer = torch.optim.Adam(model.parameters(), lr=config.exploiter_lr)
             league_manager.spawn_league_exploiter(model, optimizer, model_config)
@@ -879,12 +892,14 @@ def main():
 
             main_agent = league_manager.current_main_agent
             checkpoint = torch.load(
-                main_agent.model_path, map_location=config.device, weights_only=False
+                main_agent.model_path,
+                map_location=config.train_device,
+                weights_only=False,
             )
             eval_model_type = checkpoint.get("model_type", "policy")
             model = create_model_by_type(
                 eval_model_type, checkpoint.get("config", {})
-            ).to(config.device)
+            ).to(config.train_device)
 
             # Handle torch.compile() state dict keys
             state_dict = checkpoint["model_state_dict"]
@@ -895,7 +910,7 @@ def main():
             model.load_state_dict(state_dict)
 
             # Ensure model is on correct device after loading state dict
-            model = model.to(config.device)
+            model = model.to(config.train_device)
 
             evaluate_and_update_elo(
                 model,
@@ -903,7 +918,7 @@ def main():
                 league_tracker.elo_tracker,
                 engine_depths=args.eval_depths,
                 games_per_depth=args.eval_games,
-                device=config.device,
+                device=config.train_device,
                 tensorboard_writer=league_tracker.writer,
                 iteration=iteration,
             )

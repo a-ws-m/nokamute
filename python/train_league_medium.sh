@@ -39,7 +39,6 @@ python train_league.py \
     --eval-interval $EVAL_INTERVAL \
     --eval-games $EVAL_GAMES \
     --eval-depths $EVAL_DEPTHS \
-    --device cuda \
     --use-amp \
     --use-compile \
     --inference-batch-size $INFERENCE_BATCH_SIZE \
