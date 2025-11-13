@@ -266,9 +266,7 @@ def train_main_agent(
     checkpoint = torch.load(
         agent.model_path, map_location=config.train_device, weights_only=False
     )
-    model_type = checkpoint.get(
-        "model_type", "policy"
-    )  # Default to policy (11x faster than value model)
+    model_type = checkpoint.get("model_type", "policy")
     model = create_model_by_type(model_type, checkpoint.get("config", {})).to(
         config.train_device
     )
@@ -278,12 +276,12 @@ def train_main_agent(
     if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
         state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
-
-    # Ensure model is on correct device after loading state dict
     model = model.to(config.train_device)
-
     optimizer = torch.optim.Adam(model.parameters(), lr=config.main_agent_lr)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    # Move model to gen_device for game generation
+    model_for_gen = model.to(config.gen_device)
 
     # Generate self-play games using PFSP opponent selection
     print(f"\nGenerating {config.main_agent_games_per_iter} self-play games...")
@@ -291,9 +289,9 @@ def train_main_agent(
     opponent_sample_counts = {}
 
     player = SelfPlayGame(
-        model=model,
+        model=model_for_gen,  # <-- model on gen_device
         epsilon=0.1,
-        device=config.gen_device,  # <-- use gen_device for game generation
+        device=config.gen_device,
         enable_branching=config.enable_branching,
         max_moves=config.max_moves,
         use_amp=args.use_amp if args else False,
@@ -328,8 +326,6 @@ def train_main_agent(
                 k.replace("_orig_mod.", ""): v for k, v in opponent_state_dict.items()
             }
         opponent_model.load_state_dict(opponent_state_dict)
-
-        # Ensure model is on correct device after loading state dict
         opponent_model = opponent_model.to(config.gen_device)
         opponent_model.eval()
 
@@ -438,12 +434,12 @@ def train_main_exploiter(
     if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
         state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
-
-    # Ensure model is on correct device after loading state dict
     model = model.to(config.train_device)
-
     optimizer = torch.optim.Adam(model.parameters(), lr=config.exploiter_lr)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    # Move exploiter model to gen_device for game generation
+    model_for_gen = model.to(config.gen_device)
 
     # Load target (Main Agent) model
     main_agent = league_manager.current_main_agent
@@ -462,16 +458,14 @@ def train_main_exploiter(
             k.replace("_orig_mod.", ""): v for k, v in main_state_dict.items()
         }
     main_model.load_state_dict(main_state_dict)
-
-    # Ensure model is on correct device after loading state dict
     main_model = main_model.to(config.gen_device)
     main_model.eval()
 
     # Create exploiter agent
     exploiter_player = ExploiterAgent(
-        model=model,
+        model=model_for_gen,  # <-- model on gen_device
         opponent_model=main_model,
-        device=config.gen_device,  # <-- use gen_device for game generation
+        device=config.gen_device,
         epsilon=0.1,
         minimax_reward_weight=config.minimax_reward_weight,
         gamma=config.minimax_gamma,
