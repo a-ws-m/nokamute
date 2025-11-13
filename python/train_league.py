@@ -160,7 +160,7 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
 
             # Forward pass - heterogeneous policy model
             # For batched training, action_logits is a placeholder (not used)
-            _, white_value, black_value = model(
+            _, white_value, black_value, _, _ = model(
                 x_dict, edge_index_dict, edge_attr_dict, batch.move_to_action_indices
             )
 

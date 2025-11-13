@@ -144,8 +144,95 @@ class HiveGNNPolicyHetero(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 4, 1),  # Single value per move edge
-            nn.Tanh(),  # Output in [-1, 1]
+            nn.Tanh(),  # Output in [-1, 1] on ABSOLUTE scale
         )
+
+    def compute_move_edge_values(self, x_dict, edge_index_dict, edge_attr_dict):
+        """
+        Compute action values for all move edges.
+
+        This extracts the forward pass logic for computing move edge values into a separate method.
+        The heterogeneous graph is undirected (via ToUndirected transform), so there are 2x as many
+        move edges as legal moves. Each legal move has both forward and reverse edges with current_player=1.
+
+        Args:
+            x_dict: Dictionary of processed node features (after GNN layers)
+            edge_index_dict: Dictionary of edge indices
+            edge_attr_dict: Dictionary of edge attributes (original, not embedded)
+
+        Returns:
+            action_values: Tensor [num_actions] with values in [-1, 1] on ABSOLUTE scale
+                          (+1 = White winning, -1 = Black winning, -inf for illegal actions)
+            all_move_values: Tensor [total_move_edges] with raw values for all move edges
+            current_player_mask: Tensor [total_move_edges] boolean mask for current player's moves
+        """
+        device = list(x_dict.values())[0].device
+
+        all_move_edge_features = []
+        all_move_edge_attrs = []
+
+        # Collect move edges from all edge types (including reverse edges from ToUndirected)
+        for edge_type_tuple in edge_index_dict.keys():
+            src_type, edge_type, dst_type = edge_type_tuple
+            if "move" in edge_type or "rev_move" in edge_type:
+                edge_idx = edge_index_dict[edge_type_tuple]
+
+                if edge_idx.shape[1] > 0:  # Has edges of this type
+                    # Get source and destination node features
+                    src_features = x_dict[src_type][
+                        edge_idx[0]
+                    ]  # [num_edges, hidden_dim]
+                    dst_features = x_dict[dst_type][
+                        edge_idx[1]
+                    ]  # [num_edges, hidden_dim]
+
+                    # Combine source and destination (average)
+                    edge_features = (src_features + dst_features) / 2.0
+                    all_move_edge_features.append(edge_features)
+
+                    # Keep track of which edges belong to current player
+                    all_move_edge_attrs.append(edge_attr_dict[edge_type_tuple])
+
+        if not all_move_edge_features:
+            # No move edges at all - this is an error (should have at least one legal move)
+            raise ValueError(
+                "No move edges found in the graph. This indicates either a terminal position "
+                "or an error in graph construction."
+            )
+
+        # Concatenate all move edge features
+        all_move_features = torch.cat(
+            all_move_edge_features, dim=0
+        )  # [total_move_edges, hidden_dim]
+        all_move_attrs = torch.cat(all_move_edge_attrs, dim=0)  # [total_move_edges, 1]
+
+        # Apply action_value_head to get value for each move edge
+        all_move_values = self.action_value_head(all_move_features).squeeze(
+            -1
+        )  # [total_move_edges]
+
+        # Mask: edges with attr == 1.0 are current player's legal moves
+        current_player_mask = all_move_attrs.squeeze(-1) == 1.0  # [total_move_edges]
+
+        # Check that we have at least one current player move
+        if not current_player_mask.any():
+            raise ValueError(
+                "No current player move edges found (all edge_attr != 1.0). "
+                "This indicates an error in graph construction."
+            )
+
+        # Set non-current-player moves to -inf
+        masked_values = torch.where(
+            current_player_mask,
+            all_move_values,
+            torch.tensor(
+                float("-inf"),
+                device=all_move_values.device,
+                dtype=all_move_values.dtype,
+            ),
+        )  # [total_move_edges]
+
+        return masked_values, all_move_values, current_player_mask
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices):
         """
@@ -161,14 +248,16 @@ class HiveGNNPolicyHetero(nn.Module):
             edge_attr_dict: Dictionary of edge attributes for each edge type
                     {('src_type', 'edge_type', 'dst_type'): [num_edges, 1]}
             move_to_action_indices: Tensor mapping move edge indices to action space indices
-                    [num_legal_moves] where each entry is the action space index
+                    [total_move_edges] where each entry is the action space index
+                    Note: Due to ToUndirected, there are 2x as many edges as legal moves
 
         Returns:
-            policy_logits: Action values [1, num_actions] in ABSOLUTE scale
+            action_logits: Action values [1, num_actions] in ABSOLUTE scale
                           +1 = White winning, -1 = Black winning, -inf for illegal actions
-                          NOTE: For move selection, convert to player-relative before softmax!
             white_value: Best value for White (max of action values) [1, 1] or [batch_size, 1]
             black_value: Best value for Black (min of action values) [1, 1] or [batch_size, 1]
+            white_action_idx: Action index corresponding to white_value [1] or [batch_size]
+            black_action_idx: Action index corresponding to black_value [1] or [batch_size]
         """
         # Initial embedding for each node type
         x_dict_embedded = {}
@@ -217,8 +306,7 @@ class HiveGNNPolicyHetero(nn.Module):
 
                     x_dict_current[node_type] = h
 
-        # Detect batch size early to decide if we compute policy logits
-        # Check if this is a batched graph by looking for batch attribute
+        # Detect batch size early
         batch_size_detected = 1
         batch_dict = {}
         for node_type in x_dict.keys():
@@ -233,80 +321,12 @@ class HiveGNNPolicyHetero(nn.Module):
 
         is_batched = batch_size_detected > 1
 
-        # Generate policy logits from move edge features (skip for batched training)
-        # Strategy: For each move edge, compute edge representation by combining
-        # source and destination node features, then apply policy head MLP
-
-        # For batched graphs, policy head is problematic because move_to_action_indices
-        # are concatenated and don't align with per-graph action spaces
-        # We skip policy computation for batched training (only compute value)
-
-        if not is_batched:
-            all_move_edge_features = []
-            all_move_edge_attrs = []
-
-            # Collect move edges from all edge types (including reverse edges from ToUndirected)
-            for edge_type_tuple in edge_index_dict.keys():
-                src_type, edge_type, dst_type = edge_type_tuple
-                if "move" in edge_type or "rev_move" in edge_type:
-                    edge_idx = edge_index_dict[edge_type_tuple]
-
-                    if edge_idx.shape[1] > 0:  # Has edges of this type
-                        # Get source and destination node features
-                        src_features = x_dict_current[src_type][
-                            edge_idx[0]
-                        ]  # [num_edges, hidden_dim]
-                        dst_features = x_dict_current[dst_type][
-                            edge_idx[1]
-                        ]  # [num_edges, hidden_dim]
-
-                        # Combine source and destination (average)
-                        edge_features = (src_features + dst_features) / 2.0
-                        all_move_edge_features.append(edge_features)
-
-                        # Keep track of which edges belong to current player
-                        all_move_edge_attrs.append(edge_attr_dict[edge_type_tuple])
-        else:
-            # Batched training - skip policy head
-            all_move_edge_features = []
-            all_move_edge_attrs = []
-
-        if all_move_edge_features:
-            # Concatenate all move edge features
-            all_move_features = torch.cat(
-                all_move_edge_features, dim=0
-            )  # [total_move_edges, hidden_dim]
-            all_move_attrs = torch.cat(
-                all_move_edge_attrs, dim=0
-            )  # [total_move_edges, 1]
-
-            # Apply action_value_head to get value for each move edge
-            all_move_values = self.action_value_head(all_move_features).squeeze(
-                -1
-            )  # [total_move_edges]
-
-            # Instead of filtering with boolean indexing (which creates dynamic shapes),
-            # we'll use the move_to_action_indices to map directly to action space.
-            # Edges with attr == 1.0 are current player's legal moves.
-            # We mask out edges with attr != 1.0 by setting their logits to -inf.
-            current_player_mask = (
-                all_move_attrs.squeeze(-1) == 1.0
-            )  # [total_move_edges]
-
-            # Set non-current-player moves to -inf (will be masked out in action values)
-            masked_values = torch.where(
-                current_player_mask,
-                all_move_values,
-                torch.tensor(
-                    float("-inf"),
-                    device=all_move_values.device,
-                    dtype=all_move_values.dtype,
-                ),
-            )  # [total_move_edges]
-        else:
-            # No move edges at all (should not happen in a valid position)
-            device = list(x_dict_current.values())[0].device
-            masked_values = torch.empty(0, device=device)
+        # Compute action values from move edges (works for both batched and single)
+        masked_values, all_move_values, current_player_mask = (
+            self.compute_move_edge_values(
+                x_dict_current, edge_index_dict, edge_attr_dict
+            )
+        )
 
         # Initialize action values with -inf (illegal actions)
         device = list(x_dict_current.values())[0].device
@@ -364,13 +384,31 @@ class HiveGNNPolicyHetero(nn.Module):
 
                 # White value: best outcome for White (maximum)
                 white_value = legal_values.max().unsqueeze(0).unsqueeze(0)  # [1, 1]
+                # Find index of maximum among legal actions only
+                # Create a tensor with -inf for illegal actions, then argmax
+                white_masked = torch.where(
+                    legal_mask,
+                    action_values,
+                    torch.tensor(float("-inf"), device=device, dtype=dtype),
+                )
+                white_action_idx = torch.argmax(white_masked).unsqueeze(0)  # [1]
 
                 # Black value: best outcome for Black (minimum)
                 black_value = legal_values.min().unsqueeze(0).unsqueeze(0)  # [1, 1]
+                # Find index of minimum among legal actions only
+                # Create a tensor with +inf for illegal actions, then argmin
+                black_masked = torch.where(
+                    legal_mask,
+                    action_values,
+                    torch.tensor(float("inf"), device=device, dtype=dtype),
+                )
+                black_action_idx = torch.argmin(black_masked).unsqueeze(0)  # [1]
             else:
                 # No legal moves - neutral value
                 white_value = torch.zeros(1, 1, device=device, dtype=dtype)
                 black_value = torch.zeros(1, 1, device=device, dtype=dtype)
+                white_action_idx = torch.zeros(1, device=device, dtype=torch.long)
+                black_action_idx = torch.zeros(1, device=device, dtype=torch.long)
         else:
             # Batched graphs - need to compute per-graph values
             # The key insight: move edges have a batch assignment we can use
@@ -428,6 +466,16 @@ class HiveGNNPolicyHetero(nn.Module):
                         reduce="min",
                         dim_size=batch_size,
                     )  # [batch_size, 1]
+
+                    # Find action indices corresponding to best values
+                    # For batched case, we need to find argmax/argmin per graph
+                    # This is more complex - for now return placeholder (-1 indicates not computed)
+                    white_action_idx = torch.full(
+                        (batch_size,), -1, device=device, dtype=torch.long
+                    )
+                    black_action_idx = torch.full(
+                        (batch_size,), -1, device=device, dtype=torch.long
+                    )
                 else:
                     # No move edges - return zeros (should not happen in valid positions)
                     white_value = torch.zeros(
@@ -435,6 +483,12 @@ class HiveGNNPolicyHetero(nn.Module):
                     )
                     black_value = torch.zeros(
                         batch_size, 1, device=device, dtype=dtype, requires_grad=True
+                    )
+                    white_action_idx = torch.zeros(
+                        batch_size, device=device, dtype=torch.long
+                    )
+                    black_action_idx = torch.zeros(
+                        batch_size, device=device, dtype=torch.long
                     )
             else:
                 # No legal moves at all
@@ -444,11 +498,23 @@ class HiveGNNPolicyHetero(nn.Module):
                 black_value = torch.zeros(
                     batch_size, 1, device=device, dtype=dtype, requires_grad=True
                 )
+                white_action_idx = torch.zeros(
+                    batch_size, device=device, dtype=torch.long
+                )
+                black_action_idx = torch.zeros(
+                    batch_size, device=device, dtype=torch.long
+                )
 
             # For batched training, action_logits is not used (return placeholder)
             action_logits = action_values.unsqueeze(0)  # [1, num_actions]
 
-        return action_logits, white_value, black_value
+        return (
+            action_logits,
+            white_value,
+            black_value,
+            white_action_idx,
+            black_action_idx,
+        )
 
     def predict_action_probs(
         self,
@@ -476,7 +542,7 @@ class HiveGNNPolicyHetero(nn.Module):
             probs: Action probabilities [1, num_actions]
                    Sums to 1 over legal actions, 0 for illegal actions
         """
-        action_values, _, _ = self.forward(
+        action_values, _, _, _, _ = self.forward(
             x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices
         )
 
@@ -486,10 +552,13 @@ class HiveGNNPolicyHetero(nn.Module):
         #   White wants to maximize (keep as-is)
         #   Black wants to minimize (negate)
         if current_player == "Black":
-            # Negate for Black player, but preserve -inf for illegal moves
-            illegal_mask = torch.isinf(action_values) & (action_values < 0)
-            action_values = -action_values
-            action_values[illegal_mask] = float("-inf")
+            # Negate for Black player
+            # Preserve -inf for illegal moves (they stay -inf after negation)
+            action_values = torch.where(
+                torch.isfinite(action_values),
+                -action_values,
+                action_values,  # Keep -inf as -inf
+            )
 
         # Apply temperature
         if temperature != 1.0:
@@ -519,7 +588,7 @@ class HiveGNNPolicyHetero(nn.Module):
                    Returns white_value (max) if current_player="White"
                    Returns black_value (min) if current_player="Black"
         """
-        _, white_value, black_value = self.forward(
+        _, white_value, black_value, _, _ = self.forward(
             x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices
         )
 

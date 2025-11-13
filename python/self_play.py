@@ -226,9 +226,15 @@ class SelfPlayGame:
                     }
                     move_indices = move_indices.to(self.device)
 
+                    # Get value from current player's perspective
+                    current_player = board.to_move().name
                     with torch.no_grad():
-                        _, value = self.model(
-                            x_dict, edge_index_dict, edge_attr_dict, move_indices
+                        value = self.model.predict_value(
+                            x_dict,
+                            edge_index_dict,
+                            edge_attr_dict,
+                            move_indices,
+                            current_player=current_player,
                         )
                     result.append(value.item())
                 else:
@@ -329,8 +335,12 @@ class SelfPlayGame:
             # Also get position value if requested
             position_value = None
             if return_value:
-                _, position_value = self.model(
-                    x_dict, edge_index_dict, edge_attr_dict, move_indices
+                position_value = self.model.predict_value(
+                    x_dict,
+                    edge_index_dict,
+                    edge_attr_dict,
+                    move_indices,
+                    current_player=current_player,
                 )
                 position_value = position_value.item()
 
@@ -383,27 +393,19 @@ class SelfPlayGame:
 
     def select_move(self, board, legal_moves, return_probs=False, return_value=False):
         """
-        Select a move based on model evaluation or random selection.
-        Routes to either policy-based or value-based move selection depending on model type.
+        Select a move based on policy model evaluation (heterogeneous graphs only).
 
         Args:
             board: Current board state
             legal_moves: List of legal moves
             return_probs: If True, also return move probabilities
-            return_value: If True, also return the evaluated value of the resulting position
+            return_value: If True, also return the evaluated value of the current position
 
         Returns:
-            Selected move (and optionally move probabilities dict and/or move value)
+            Selected move (and optionally move probabilities dict and/or position value)
         """
-        # Route to appropriate method based on model type
-        if self.use_policy_model:
-            return self.select_move_policy(
-                board, legal_moves, return_probs, return_value
-            )
-        else:
-            return self.select_move_value(
-                board, legal_moves, return_probs, return_value
-            )
+        # Only support policy-based model with heterogeneous graphs
+        return self.select_move_policy(board, legal_moves, return_probs, return_value)
 
     def select_move_value(
         self, board, legal_moves, return_probs=False, return_value=False
