@@ -913,6 +913,11 @@ impl Board {
         Ok(absolute_score)
     }
 
+    /// Pass the turn (apply a pass move)
+    fn pass_turn(&mut self) {
+        self.inner.apply(RustTurn::Pass);
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Board(turn={}, to_move={})",
