@@ -15,14 +15,12 @@ class LeagueConfig:
     main_agent_batch_size: int = 64
     main_agent_epochs: int = 10
     main_agent_games_per_iter: int = 10
-    main_agent_temperature: float = 1.0
 
     # Exploiter settings
     exploiter_lr: float = 1e-3
     exploiter_batch_size: int = 64
     exploiter_epochs: int = 10
     exploiter_games_per_iter: int = 20
-    exploiter_temperature: float = 1.0
 
     # Minimax reward settings
     minimax_reward_weight: float = 1.0  # Weight of minimax reward vs game outcome

@@ -292,7 +292,7 @@ def train_main_agent(
 
     player = SelfPlayGame(
         model=model,
-        temperature=config.main_agent_temperature,
+        epsilon=0.1,  # Epsilon-greedy exploration for training
         device=config.device,
         enable_branching=config.enable_branching,
         max_moves=config.max_moves,
@@ -470,7 +470,7 @@ def train_main_exploiter(
         model=model,
         opponent_model=main_model,
         device=config.device,
-        temperature=config.exploiter_temperature,
+        epsilon=0.1,  # Exploiter uses epsilon-greedy, opponent is greedy
         minimax_reward_weight=config.minimax_reward_weight,
         gamma=config.minimax_gamma,
         enable_branching=config.enable_branching,

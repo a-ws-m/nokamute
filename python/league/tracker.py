@@ -309,16 +309,16 @@ class LeagueTracker:
         model1 = self._load_model(agent1, device)
         model2 = self._load_model(agent2, device)
 
-        # Create players
+        # Create players (greedy evaluation)
         player1 = SelfPlayGame(
             model=model1,
-            temperature=0,
+            epsilon=0.0,
             device=device,
             inference_batch_size=inference_batch_size,
         )
         player2 = SelfPlayGame(
             model=model2,
-            temperature=0,
+            epsilon=0.0,
             device=device,
             inference_batch_size=inference_batch_size,
         )

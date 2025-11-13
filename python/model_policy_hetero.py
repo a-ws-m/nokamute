@@ -641,15 +641,13 @@ class HiveGNNPolicyHetero(nn.Module):
         edge_index_dict,
         edge_attr_dict,
         move_to_action_indices,
-        temperature=1.0,
         deterministic=False,
     ):
         """
-        Select an action given a board state.
+        Select an action given a board state using greedy selection.
 
         Args:
             x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices: Same as forward()
-            temperature: Temperature for sampling (higher = more exploration)
             deterministic: If True, select argmax instead of sampling
 
         Returns:
@@ -662,7 +660,6 @@ class HiveGNNPolicyHetero(nn.Module):
                 edge_index_dict,
                 edge_attr_dict,
                 move_to_action_indices,
-                temperature,
             )
             probs = probs.squeeze(0)  # [num_actions]
 

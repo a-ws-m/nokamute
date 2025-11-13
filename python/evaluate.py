@@ -95,8 +95,8 @@ def evaluate_vs_random(model, num_games=100, device="cpu"):
         Win rate statistics
     """
     # Temperature=0 ensures greedy (best) move selection during evaluation
-    ai_player = SelfPlayGame(model=model, temperature=0, device=device)
-    random_player = SelfPlayGame(model=None, temperature=1.0, device=device)
+    ai_player = SelfPlayGame(model=model, epsilon=0.0, device=device)
+    random_player = SelfPlayGame(model=None, epsilon=0.0, device=device)
 
     results = {
         "ai_white_wins": 0,

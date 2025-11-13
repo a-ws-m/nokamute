@@ -48,7 +48,7 @@ class SelfPlayGame:
     def __init__(
         self,
         model=None,
-        temperature=1.0,
+        epsilon=0.0,
         device="cpu",
         enable_branching=False,
         max_moves=400,
@@ -59,7 +59,7 @@ class SelfPlayGame:
         """
         Args:
             model: GNN model for position evaluation (optional)
-            temperature: Temperature for move selection (higher = more exploration)
+            epsilon: Epsilon for epsilon-greedy exploration (0.0 = greedy, 1.0 = random)
             device: Device to run model on
             enable_branching: Enable branching MCMC for game generation
             max_moves: Maximum number of moves before declaring a draw (default: 400)
@@ -70,7 +70,7 @@ class SelfPlayGame:
                                  Set this to your GPU's maximum capacity for optimal performance.
         """
         self.model = model
-        self.temperature = temperature
+        self.epsilon = epsilon
         self.device = device
         self.enable_branching = enable_branching
         self.max_moves = max_moves
@@ -165,15 +165,10 @@ class SelfPlayGame:
         if current_player == "Black":
             utilities = -utilities  # Black minimizes (so negate)
 
-        # Compute softmax probabilities over utilities (keep in PyTorch)
-        if self.temperature == 0:
-            # Greedy: assign probability 1 to best move
-            best_idx = torch.argmax(utilities).item()
-            probs = torch.zeros(len(legal_moves), device=self.device)
-            probs[best_idx] = 1.0
-        else:
-            # Softmax with temperature (all in PyTorch)
-            probs = torch.nn.functional.softmax(utilities / self.temperature, dim=0)
+        # Greedy selection: assign probability 1 to best move
+        best_idx = torch.argmax(utilities).item()
+        probs = torch.zeros(len(legal_moves), device=self.device)
+        probs[best_idx] = 1.0
 
         # Convert to CPU numpy for dictionary creation (only at the end)
         probs_np = probs.cpu().numpy()
@@ -187,8 +182,8 @@ class SelfPlayGame:
     ):
         """
         Select a move using the policy-based model (heterogeneous graph with fixed action space).
-        Uses the new heterogeneous graph representation with destination/in-play/out-of-play nodes
-        and move edges.
+        Uses epsilon-greedy exploration: with probability epsilon, select a random move;
+        otherwise, select greedily based on the model's action values.
 
         Args:
             board: Current board state
@@ -317,7 +312,6 @@ class SelfPlayGame:
                         edge_index_dict,
                         edge_attr_dict,
                         move_indices,
-                        temperature=self.temperature,
                         current_player=current_player,  # Pass current player for proper value conversion
                     )
             else:
@@ -326,7 +320,6 @@ class SelfPlayGame:
                     edge_index_dict,
                     edge_attr_dict,
                     move_indices,
-                    temperature=self.temperature,
                     current_player=current_player,  # Pass current player for proper value conversion
                 )
 
