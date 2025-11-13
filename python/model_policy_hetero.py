@@ -339,7 +339,16 @@ class HiveGNNPolicyHetero(nn.Module):
         # Map move edge values to action space using move_to_action_indices
         # move_to_action_indices maps each move edge to its action index
         # Edges with -1 index are not in the action space (shouldn't happen)
-        if len(move_to_action_indices) > 0 and len(masked_values) > 0:
+        # NOTE: For batched graphs, move_to_action_indices may not align with masked_values
+        # due to concatenation during batching. In that case, skip action space mapping
+        # and only compute white_value/black_value directly from masked_values.
+        use_action_space = (
+            len(move_to_action_indices) > 0
+            and len(masked_values) > 0
+            and len(move_to_action_indices) == len(masked_values)
+        )
+
+        if use_action_space:
             # Replace -1 indices with a dummy index (0) and mask them out
             # This avoids dynamic control flow
             valid_mask = move_to_action_indices >= 0
@@ -378,35 +387,52 @@ class HiveGNNPolicyHetero(nn.Module):
             # White wants to maximize (pick best move) -> white_value = max
             # Black wants to minimize (pick best move) -> black_value = min
 
-            legal_mask = torch.isfinite(action_values)
-            if legal_mask.any():
-                legal_values = action_values[legal_mask]
+            if use_action_space:
+                # Use action space values
+                legal_mask = torch.isfinite(action_values)
+                if legal_mask.any():
+                    legal_values = action_values[legal_mask]
 
-                # White value: best outcome for White (maximum)
-                white_value = legal_values.max().unsqueeze(0).unsqueeze(0)  # [1, 1]
-                # Find index of maximum among legal actions only
-                # Create a tensor with -inf for illegal actions, then argmax
-                white_masked = torch.where(
-                    legal_mask,
-                    action_values,
-                    torch.tensor(float("-inf"), device=device, dtype=dtype),
-                )
-                white_action_idx = torch.argmax(white_masked).unsqueeze(0)  # [1]
+                    # White value: best outcome for White (maximum)
+                    white_value = legal_values.max().unsqueeze(0).unsqueeze(0)  # [1, 1]
+                    # Find index of maximum among legal actions only
+                    white_masked = torch.where(
+                        legal_mask,
+                        action_values,
+                        torch.tensor(float("-inf"), device=device, dtype=dtype),
+                    )
+                    white_action_idx = torch.argmax(white_masked).unsqueeze(0)  # [1]
 
-                # Black value: best outcome for Black (minimum)
-                black_value = legal_values.min().unsqueeze(0).unsqueeze(0)  # [1, 1]
-                # Find index of minimum among legal actions only
-                # Create a tensor with +inf for illegal actions, then argmin
-                black_masked = torch.where(
-                    legal_mask,
-                    action_values,
-                    torch.tensor(float("inf"), device=device, dtype=dtype),
-                )
-                black_action_idx = torch.argmin(black_masked).unsqueeze(0)  # [1]
+                    # Black value: best outcome for Black (minimum)
+                    black_value = legal_values.min().unsqueeze(0).unsqueeze(0)  # [1, 1]
+                    # Find index of minimum among legal actions only
+                    black_masked = torch.where(
+                        legal_mask,
+                        action_values,
+                        torch.tensor(float("inf"), device=device, dtype=dtype),
+                    )
+                    black_action_idx = torch.argmin(black_masked).unsqueeze(0)  # [1]
+                else:
+                    # No legal moves - neutral value
+                    white_value = torch.zeros(1, 1, device=device, dtype=dtype)
+                    black_value = torch.zeros(1, 1, device=device, dtype=dtype)
+                    white_action_idx = torch.zeros(1, device=device, dtype=torch.long)
+                    black_action_idx = torch.zeros(1, device=device, dtype=torch.long)
             else:
-                # No legal moves - neutral value
-                white_value = torch.zeros(1, 1, device=device, dtype=dtype)
-                black_value = torch.zeros(1, 1, device=device, dtype=dtype)
+                # No action space mapping - compute directly from masked_values
+                # This can happen if move_to_action_indices doesn't align (e.g., batching issue)
+                if len(masked_values) > 0:
+                    legal_values = masked_values[torch.isfinite(masked_values)]
+                    if len(legal_values) > 0:
+                        white_value = legal_values.max().unsqueeze(0).unsqueeze(0)
+                        black_value = legal_values.min().unsqueeze(0).unsqueeze(0)
+                    else:
+                        white_value = torch.zeros(1, 1, device=device, dtype=dtype)
+                        black_value = torch.zeros(1, 1, device=device, dtype=dtype)
+                else:
+                    white_value = torch.zeros(1, 1, device=device, dtype=dtype)
+                    black_value = torch.zeros(1, 1, device=device, dtype=dtype)
+                # No action indices available
                 white_action_idx = torch.zeros(1, device=device, dtype=torch.long)
                 black_action_idx = torch.zeros(1, device=device, dtype=torch.long)
         else:
@@ -420,28 +446,23 @@ class HiveGNNPolicyHetero(nn.Module):
 
             if len(masked_values) > 0:
                 # Get batch assignment for move edges
-                # Move edges come from either in_play->dest or out_of_play->dest
+                # IMPORTANT: Must collect in the same order as compute_move_edge_values
+                # which iterates over edge_index_dict.keys()
                 move_edge_batch = []
 
-                # Collect batch indices for in_play -> destination moves
-                move_key = ("in_play", "move", "destination")
-                if (
-                    move_key in edge_index_dict
-                    and edge_index_dict[move_key].shape[1] > 0
-                ):
-                    src_indices = edge_index_dict[move_key][0]
-                    if "in_play" in batch_dict:
-                        move_edge_batch.append(batch_dict["in_play"][src_indices])
+                # Iterate in the same order as compute_move_edge_values
+                for edge_type_tuple in edge_index_dict.keys():
+                    src_type, edge_type, dst_type = edge_type_tuple
+                    if "move" in edge_type or "rev_move" in edge_type:
+                        edge_idx = edge_index_dict[edge_type_tuple]
 
-                # Collect batch indices for out_of_play -> destination moves
-                move_key = ("out_of_play", "move", "destination")
-                if (
-                    move_key in edge_index_dict
-                    and edge_index_dict[move_key].shape[1] > 0
-                ):
-                    src_indices = edge_index_dict[move_key][0]
-                    if "out_of_play" in batch_dict:
-                        move_edge_batch.append(batch_dict["out_of_play"][src_indices])
+                        if edge_idx.shape[1] > 0:  # Has edges of this type
+                            # Get batch assignment from source nodes
+                            src_indices = edge_idx[0]
+                            if src_type in batch_dict:
+                                move_edge_batch.append(
+                                    batch_dict[src_type][src_indices]
+                                )
 
                 if move_edge_batch:
                     # Concatenate batch assignments for all move edges
@@ -449,23 +470,39 @@ class HiveGNNPolicyHetero(nn.Module):
 
                     # Compute white_value (max) and black_value (min) per graph
                     # Action values are absolute: +1 = White winning, -1 = Black winning
+                    # IMPORTANT: Only consider finite values (current player's moves)
+                    # masked_values has -inf for opponent moves, which should be excluded
                     from torch_geometric.utils import scatter
 
-                    white_value = scatter(
-                        masked_values.unsqueeze(-1),
-                        all_move_batch,
-                        dim=0,
-                        reduce="max",
-                        dim_size=batch_size,
-                    )  # [batch_size, 1]
+                    # Filter out -inf values (opponent moves) before scatter
+                    finite_mask = torch.isfinite(masked_values)
+                    if finite_mask.any():
+                        finite_values = masked_values[finite_mask]
+                        finite_batch = all_move_batch[finite_mask]
 
-                    black_value = scatter(
-                        masked_values.unsqueeze(-1),
-                        all_move_batch,
-                        dim=0,
-                        reduce="min",
-                        dim_size=batch_size,
-                    )  # [batch_size, 1]
+                        white_value = scatter(
+                            finite_values.unsqueeze(-1),
+                            finite_batch,
+                            dim=0,
+                            reduce="max",
+                            dim_size=batch_size,
+                        )  # [batch_size, 1]
+
+                        black_value = scatter(
+                            finite_values.unsqueeze(-1),
+                            finite_batch,
+                            dim=0,
+                            reduce="min",
+                            dim_size=batch_size,
+                        )  # [batch_size, 1]
+                    else:
+                        # No finite values - all opponent moves (shouldn't happen)
+                        white_value = torch.zeros(
+                            batch_size, 1, device=device, dtype=dtype
+                        )
+                        black_value = torch.zeros(
+                            batch_size, 1, device=device, dtype=dtype
+                        )
 
                     # Find action indices corresponding to best values
                     # For batched case, we need to find argmax/argmin per graph
