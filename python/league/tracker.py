@@ -409,14 +409,17 @@ class LeagueTracker:
 
         return results
 
-    def _load_model(self, agent: LeagueAgent, device: str) -> HiveGNN:
-        """Load model from checkpoint."""
+    def _load_model(self, agent: LeagueAgent, device: str):
         checkpoint = torch.load(agent.model_path, map_location=device)
+        model_type = checkpoint.get("model_type", "policy")
+        if model_type == "policy":
+            from model_policy_hetero import create_policy_model
 
-        from model import create_model
+            model = create_policy_model(checkpoint.get("config", {})).to(device)
+        else:
+            from model import create_model
 
-        model_config = checkpoint.get("config", {})
-        model = create_model(model_config).to(device)
+            model = create_model(checkpoint.get("config", {})).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
 

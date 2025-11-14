@@ -180,7 +180,7 @@ def evaluate_model(
         "total_time": 0,
     }
 
-    games_per_side = num_games // 2
+    games_per_side = -(-num_games // 2)  # Ceiling division
 
     if verbose:
         print(f"Evaluating model vs engine (depth {engine_depth})...")
