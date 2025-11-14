@@ -556,13 +556,23 @@ def train_main_exploiter(
     print(
         f"\nGenerating {config.exploiter_games_per_iter} exploiter games with minimax rewards..."
     )
-    games = exploiter_player.generate_training_data(
-        num_games=config.exploiter_games_per_iter,
-        exploiter_is_white=True,  # Alternate in production
-    )
+    games = []
+    greedy_games = []
+    for i in range(config.exploiter_games_per_iter):
+        # Alternate epsilon: half greedy (epsilon=0), half exploratory (epsilon=config.exploiter_epsilon or 0.1)
+        epsilon = 0.0 if i % 2 == 0 else exploiter_player.epsilon
+        exploiter_player.epsilon = epsilon
+        game_data, result, branch_id = exploiter_player.play_game_with_minimax_rewards(
+            exploiter_is_white=(i % 2 == 0)
+        )
+        games.append((game_data, result, branch_id))
+        if epsilon == 0.0:
+            greedy_games.append((game_data, result, branch_id))
+    # Restore exploiter_player.epsilon to original value
+    exploiter_player.epsilon = config.minimax_reward_weight
 
     # Record results
-    for game_data, result, _ in games:
+    for idx, (game_data, result, _) in enumerate(games):
         # Result is from White's perspective
         exploiter_result = result  # Exploiter is White
         main_result = -result
@@ -634,20 +644,18 @@ def train_main_exploiter(
     win_rate_vs_main = exploiter.get_win_rate_vs(main_agent.name)
     print(f"\nExploiter win rate vs {main_agent.name}: {win_rate_vs_main:.2%}")
 
-    # Get recent games for convergence check
+    # Get recent games for convergence check (only greedy games)
     recent_games = []
-    for opp_name, wins in exploiter.matchup_wins.items():
-        losses = exploiter.matchup_losses[opp_name]
-        draws = exploiter.matchup_draws[opp_name]
-        total = wins + losses + draws
-
-        # Approximate recent games (simplified)
-        for _ in range(wins):
-            recent_games.append((opp_name, 1.0))
-        for _ in range(losses):
-            recent_games.append((opp_name, -1.0))
-        for _ in range(draws):
-            recent_games.append((opp_name, 0.0))
+    for game_data, result, _ in greedy_games:
+        # Only count results from greedy games
+        # Result is from exploiter's perspective
+        # Use main_agent.name as opponent
+        if result > 0.5:
+            recent_games.append((main_agent.name, 1.0))
+        elif result < -0.5:
+            recent_games.append((main_agent.name, -1.0))
+        else:
+            recent_games.append((main_agent.name, 0.0))
 
     is_converged = league_manager.check_exploiter_convergence(exploiter, recent_games)
     exploiter.is_converged = is_converged
