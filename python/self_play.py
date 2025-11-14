@@ -347,10 +347,17 @@ class SelfPlayGame:
             # Normalize (should already be normalized)
             legal_probs = legal_probs / legal_probs.sum()
 
-        # Sample action index
-        selected_action_idx = np.random.choice(
-            valid_indices.cpu().numpy(), p=legal_probs
-        )
+        # We want to pick the best move with probability 1-epsilon,
+        # and a random move with probability epsilon
+        if random.random() < self.epsilon:
+            # Random move
+            selected_action_idx = np.random.choice(
+                valid_indices.cpu().numpy()
+            )  # Uniform
+        else:
+            # Best move according to policy
+            selected_action_idx = action_idx.item()
+
         selected_move_str = action_to_str[selected_action_idx]
 
         # Find the corresponding move object
