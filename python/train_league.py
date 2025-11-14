@@ -54,9 +54,10 @@ def create_model_by_type(model_type, model_config):
         return create_model(model_config)
 
 
-def train_epoch_standard(model, training_data, optimizer, batch_size=32, device="cpu"):
+def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device="cpu"):
     """
-    Train model for one epoch using TD loss only.
+    Train model for one epoch using TD loss only (self-play format).
+    Expects training_data as 7-element tuples.
 
     With the new architecture, both policy and value heads derive from the same action values:
     - Value = max(action_values)
@@ -80,25 +81,16 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
     from hetero_graph_utils import prepare_model_inputs
     from torch_geometric.data import HeteroData
 
-    model = model.to(device)  # <-- Ensure model is on the correct device
+    model = model.to(device)
     model.train()
     total_loss = 0
     num_batches = 0
 
-    # Check if this is a heterogeneous model
-    is_hetero = hasattr(model, "node_embedding")
+    from torch_geometric.loader import DataLoader as PyGDataLoader
 
-    if is_hetero:
-        # Handle heterogeneous data - batch using PyTorch Geometric's DataLoader
-        from action_space import get_action_space_size
-        from torch_geometric.loader import DataLoader as PyGDataLoader
-
-        # Prepare data list for batching
-        # Format: (hetero_data, move_to_action_indices, target, action_idx, next_data, next_indices, player)
-        data_list = []
-        next_state_list = []
-
-        for item in training_data:
+    data_list = []
+    for item in training_data:
+        if len(item) == 7:
             (
                 hetero_data,
                 move_to_action_indices,
@@ -108,169 +100,221 @@ def train_epoch_standard(model, training_data, optimizer, batch_size=32, device=
                 next_move_to_action_indices,
                 current_player,
             ) = item
+        else:
+            continue
 
-            if not isinstance(hetero_data, HeteroData):
-                continue
+        if not isinstance(hetero_data, HeteroData):
+            continue
 
-            # Ensure hetero_data is on CPU (in case it was moved to device in previous epoch)
-            hetero_data = hetero_data.cpu()
+        hetero_data = hetero_data.cpu()
+        hetero_data.y = torch.tensor([target], dtype=torch.float32)
+        hetero_data.move_to_action_indices = move_to_action_indices.cpu()
+        hetero_data.selected_action_idx = torch.tensor(
+            [selected_action_idx], dtype=torch.long
+        )
+        hetero_data.has_next_state = torch.tensor(
+            [next_hetero_data is not None], dtype=torch.bool
+        )
+        player_int = 0 if current_player.name == "White" else 1
+        hetero_data.current_player = torch.tensor([player_int], dtype=torch.long)
+        data_list.append(hetero_data)
 
-            # Attach metadata for batching (ensure all on CPU for PyG DataLoader)
-            hetero_data.y = torch.tensor([target], dtype=torch.float32)
-            hetero_data.move_to_action_indices = move_to_action_indices.cpu()
-            hetero_data.selected_action_idx = torch.tensor(
-                [selected_action_idx], dtype=torch.long
-            )
-            hetero_data.has_next_state = torch.tensor(
-                [next_hetero_data is not None], dtype=torch.bool
-            )
-            # current_player is Color enum: convert to int (White=0, Black=1)
-            player_int = 0 if current_player.name == "White" else 1
-            hetero_data.current_player = torch.tensor([player_int], dtype=torch.long)
+    if len(data_list) == 0:
+        return 0.0
 
-            data_list.append(hetero_data)
+    loader = PyGDataLoader(data_list, batch_size=batch_size, shuffle=False)
+    for batch in tqdm(loader, desc="Training batches", leave=False, unit="batch"):
+        batch = batch.to(device)
 
-            # Store next state info (keep original index for alignment)
-            # Ensure next state is also on CPU if it exists
-            if next_hetero_data is not None:
-                next_hetero_data = next_hetero_data.cpu()
-            next_state_list.append((next_hetero_data, next_move_to_action_indices))
-
-        if len(data_list) == 0:
-            return 0.0
-
-        # Create DataLoader for batching heterogeneous graphs
-        loader = PyGDataLoader(
-            data_list, batch_size=batch_size, shuffle=False
-        )  # Don't shuffle to maintain alignment with next_state_list
-
-        batch_idx = 0
-        for batch in tqdm(loader, desc="Training batches", leave=False, unit="batch"):
-            batch = batch.to(device)
-
-            # Explicitly move custom tensor attributes
-            def recursive_to(obj, device):
-                if torch.is_tensor(obj):
-                    return obj.to(device)
-                elif isinstance(obj, list):
-                    return [recursive_to(x, device) for x in obj]
-                elif isinstance(obj, dict):
-                    return {k: recursive_to(v, device) for k, v in obj.items()}
-                else:
-                    return obj
-
-            if hasattr(batch, "move_to_action_indices"):
-                batch.move_to_action_indices = recursive_to(
-                    batch.move_to_action_indices, device
-                )
-            if hasattr(batch, "selected_action_idx"):
-                batch.selected_action_idx = batch.selected_action_idx.to(device)
-            if hasattr(batch, "current_player"):
-                batch.current_player = batch.current_player.to(device)
-            if hasattr(batch, "has_next_state"):
-                batch.has_next_state = batch.has_next_state.to(device)
-            # Move all node and edge tensors inside batch to device
-            for node_type in batch.node_types:
-                if hasattr(batch[node_type], "x"):
-                    batch[node_type].x = batch[node_type].x.to(device)
-            for edge_type in batch.edge_types:
-                if hasattr(batch[edge_type], "edge_index"):
-                    batch[edge_type].edge_index = batch[edge_type].edge_index.to(device)
-                if hasattr(batch[edge_type], "edge_attr"):
-                    batch[edge_type].edge_attr = batch[edge_type].edge_attr.to(device)
-            batch_size_actual = batch.y.shape[0]
-
-            optimizer.zero_grad()
-
-            # Prepare inputs from batch (preserves batch information)
-            x_dict, edge_index_dict, edge_attr_dict, _ = prepare_model_inputs(
-                batch, batch.move_to_action_indices
-            )
-
-            # Move all x_dict, edge_index_dict, edge_attr_dict to device
-            x_dict = {k: v.to(device) for k, v in x_dict.items()}
-            edge_index_dict = {k: v.to(device) for k, v in edge_index_dict.items()}
-            edge_attr_dict = {k: v.to(device) for k, v in edge_attr_dict.items()}
-
-            # Forward pass - heterogeneous policy model
-            # For batched training, action_logits is a placeholder (not used)
-            _, white_value, black_value, _, _ = model(
-                x_dict, edge_index_dict, edge_attr_dict, batch.move_to_action_indices
-            )
-
-            # Select appropriate value based on current player
-            # current_player: 0=White, 1=Black
-            # White uses white_value (max), Black uses black_value (min)
-            value_current = torch.where(
-                batch.current_player == 0,
-                white_value.squeeze(-1),
-                black_value.squeeze(-1),
-            )  # [batch_size]
-
-            predictions = value_current
-            targets = batch.y.squeeze()
-
-            # TD Loss (value network supervised by game outcome)
-            loss = F.mse_loss(predictions, targets)
-
-            # Backward pass
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            num_batches += 1
-            batch_idx += 1
-
-        # Return average TD loss
-        avg_loss = total_loss / max(num_batches, 1)
-        return avg_loss
-
-    else:
-        # Handle homogeneous data (old format - shouldn't be used anymore)
-        data_list = []
-        for item in training_data:
-            if len(item) == 3:
-                node_features, edge_index, target = item
-                if len(node_features) == 0:
-                    continue
-
-                x = torch.tensor(node_features, dtype=torch.float32)
-                edge_index_tensor = torch.tensor(edge_index, dtype=torch.long)
-
-                data = Data(x=x, edge_index=edge_index_tensor)
-                data.y = torch.tensor([target], dtype=torch.float32)
-                data_list.append(data)
-
-        if len(data_list) == 0:
-            return 0.0, 0.0, 0.0
-
-        loader = DataLoader(data_list, batch_size=batch_size, shuffle=True)
-
-        for batch in tqdm(loader, desc="Training batches", leave=False, unit="batch"):
-            batch = batch.to(device)
-            optimizer.zero_grad()
-
-            # Forward pass
-            output1, output2 = model(batch.x, batch.edge_index, batch.batch)
-
-            # Check output shapes to determine which is the value
-            if output1.shape[-1] == 1 or output1.dim() == 1:
-                predictions = output1.squeeze()
+        # Explicitly move custom tensor attributes
+        def recursive_to(obj, device):
+            if torch.is_tensor(obj):
+                return obj.to(device)
+            elif isinstance(obj, list):
+                return [recursive_to(x, device) for x in obj]
+            elif isinstance(obj, dict):
+                return {k: recursive_to(v, device) for k, v in obj.items()}
             else:
-                predictions = output2.squeeze()
+                return obj
 
-            targets = batch.y
+        if hasattr(batch, "move_to_action_indices"):
+            batch.move_to_action_indices = recursive_to(
+                batch.move_to_action_indices, device
+            )
+        if hasattr(batch, "selected_action_idx"):
+            batch.selected_action_idx = batch.selected_action_idx.to(device)
+        if hasattr(batch, "current_player"):
+            batch.current_player = batch.current_player.to(device)
+        if hasattr(batch, "has_next_state"):
+            batch.has_next_state = batch.has_next_state.to(device)
+        # Move all node and edge tensors inside batch to device
+        for node_type in batch.node_types:
+            if hasattr(batch[node_type], "x"):
+                batch[node_type].x = batch[node_type].x.to(device)
+        for edge_type in batch.edge_types:
+            if hasattr(batch[edge_type], "edge_index"):
+                batch[edge_type].edge_index = batch[edge_type].edge_index.to(device)
+            if hasattr(batch[edge_type], "edge_attr"):
+                batch[edge_type].edge_attr = batch[edge_type].edge_attr.to(device)
 
-            # MSE loss
-            loss = F.mse_loss(predictions, targets)
+        optimizer.zero_grad()
 
-            # Backward pass
-            loss.backward()
-            optimizer.step()
+        # Prepare inputs from batch (preserves batch information)
+        x_dict, edge_index_dict, edge_attr_dict, _ = prepare_model_inputs(
+            batch, batch.move_to_action_indices
+        )
 
-            total_loss += loss.item()
-            num_batches += 1
+        # Move all x_dict, edge_index_dict, edge_attr_dict to device
+        x_dict = {k: v.to(device) for k, v in x_dict.items()}
+        edge_index_dict = {k: v.to(device) for k, v in edge_index_dict.items()}
+        edge_attr_dict = {k: v.to(device) for k, v in edge_attr_dict.items()}
 
+        # Forward pass - heterogeneous policy model
+        # For batched training, action_logits is a placeholder (not used)
+        _, white_value, black_value, _, _ = model(
+            x_dict, edge_index_dict, edge_attr_dict, batch.move_to_action_indices
+        )
+
+        # Select appropriate value based on current player
+        # current_player: 0=White, 1=Black
+        # White uses white_value (max), Black uses black_value (min)
+        value_current = torch.where(
+            batch.current_player == 0,
+            white_value.squeeze(-1),
+            black_value.squeeze(-1),
+        )  # [batch_size]
+
+        predictions = value_current
+        targets = batch.y.squeeze()
+
+        # TD Loss (value network supervised by game outcome)
+        loss = F.mse_loss(predictions, targets)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        num_batches += 1
+
+    # Return average TD loss
+    avg_loss = total_loss / max(num_batches, 1)
+    return avg_loss
+
+
+def train_epoch_exploiter(model, training_data, optimizer, batch_size=32, device="cpu"):
+    """
+    Train model for one epoch using TD loss only (exploiter format).
+    Expects training_data as 3-element tuples.
+
+    With the new architecture, both policy and value heads derive from the same action values:
+    - Value = max(action_values)
+    - Policy = softmax(action_values)
+
+    Since they share the same parameters (action_value_head), we only need to train on the value target.
+    The policy automatically learns to assign higher probabilities to better moves.
+
+    Loss: TD Loss (value network) = MSE between predicted value V(S_t) and target value
+
+    Args:
+        model: GNN model (heterogeneous policy model with action_value_head)
+        training_data: List of (hetero_data, move_to_action_indices, target_value)
+        optimizer: Optimizer
+        batch_size: Batch size
+        device: Device
+
+    Returns:
+        Average TD loss
+    """
+    from hetero_graph_utils import prepare_model_inputs
+    from torch_geometric.data import HeteroData
+
+    model = model.to(device)
+    model.train()
+    total_loss = 0
+    num_batches = 0
+
+    from torch_geometric.loader import DataLoader as PyGDataLoader
+
+    data_list = []
+    for item in training_data:
+        if len(item) == 3:
+            hetero_data, move_to_action_indices, target = item
+        else:
+            continue
+
+        if not isinstance(hetero_data, HeteroData):
+            continue
+
+        hetero_data = hetero_data.cpu()
+        hetero_data.y = torch.tensor([target], dtype=torch.float32)
+        hetero_data.move_to_action_indices = move_to_action_indices.cpu()
+        data_list.append(hetero_data)
+
+    if len(data_list) == 0:
+        return 0.0
+
+    loader = PyGDataLoader(data_list, batch_size=batch_size, shuffle=False)
+    for batch in tqdm(loader, desc="Training batches", leave=False, unit="batch"):
+        batch = batch.to(device)
+
+        # Explicitly move custom tensor attributes
+        def recursive_to(obj, device):
+            if torch.is_tensor(obj):
+                return obj.to(device)
+            elif isinstance(obj, list):
+                return [recursive_to(x, device) for x in obj]
+            elif isinstance(obj, dict):
+                return {k: recursive_to(v, device) for k, v in obj.items()}
+            else:
+                return obj
+
+        if hasattr(batch, "move_to_action_indices"):
+            batch.move_to_action_indices = recursive_to(
+                batch.move_to_action_indices, device
+            )
+        for node_type in batch.node_types:
+            if hasattr(batch[node_type], "x"):
+                batch[node_type].x = batch[node_type].x.to(device)
+        for edge_type in batch.edge_types:
+            if hasattr(batch[edge_type], "edge_index"):
+                batch[edge_type].edge_index = batch[edge_type].edge_index.to(device)
+            if hasattr(batch[edge_type], "edge_attr"):
+                batch[edge_type].edge_attr = batch[edge_type].edge_attr.to(device)
+
+        optimizer.zero_grad()
+
+        # Prepare inputs from batch (preserves batch information)
+        x_dict, edge_index_dict, edge_attr_dict, _ = prepare_model_inputs(
+            batch, batch.move_to_action_indices
+        )
+
+        # Move all x_dict, edge_index_dict, edge_attr_dict to device
+        x_dict = {k: v.to(device) for k, v in x_dict.items()}
+        edge_index_dict = {k: v.to(device) for k, v in edge_index_dict.items()}
+        edge_attr_dict = {k: v.to(device) for k, v in edge_attr_dict.items()}
+
+        # Forward pass - heterogeneous policy model
+        # For batched training, action_logits is a placeholder (not used)
+        _, white_value, black_value, _, _ = model(
+            x_dict, edge_index_dict, edge_attr_dict, batch.move_to_action_indices
+        )
+
+        # For exploiter training, always use white_value
+        predictions = white_value.squeeze(-1)
+        targets = batch.y.squeeze()
+
+        # TD Loss (value network supervised by game outcome)
+        loss = F.mse_loss(predictions, targets)
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        num_batches += 1
+
+    # Return average TD loss
     avg_loss = total_loss / max(num_batches, 1)
     return avg_loss
 
@@ -396,7 +440,7 @@ def train_main_agent(
     for epoch in tqdm(
         range(config.main_agent_epochs), desc="Training epochs", unit="epoch"
     ):
-        loss = train_epoch_standard(
+        loss = train_epoch_selfplay(
             model,
             training_data,
             optimizer,
@@ -542,7 +586,7 @@ def train_main_exploiter(
     for epoch in tqdm(
         range(config.exploiter_epochs), desc="Training epochs", unit="epoch"
     ):
-        loss = train_epoch_standard(
+        loss = train_epoch_exploiter(
             model,
             training_data,
             optimizer,
