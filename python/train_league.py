@@ -1000,10 +1000,65 @@ def main():
 
             # Show current leaderboard
             print("\nCurrent ELO Leaderboard:")
-            for rank, (player, rating) in enumerate(
-                league_tracker.elo_tracker.get_leaderboard(10), 1
-            ):
+            leaderboard = [
+                (player, rating)
+                for player, rating in league_tracker.elo_tracker.get_leaderboard(10)
+                if player in league_tracker.agent_elo_history
+                and league_tracker.agent_elo_history[player]
+            ]
+            for rank, (player, rating) in enumerate(leaderboard, 1):
                 print(f"  {rank}. {player}: {rating:.1f}")
+
+            # Simulate matches between latest batch of models and other leaderboard models
+            # Only include agents that have played evaluation games
+            leaderboard_agents = [
+                agent
+                for agent in league_manager.get_all_agents()
+                if agent.name in league_tracker.agent_elo_history
+                and league_tracker.agent_elo_history[agent.name]
+            ]
+            # Latest batch: current main agent and any exploiters spawned this iteration
+            latest_agents = []
+            if (
+                league_manager.current_main_agent
+                and league_manager.current_main_agent.name
+                in league_tracker.agent_elo_history
+            ):
+                latest_agents.append(league_manager.current_main_agent)
+            if (
+                league_manager.current_main_exploiter
+                and league_manager.current_main_exploiter.name
+                in league_tracker.agent_elo_history
+            ):
+                latest_agents.append(league_manager.current_main_exploiter)
+            if (
+                league_manager.current_league_exploiter
+                and league_manager.current_league_exploiter.name
+                in league_tracker.agent_elo_history
+            ):
+                latest_agents.append(league_manager.current_league_exploiter)
+
+            # For each pair (latest_agent, leaderboard_agent) where names differ, simulate matches
+            for agent_a in latest_agents:
+                for agent_b in leaderboard_agents:
+                    if agent_a.name == agent_b.name:
+                        continue
+                    print(
+                        f"\nSimulating evaluation matches: {agent_a.name} vs {agent_b.name}"
+                    )
+                    results = league_tracker.evaluate_head_to_head(
+                        agent_a,
+                        agent_b,
+                        num_games=args.eval_games,
+                        device=config.train_device,
+                        iteration=iteration,
+                        inference_batch_size=config.inference_batch_size,
+                    )
+                    print(
+                        f"  {agent_a.name} win rate: {results['agent1_win_rate']:.2%}, "
+                        f"{agent_b.name} win rate: {results['agent2_win_rate']:.2%}, "
+                        f"draw rate: {results['draw_rate']:.2%}"
+                    )
 
     # Final summary
     print(f"\n{'='*80}")
