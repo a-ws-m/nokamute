@@ -477,12 +477,12 @@ class LeagueTracker:
         """
         leaderboard = self.elo_tracker.get_leaderboard(top_n)
 
-        # Filter out agents with no ELO history (never played evaluation games)
+        # Only include agents that have played at least one evaluation game
         leaderboard = [
             (agent_name, elo_rating)
             for agent_name, elo_rating in leaderboard
             if agent_name in self.agent_elo_history
-            and self.agent_elo_history[agent_name]
+            and len(self.agent_elo_history[agent_name]) > 0
         ]
 
         for rank, (agent_name, elo_rating) in enumerate(leaderboard, 1):

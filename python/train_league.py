@@ -1004,7 +1004,7 @@ def main():
                 (player, rating)
                 for player, rating in league_tracker.elo_tracker.get_leaderboard(10)
                 if player in league_tracker.agent_elo_history
-                and league_tracker.agent_elo_history[player]
+                and len(league_tracker.agent_elo_history[player]) > 0
             ]
             for rank, (player, rating) in enumerate(leaderboard, 1):
                 print(f"  {rank}. {player}: {rating:.1f}")
@@ -1015,7 +1015,7 @@ def main():
                 agent
                 for agent in league_manager.get_all_agents()
                 if agent.name in league_tracker.agent_elo_history
-                and league_tracker.agent_elo_history[agent.name]
+                and len(league_tracker.agent_elo_history[agent.name]) > 0
             ]
             # Latest batch: current main agent and any exploiters spawned this iteration
             latest_agents = []
