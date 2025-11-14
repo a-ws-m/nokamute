@@ -205,7 +205,7 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
 def train_epoch_exploiter(model, training_data, optimizer, batch_size=32, device="cpu"):
     """
     Train model for one epoch using TD loss only (exploiter format).
-    Expects training_data as 3-element tuples.
+    Expects training_data as 4-element tuples: (hetero_data, move_to_action_indices, target_value, exploiter_colour)
 
     With the new architecture, both policy and value heads derive from the same action values:
     - Value = max(action_values)
@@ -218,7 +218,7 @@ def train_epoch_exploiter(model, training_data, optimizer, batch_size=32, device
 
     Args:
         model: GNN model (heterogeneous policy model with action_value_head)
-        training_data: List of (hetero_data, move_to_action_indices, target_value)
+        training_data: List of (hetero_data, move_to_action_indices, target_value, exploiter_colour)
         optimizer: Optimizer
         batch_size: Batch size
         device: Device
@@ -237,9 +237,11 @@ def train_epoch_exploiter(model, training_data, optimizer, batch_size=32, device
     from torch_geometric.loader import DataLoader as PyGDataLoader
 
     data_list = []
+    exploiter_colours = []
     for item in training_data:
-        if len(item) == 3:
-            hetero_data, move_to_action_indices, target = item
+        # Expecting (hetero_data, move_to_action_indices, target, exploiter_colour)
+        if len(item) == 4:
+            hetero_data, move_to_action_indices, target, exploiter_colour = item
         else:
             continue
 
@@ -250,12 +252,22 @@ def train_epoch_exploiter(model, training_data, optimizer, batch_size=32, device
         hetero_data.y = torch.tensor([target], dtype=torch.float32)
         hetero_data.move_to_action_indices = move_to_action_indices.cpu()
         data_list.append(hetero_data)
+        exploiter_colours.append(exploiter_colour)
 
     if len(data_list) == 0:
         return 0.0
 
     loader = PyGDataLoader(data_list, batch_size=batch_size, shuffle=False)
-    for batch in tqdm(loader, desc="Training batches", leave=False, unit="batch"):
+
+    # Split exploiter_colours into batches
+    def batch_exploiter_colours(colours, batch_size):
+        for i in range(0, len(colours), batch_size):
+            yield colours[i : i + batch_size]
+
+    for batch, batch_colours in zip(
+        tqdm(loader, desc="Training batches", leave=False, unit="batch"),
+        batch_exploiter_colours(exploiter_colours, batch_size),
+    ):
         batch = batch.to(device)
 
         # Explicitly move custom tensor attributes
@@ -295,13 +307,22 @@ def train_epoch_exploiter(model, training_data, optimizer, batch_size=32, device
         edge_attr_dict = {k: v.to(device) for k, v in edge_attr_dict.items()}
 
         # Forward pass - heterogeneous policy model
-        # For batched training, action_logits is a placeholder (not used)
         _, white_value, black_value, _, _ = model(
             x_dict, edge_index_dict, edge_attr_dict, batch.move_to_action_indices
         )
 
-        # For exploiter training, always use white_value
-        predictions = white_value.squeeze(-1)
+        # Select appropriate value based on exploiter's colour
+        # batch_colours: list of "White" or "Black"
+        batch_colours_tensor = torch.tensor(
+            [0 if c == "White" else 1 for c in batch_colours], device=device
+        )
+        value_current = torch.where(
+            batch_colours_tensor == 0,
+            white_value.squeeze(-1),
+            black_value.squeeze(-1),
+        )  # [batch_size]
+
+        predictions = value_current
         targets = batch.y.squeeze()
 
         # TD Loss (value network supervised by game outcome)
