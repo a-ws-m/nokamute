@@ -23,7 +23,7 @@ class LeagueConfig:
     exploiter_games_per_iter: int = 20
 
     # Minimax reward settings
-    minimax_reward_weight: float = 1.0  # Weight of minimax reward vs game outcome
+    minimax_reward_weight: float = 0.3  # Weight of minimax reward vs game outcome
     minimax_gamma: float = 0.99  # Discount factor for minimax reward
 
     # PFSP (Prioritized Fictitious Self-Play) settings

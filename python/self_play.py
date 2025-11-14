@@ -926,6 +926,32 @@ class SelfPlayGame:
         }
 
 
+def compute_td_lambda_targets(move_values, final_result, gamma=0.99, lambda_=0.2):
+    """
+    Compute TD-lambda targets for a trajectory.
+
+    Args:
+        move_values: List of move values for each position in the trajectory
+        final_result: Final game result
+        gamma: Discount factor
+        lambda_: TD-lambda parameter
+
+    Returns:
+        List of TD-lambda targets for each position
+    """
+    T = len(move_values)
+    td_targets = []
+    for t in range(T):
+        td_lambda = 0.0
+        for n in range(1, T - t):
+            v_tp_n = move_values[t + n] if (t + n) < T else final_result
+            g_n = (gamma**n) * v_tp_n
+            td_lambda += (1 - lambda_) * (lambda_ ** (n - 1)) * g_n
+        td_lambda += (lambda_ ** (T - t - 1)) * final_result
+        td_targets.append(td_lambda)
+    return td_targets
+
+
 def prepare_training_data(games):
     """
     Convert self-play games to training data.
@@ -997,7 +1023,10 @@ def prepare_training_data(games):
                 else:
                     move_values[i] = final_result
 
-        # For each position, compute TD-lambda target
+        td_targets = compute_td_lambda_targets(
+            move_values, final_result, gamma=gamma, lambda_=lambda_
+        )
+
         T = len(game_data)
         for t in range(T):
             # Get selected action index from UHP string
@@ -1039,24 +1068,11 @@ def prepare_training_data(games):
             else:
                 next_hetero_data, next_move_to_action_indices = None, None
 
-            # Compute TD-lambda target for position t
-            # n-step returns: G_t^{(n)} = sum_{k=0}^{n-1} gamma^k * r_{t+k} + gamma^n * V_{t+n}
-            # Here, r_{t+k} = 0 for all steps except the last, which is final_result
-            # V_{t+n} is move_value at t+n (except for terminal, which is final_result)
-            td_lambda = 0.0
-            for n in range(1, T - t):
-                # n-step return: use move_value at t+n
-                v_tp_n = move_values[t + n] if (t + n) < T else final_result
-                g_n = (gamma**n) * v_tp_n
-                td_lambda += (1 - lambda_) * (lambda_ ** (n - 1)) * g_n
-            # Add final MC return
-            td_lambda += (lambda_ ** (T - t - 1)) * final_result
-
             training_examples.append(
                 (
                     hetero_data,
                     move_to_action_indices,
-                    td_lambda,
+                    td_targets[t],
                     selected_action_idx,
                     next_hetero_data,
                     next_move_to_action_indices,
