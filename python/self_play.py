@@ -706,11 +706,7 @@ class SelfPlayGame:
             uhp_move_strings = graph_dict["move_to_action"]
 
             # Check for pass move
-            if (
-                len(legal_moves) == 1
-                and hasattr(legal_moves[0], "is_pass")
-                and legal_moves[0].is_pass()
-            ):
+            if len(legal_moves) == 1 and legal_moves[0].is_pass():
                 selected_move = legal_moves[0]
                 move_probs = {str(selected_move): 1.0}
                 move_value = PASS_PLACEHOLDER_VALUE

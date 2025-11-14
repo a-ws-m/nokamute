@@ -46,8 +46,9 @@ def play_interactive_game(model, device="cpu", human_first=True):
 
         # Check for pass
         if len(legal_moves) == 1 and legal_moves[0].is_pass():
-            print("No legal moves - game is a draw")
-            break
+            print("Must pass")
+            board.pass_turn()
+            continue
 
         # Display board state
         pieces = board.get_pieces()
@@ -128,8 +129,8 @@ def evaluate_vs_random(model, num_games=100, device="cpu"):
                 break
 
             if len(legal_moves) == 1 and legal_moves[0].is_pass():
-                results["draws"] += 1
-                break
+                board.pass_turn()
+                continue
 
             # Select move based on current player
             current_is_ai = (board.to_move().name == "White" and ai_is_white) or (
