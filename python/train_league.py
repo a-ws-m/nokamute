@@ -389,7 +389,7 @@ def train_main_agent(
 
     player = SelfPlayGame(
         model=model_for_gen,  # <-- model on gen_device
-        epsilon=0.1,
+        epsilon=config.epsilon,  # Epsilon-greedy sampling
         device=config.gen_device,
         enable_branching=config.enable_branching,
         max_moves=config.max_moves,
@@ -565,7 +565,7 @@ def train_main_exploiter(
         model=model_for_gen,  # <-- model on gen_device
         opponent_model=main_model,
         device=config.gen_device,
-        epsilon=0.1,
+        epsilon=config.epsilon,
         minimax_reward_weight=config.minimax_reward_weight,
         gamma=config.minimax_gamma,
         enable_branching=config.enable_branching,

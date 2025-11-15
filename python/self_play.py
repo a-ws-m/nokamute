@@ -975,7 +975,7 @@ def prepare_training_data(games):
     from hetero_graph_utils import board_to_hetero_data
 
     # TD-lambda implementation (lambda=0.2)
-    lambda_ = 0.2
+    lambda_ = 0.8
     gamma = 0.99
 
     training_examples = []

@@ -23,12 +23,12 @@ class LeagueConfig:
     exploiter_games_per_iter: int = 20
 
     # Minimax reward settings
-    minimax_reward_weight: float = 0.3  # Weight of minimax reward vs game outcome
+    minimax_reward_weight: float = 0.0  # Weight of minimax reward vs game outcome
     minimax_gamma: float = 0.99  # Discount factor for minimax reward
 
     # PFSP (Prioritized Fictitious Self-Play) settings
     pfsp_exponent: float = 2.0  # Exponent for (1 - win_rate)^exponent sampling
-    pfsp_epsilon: float = 0.1  # Probability of uniform sampling
+    pfsp_epsilon: float = 0.01  # Probability of uniform sampling
 
     # Convergence criteria
     main_exploiter_convergence_threshold: float = 0.70  # 70% win rate vs Main Agent
@@ -66,6 +66,9 @@ class LeagueConfig:
     )
     # None = evaluate all positions in single batch
     # Set to GPU capacity for optimal performance
+
+    # Epsilon-greedy sampling for play
+    epsilon: float = 0.01  # Default epsilon for epsilon-greedy move selection
 
     def __post_init__(self):
         """Validate configuration."""
