@@ -139,7 +139,7 @@ python evaluate.py \
 
 ```
 python/
-├── model.py           # GNN model architecture
+├── model_policy_hetero.py           # GNN model architecture (heterogeneous)
 ├── self_play.py       # Self-play game generation
 ├── train.py           # Main training script
 ├── evaluate.py        # Evaluation utilities

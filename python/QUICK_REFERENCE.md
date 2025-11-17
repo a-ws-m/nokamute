@@ -52,10 +52,10 @@ tracker.save()
 ## 3. Evaluate Model vs Engine
 
 ```python
-from model import create_model
+from model_policy_hetero import create_policy_model
 from evaluate_vs_engine import evaluate_model
 
-model = create_model()
+model = create_policy_model()
 
 # Simple evaluation
 results = evaluate_model(

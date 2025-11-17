@@ -5,7 +5,7 @@ Evaluation utilities for trained models.
 import argparse
 
 import torch
-from model import create_model
+from model_policy_hetero import create_policy_model
 from self_play import SelfPlayGame
 
 import nokamute
@@ -187,7 +187,7 @@ def main():
     checkpoint = torch.load(args.model, map_location=args.device)
 
     model_config = checkpoint.get("config", {})
-    model = create_model(model_config).to(args.device)
+    model = create_policy_model(model_config).to(args.device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 

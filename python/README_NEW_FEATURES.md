@@ -110,9 +110,9 @@ Comprehensive evaluation system for testing ML models against the Rust engine.
 
 ```python
 from evaluate_vs_engine import evaluate_model
-from model import create_model
+from model_policy_hetero import create_policy_model
 
-model = create_model()
+model = create_policy_model()
 
 results = evaluate_model(
     model=model,
@@ -224,7 +224,7 @@ tensorboard --logdir checkpoints/logs
 python/
 ├── elo_tracker.py          # ELO rating system
 ├── evaluate_vs_engine.py   # Model vs engine evaluation
-├── model.py                # GNN model (updated node features)
+├── model_policy_hetero.py  # GNN model (heterogeneous node/edge features)
 ├── train.py                # Training script (with ELO integration)
 ├── self_play.py            # Self-play game generation
 ├── demo_features.py        # Demo of new features
@@ -235,10 +235,10 @@ python/
 
 ```python
 # 1. Create model and tracker
-from model import create_model
+from model_policy_hetero import create_policy_model
 from elo_tracker import EloTracker
 
-model = create_model()
+model = create_policy_model()
 tracker = EloTracker(save_path="checkpoints/elo_history.json")
 
 # 2. Train with self-play

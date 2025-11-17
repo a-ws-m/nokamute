@@ -229,7 +229,7 @@ Based on the paper's findings:
 ## Integration with Existing Code
 
 The league system integrates seamlessly:
-- Uses existing `model.py` (HiveGNN)
+- Uses `model_policy_hetero.py` (HiveGNNPolicyHetero)
 - Uses existing `self_play.py` (game generation)
 - Uses existing `evaluate_vs_engine.py` (ELO tracking)
 - Uses existing `elo_tracker.py` (rating system)

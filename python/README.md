@@ -106,7 +106,7 @@ The model uses Graph Neural Networks to evaluate board positions:
 ## Files
 
 - `train.py`: Main self-play training script
-- `model.py`: GNN model architecture
+- `model_policy_hetero.py`: GNN model architecture (heterogeneous graph representation)
 - `self_play.py`: Self-play game generation
 - `evaluate.py`: Model evaluation utilities
 - `utils.py`: Helper functions

@@ -28,7 +28,6 @@ from league import (
     LeagueTracker,
     prepare_exploiter_training_data,
 )
-from model import create_model
 from model_policy_hetero import create_policy_model
 from self_play import SelfPlayGame, prepare_training_data
 from torch_geometric.data import Batch, Data
@@ -47,11 +46,17 @@ def create_model_by_type(model_type, model_config):
     Returns:
         Model instance
     """
-    if model_type == "policy":
-        # Policy now means heterogeneous policy model
+    # The homogeneous `model.py` has been removed; all model types now use
+    # the heterogeneous policy model implemented in `model_policy_hetero`.
+    if model_type in (None, "policy", "policy_hetero", "hetero"):
         return create_policy_model(model_config)
+    # For backward compatibility, if model_type was set to "value/old" we
+    # still instantiate the hetero model but emit a warning.
     else:
-        return create_model(model_config)
+        print(
+            f"Warning: legacy model_type '{model_type}' is unsupported — using heterogeneous policy model"
+        )
+        return create_policy_model(model_config)
 
 
 def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device="cpu"):

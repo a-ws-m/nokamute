@@ -84,7 +84,7 @@ from pretrain.eval_matching import (
     load_eval_data,
     normalize_evaluation
 )
-from model import create_model
+from model_policy_hetero import create_policy_model
 import torch
 
 # Generate data
@@ -100,7 +100,7 @@ data = generate_eval_matching_data(
 save_eval_data(data, "my_pretrain_data.pkl")
 
 # Create model
-model = create_model()
+model = create_policy_model()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 # Pre-train

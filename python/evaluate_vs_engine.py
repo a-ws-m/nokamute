@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from elo_tracker import EloTracker
-from model import HiveGNN
+from model_policy_hetero import HiveGNNPolicyHetero
 from self_play import SelfPlayGame
 
 import nokamute
@@ -148,7 +148,7 @@ def play_game(
 
 
 def evaluate_model(
-    model: HiveGNN,
+    model: HiveGNNPolicyHetero,
     engine_depth: int = 3,
     num_games: int = 20,
     device: str = "cpu",
@@ -239,7 +239,7 @@ def evaluate_model(
 
 
 def evaluate_and_update_elo(
-    model: HiveGNN,
+    model: HiveGNNPolicyHetero,
     model_name: str,
     elo_tracker: EloTracker,
     engine_depths: List[int] = [3],
@@ -348,9 +348,9 @@ if __name__ == "__main__":
     print("Testing evaluation module...")
 
     # Create a dummy model
-    from model import create_model
+    from model_policy_hetero import create_policy_model
 
-    model = create_model()
+    model = create_policy_model()
 
     # Test against engine
     results = evaluate_model(model, engine_depth=2, num_games=4, verbose=True)

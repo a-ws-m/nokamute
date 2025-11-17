@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from elo_tracker import EloTracker
 from league.manager import AgentArchetype, LeagueAgent
-from model import HiveGNN
+from model_policy_hetero import HiveGNNPolicyHetero
 from self_play import SelfPlayGame
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -412,14 +412,17 @@ class LeagueTracker:
     def _load_model(self, agent: LeagueAgent, device: str):
         checkpoint = torch.load(agent.model_path, map_location=device)
         model_type = checkpoint.get("model_type", "policy")
-        if model_type == "policy":
-            from model_policy_hetero import create_policy_model
+        # All legacy models have been consolidated into the heterogeneous policy
+        # model. If a non-policy type is found, log a warning and instantiate
+        # the heterogenous model anyway.
+        from model_policy_hetero import create_policy_model
 
-            model = create_policy_model(checkpoint.get("config", {})).to(device)
-        else:
-            from model import create_model
+        if model_type != "policy":
+            print(
+                f"Warning: legacy model_type '{model_type}' found in checkpoint; using heterogeneous policy model instead"
+            )
 
-            model = create_model(checkpoint.get("config", {})).to(device)
+        model = create_policy_model(checkpoint.get("config", {})).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
 

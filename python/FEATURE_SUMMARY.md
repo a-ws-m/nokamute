@@ -67,7 +67,7 @@ src/
 - Added ELO logging to TensorBoard
 - Enhanced training summary with ELO statistics
 
-### `python/model.py`
+### `python/model_policy_hetero.py` (replaces `model.py`)
 - Updated default node features from 4 to 11
 - Matches graph representation in Rust code
 

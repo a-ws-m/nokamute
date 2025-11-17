@@ -57,10 +57,10 @@ Each epoch:
 
 ```python
 from pretrain.eval_matching import pretrain_eval_matching
-from model import create_model
+from model_policy_hetero import create_policy_model
 
 # Create model
-model = create_model({"hidden_dim": 32, "num_layers": 3})
+model = create_policy_model({"hidden_dim": 32, "num_layers": 3})
 
 # Pre-train using branching Markov chain
 losses = pretrain_eval_matching(
