@@ -401,8 +401,8 @@ def test_first_move_action_value_evolution_with_train_main_agent(monkeypatch, tm
     model = create_policy_model({"hidden_dim": 64, "num_layers": 2, "num_heads": 2})
     model.eval()
 
-    # Monkeypatch get_winner to require grasshopper then ladybug (White) to win
-    def _mock_get_winner_grasshopper_ladybug(self):
+    # Monkeypatch get_winner to require grasshopper then any other move (White) to win
+    def _mock_get_winner_grasshopper_first(self):
         log = self.get_game_log()
         if not log:
             return None
@@ -420,8 +420,27 @@ def test_first_move_action_value_evolution_with_train_main_agent(monkeypatch, tm
             return "Black"
 
     monkeypatch.setattr(
-        nokamute.Board, "get_winner", _mock_get_winner_grasshopper_ladybug
+        nokamute.Board, "get_winner", _mock_get_winner_grasshopper_first
     )
+
+    # Debug: verify monkeypatch is working
+    # Apply moves: wG1, bA1, bQ
+    winning_moves = ["wG1", "bA1 -wG1", "wQ wG1-"]
+    losing_moves = ["wA1", "bA1 -wA1", "wQ wA1-"]
+    for move_set in (winning_moves, losing_moves):
+        test_board = nokamute.Board()
+        for move_str in move_set:
+            turn = test_board.parse_move(move_str)
+            test_board.apply(turn)
+        log = test_board.get_game_log()
+        winner = test_board.get_winner()
+        print(f"[DEBUG] Monkeypatch test: log={log}, winner={winner}")
+
+    # Counter for move sequences and results
+    from collections import Counter
+
+    move_counter = Counter()
+    result_counter = Counter()
 
     # Build small league and tracker in a temp directory
     config = LeagueConfig()
@@ -487,6 +506,49 @@ def test_first_move_action_value_evolution_with_train_main_agent(monkeypatch, tm
 
         # Train one iteration of Main Agent
         train_main_agent(league_manager, tracker, config, iteration=it)
+
+        # After training, inspect the games played in this iteration
+        # LeagueManager should have a record of games played
+        # Try to find the most recent games played by main agent
+        main_agent_games_dir = league_dir / "main_agent_games"
+        if main_agent_games_dir.exists():
+            for game_file in sorted(main_agent_games_dir.glob("*.txt")):
+                try:
+                    with open(game_file, "r") as f:
+                        lines = f.readlines()
+                        # Try to extract move sequence and result
+                        moves = None
+                        result = None
+                        for line in lines:
+                            if line.startswith("Moves:"):
+                                moves = line.strip().split(":", 1)[-1].strip()
+                            if line.startswith("Result:"):
+                                result = line.strip().split(":", 1)[-1].strip()
+                        if moves:
+                            move_counter[moves] += 1
+                        if result:
+                            result_counter[result] += 1
+                except Exception as e:
+                    print(f"[DEBUG] Error reading {game_file}: {e}")
+
+        # Also, print a sample of games from the tracker logs if available
+        logs_dir = league_dir / "logs"
+        if logs_dir.exists():
+            for log_file in sorted(logs_dir.glob("*.txt"))[-5:]:
+                print(f"[DEBUG] Recent log: {log_file}")
+                try:
+                    with open(log_file, "r") as f:
+                        print(f.read())
+                except Exception as e:
+                    print(f"[DEBUG] Error reading log {log_file}: {e}")
+
+    # Print summary of move sequences and results
+    print("\n[DEBUG] Move sequence counts:")
+    for move_seq, count in move_counter.most_common():
+        print(f"  {move_seq}: {count}")
+    print("\n[DEBUG] Result counts:")
+    for result, count in result_counter.most_common():
+        print(f"  {result}: {count}")
 
     # Convert history to numpy array -> shape (n_iter,) or (n_iter,1)
     history = np.array(values_history).squeeze()
