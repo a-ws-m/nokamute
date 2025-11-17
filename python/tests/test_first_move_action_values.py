@@ -34,8 +34,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from action_space import action_to_string, get_action_space
 from hetero_graph_utils import board_to_hetero_data, prepare_model_inputs
+from league.config import LeagueConfig
+from league.manager import LeagueManager
+from league.tracker import LeagueTracker
 from model_policy_hetero import create_policy_model
 from self_play import SelfPlayGame, prepare_training_data
+from train_league import train_main_agent
 
 
 def _mock_get_winner_decide_after_first_move(self):
@@ -315,3 +319,190 @@ def test_first_move_action_value_evolution(monkeypatch):
             print(
                 "Grasshopper is not the final best action (training did not distinguish moves strongly). Consider adding policy cross-entropy or action-level supervision to drive other action values down."
             )
+    # Explicit assertion: at the end of training, only grasshopper moves should have positive values
+    if grasshopper_indices:
+        final_vals = history[-1]
+        pos_idxs = [i for i, v in enumerate(final_vals) if v > 0]
+        assert set(pos_idxs) == set(
+            grasshopper_indices
+        ), f"Only grasshopper moves should be positive; positives={pos_idxs}, grasshopper={grasshopper_indices}"
+
+
+def _initial_board_action_values_for_model(model):
+    """Return (selected_values, labels, grasshopper_indices, action_probs, value)
+
+    selected_values: numpy array of action-values (absolute) for the legal starting
+      positions (sorted order)
+    labels: list of UHP strings for each selected action
+    grasshopper_indices: indices of labels that start with 'wG'
+    """
+
+    start_board = nokamute.Board()
+    graph_dict = start_board.to_graph()
+    data, move_to_action_indices = board_to_hetero_data(graph_dict)
+    x_dict, edge_index_dict, edge_attr_dict, move_to_idx = prepare_model_inputs(
+        data, move_to_action_indices
+    )
+
+    model.eval()
+    with torch.no_grad():
+        action_values, action_probs, value, action_idx = model.predict_action_info(
+            x_dict, edge_index_dict, edge_attr_dict, move_to_idx, current_player="White"
+        )
+
+    # Determine legal actions
+    legal_action_idxs = np.unique(move_to_idx[move_to_idx >= 0].cpu().numpy())
+    legal_action_idxs = sorted(legal_action_idxs)
+
+    action_values_np = action_values.squeeze(0).cpu().numpy()
+    selected_values = np.array([action_values_np[i] for i in legal_action_idxs])
+    action_probs_np = action_probs.squeeze(0).cpu().numpy()
+
+    labels = [action_to_string(i) for i in legal_action_idxs]
+    grasshopper_indices = [i for i, lab in enumerate(labels) if lab.startswith("wG")]
+
+    return selected_values, labels, grasshopper_indices, action_probs_np, value
+
+
+def _plot_action_value_history(history, labels, out_path):
+    plt.figure(figsize=(8, 5))
+    for a_idx in range(history.shape[1]):
+        plt.plot(history[:, a_idx], label=labels[a_idx])
+
+    plt.xlabel("Iteration")
+    plt.ylabel("Predicted action value (absolute)")
+    plt.title("Action value evolution for 7 starting moves")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out_path)
+
+
+def test_first_move_action_value_evolution_with_train_main_agent(monkeypatch, tmp_path):
+    """Train via `train_main_agent` and track first move values over time.
+
+    Use a custom `get_winner` rule: if White's first move is a grasshopper (wG)
+    AND White has played a second move, White wins; otherwise Black wins. This
+    creates a two-move dependency that can only be learned when we actually
+    train the Main Agent with `train_main_agent()`.
+    """
+
+    # Small model for quick test
+    model = create_policy_model({"hidden_dim": 64, "num_layers": 2, "num_heads": 2})
+    model.eval()
+
+    # Monkeypatch get_winner to require grasshopper then ladybug (White) to win
+    def _mock_get_winner_grasshopper_ladybug(self):
+        log = self.get_game_log()
+        if not log:
+            return None
+
+        segments = [s.strip() for s in log.split(";") if s.strip() != ""]
+        if not segments or len(segments) < 3:
+            # Not enough moves yet
+            return None
+
+        # If first move isn't a White grasshopper, White cannot win
+        first_segment = segments[0]
+        if first_segment.startswith("wG"):
+            return "White"
+        else:
+            return "Black"
+
+    monkeypatch.setattr(
+        nokamute.Board, "get_winner", _mock_get_winner_grasshopper_ladybug
+    )
+
+    # Build small league and tracker in a temp directory
+    config = LeagueConfig()
+    # Increase epsilon to encourage exploration so we see non-greedy moves
+    config.epsilon = 1.0
+    # Small numbers for quicker tests
+    config.main_agent_games_per_iter = 20
+    config.main_agent_epochs = 5
+    config.main_agent_batch_size = 8
+    # Ensure CPU for CI / developer machines
+    config.gen_device = "cpu"
+    config.train_device = "cpu"
+
+    league_dir = tmp_path / "league"
+    league_dir.mkdir(parents=True, exist_ok=True)
+
+    league_manager = LeagueManager(config, str(league_dir))
+    tracker = LeagueTracker(str(league_dir / "logs"))
+
+    # Initialize main agent
+    model_config = {"hidden_dim": 64, "num_layers": 2, "num_heads": 2}
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.main_agent_lr)
+    league_manager.initialize_main_agent(model, optimizer, model_config)
+
+    n_iter = 5
+    values_history = []
+    # We'll save full per-iteration action-values for the first moves
+    full_values_history = []
+    labels = None
+    grasshopper_indices = []
+
+    for it in range(n_iter):
+        # Evaluate current main agent's predicted start position values
+        # Load current main model
+        ckpt = torch.load(
+            league_manager.current_main_agent.model_path, map_location="cpu"
+        )
+        # Load the model using LeagueTracker helper so saved config/state match
+        # exactly and we avoid size mismatches.
+        assert league_manager.current_main_agent is not None
+        cur_model = tracker._load_model(league_manager.current_main_agent, device="cpu")
+        cur_model.eval()
+
+        # Extract starting action values
+        selected_values, labels, grasshopper_indices, action_probs, value = (
+            _initial_board_action_values_for_model(cur_model)
+        )
+
+        # Save only the grasshopper values for monitoring
+        if grasshopper_indices:
+            # There may be multiple grasshopper placements; take the maximum
+            g_vals = selected_values[grasshopper_indices]
+            values_history.append(float(g_vals.max()))
+        else:
+            values_history.append(0.0)
+
+        # Also record full values for assertion at end
+        full_values_history.append(selected_values)
+
+        print(
+            f"Iteration {it}: grasshopper_idx={grasshopper_indices}, value={values_history[-1]}"
+        )
+
+        # Train one iteration of Main Agent
+        train_main_agent(league_manager, tracker, config, iteration=it)
+
+    # Convert history to numpy array -> shape (n_iter,) or (n_iter,1)
+    history = np.array(values_history).squeeze()
+    full_history = np.vstack(full_values_history)
+
+    # Plot trend
+    plots_dir = Path(__file__).resolve().parents[1] / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    out_path = plots_dir / "first_move_action_values_main_agent.png"
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(history)
+    plt.xlabel("Iteration")
+    plt.ylabel("Grasshopper predicted action value (approx)")
+    plt.title("Grasshopper value trend when learning by train_main_agent()")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out_path)
+
+    # Basic assertion: the file was written and has non-zero size
+    assert out_path.exists() and out_path.stat().st_size > 0
+
+    # Explicit assertion: at the end of training, only grasshopper moves should have positive values
+    if grasshopper_indices:
+        final_vals = full_history[-1]
+        pos_idxs = [i for i, v in enumerate(final_vals) if v > 0]
+        assert set(pos_idxs) == set(
+            grasshopper_indices
+        ), f"Only grasshopper moves should be positive; positives={pos_idxs}, grasshopper={grasshopper_indices}"
