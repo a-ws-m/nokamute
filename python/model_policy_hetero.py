@@ -252,7 +252,7 @@ class HiveGNNPolicyHetero(nn.Module):
                     Note: Due to ToUndirected, there are 2x as many edges as legal moves
 
         Returns:
-            action_logits: Action values [1, num_actions] in ABSOLUTE scale
+            action_values: Action values [1, num_actions] in ABSOLUTE scale
                           +1 = White winning, -1 = Black winning, -inf for illegal actions
             white_value: Best value for White (max of action values) [1, 1] or [batch_size, 1]
             black_value: Best value for Black (min of action values) [1, 1] or [batch_size, 1]
@@ -380,7 +380,7 @@ class HiveGNNPolicyHetero(nn.Module):
 
         if not is_batched:
             # Single graph - add batch dimension
-            action_logits = action_values.unsqueeze(0)  # [1, num_actions]
+            action_values = action_values.unsqueeze(0)  # [1, num_actions]
 
             # Compute value assuming optimal play
             # Action values are absolute: +1 = White winning, -1 = Black winning
@@ -543,10 +543,10 @@ class HiveGNNPolicyHetero(nn.Module):
                 )
 
             # For batched training, action_logits is not used (return placeholder)
-            action_logits = action_values.unsqueeze(0)  # [1, num_actions]
+            action_values = action_values.unsqueeze(0)  # [1, num_actions]
 
         return (
-            action_logits,
+            action_values,
             white_value,
             black_value,
             white_action_idx,
