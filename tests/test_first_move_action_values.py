@@ -10,7 +10,7 @@ Notes:
 - To run this test locally in the recommended environment use:
 
     micromamba activate torch
-    pytest python/tests/test_first_move_action_values.py -s
+    pytest tests/test_first_move_action_values.py -q
 
 """
 
@@ -22,16 +22,17 @@ matplotlib.use("Agg")  # headless
 import os
 import sys
 
+# Ensure local python/ package modules are importable when tests are executed
+# from the repository root -- add `python` directory to sys.path (not the
+# tests dir). This makes imports like `from action_space import ...` work when
+# tests live under `tests/` instead of `python/tests/`.
+sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "python"))
+)
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-
-import nokamute
-
-# Ensure local python/ package modules are importable when tests are executed
-# from the repository root
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from action_space import action_to_string, get_action_space
 from hetero_graph_utils import board_to_hetero_data, prepare_model_inputs
 from league.config import LeagueConfig
@@ -40,6 +41,10 @@ from league.tracker import LeagueTracker
 from model_policy_hetero import create_policy_model
 from self_play import SelfPlayGame, prepare_training_data
 from train_league import train_main_agent
+
+import nokamute
+
+# (rest of file unchanged - other helpers and tests)
 
 
 def _mock_get_winner_decide_after_first_move(self):
@@ -72,7 +77,7 @@ def test_first_move_action_value_evolution(monkeypatch):
     """Run a small number of self-play iterations, train, and plot action values.
 
     This test is intended to validate the training loop is updating the value
-    predictions. The plot is written under `tmp_path` so CI / developer can
+    predictions. The plot is written under `python/plots` so CI / developer can
     inspect it.
     """
 
@@ -273,7 +278,7 @@ def test_first_move_action_value_evolution(monkeypatch):
 
     # Plot per-action curves
     # Save the plot to a non-temporary path so it is easy to inspect after the test
-    plots_dir = Path(__file__).resolve().parents[1] / "plots"
+    plots_dir = Path(__file__).resolve().parents[1] / "python" / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     out_path = plots_dir / "first_move_action_values.png"
     plt.figure(figsize=(8, 5))
@@ -326,6 +331,11 @@ def test_first_move_action_value_evolution(monkeypatch):
         assert set(pos_idxs) == set(
             grasshopper_indices
         ), f"Only grasshopper moves should be positive; positives={pos_idxs}, grasshopper={grasshopper_indices}"
+
+
+# Keep the helper functions unchanged below, but ensure that the plots path is also
+# updated to the `python/plots` directory when used from this new top-level
+# `tests/` path.
 
 
 def _initial_board_action_values_for_model(model):
@@ -483,7 +493,7 @@ def test_first_move_action_value_evolution_with_train_main_agent(monkeypatch, tm
     full_history = np.vstack(full_values_history)
 
     # Plot trend
-    plots_dir = Path(__file__).resolve().parents[1] / "plots"
+    plots_dir = Path(__file__).resolve().parents[1] / "python" / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     out_path = plots_dir / "first_move_action_values_main_agent.png"
 
