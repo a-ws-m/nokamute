@@ -2,6 +2,7 @@ use crate::{Board as RustBoard, Bug as RustBug, Color as RustColor, Hex, Rules, 
 use minimax::Game;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
+use std::collections::HashMap;
 
 /// Represents a bug type in the Hive game
 #[pyclass]
@@ -616,7 +617,86 @@ impl Board {
                 move_order.push(mv.clone());
             }
         }
+
+        // Also provide a numeric canonical ordering of action space indices.
+        // We rely on Python's `action_space.string_to_action` function to map
+        // UHP strings into global action IDs. Use the Python interpreter
+        // to perform the mapping so we reuse the canonical Python action
+        // space enumeration instead of re-implementing it in Rust.
+        let mut move_order_idx: Vec<i64> = Vec::new();
+        // Build numeric action space mapping in Rust and map move_order -> indices
+        let mut rust_action_map: HashMap<String, i64> = HashMap::new();
+        let mut action_idx: i64 = 0;
+
+        // Same enumeration rules as python/action_space.py
+        let bug_types = vec!["Q", "A", "G", "B", "S", "M", "L", "P"];
+        let colors = vec!["w", "b"];
+
+        let mut piece_identifiers: Vec<String> = Vec::new();
+        for &color in colors.iter() {
+            for &bug in bug_types.iter() {
+                if ["A", "G", "B", "S"].contains(&bug) {
+                    for num in 1..=3 {
+                        let s = format!("{}{}{}", color, bug, num);
+                        piece_identifiers.push(s);
+                    }
+                } else {
+                    let s = format!("{}{}", color, bug);
+                    piece_identifiers.push(s);
+                }
+            }
+        }
+
+        // 1. First move placements - just piece identifiers
+        for piece in piece_identifiers.iter() {
+            if !rust_action_map.contains_key(piece) {
+                rust_action_map.insert(piece.clone(), action_idx);
+                action_idx += 1;
+            }
+        }
+
+        // 2. Placements and movements with direction
+        for piece in piece_identifiers.iter() {
+            for target in piece_identifiers.iter() {
+                if piece == target {
+                    continue;
+                }
+                for dir_char in ["\\", "/", "-"].iter() {
+                    let move_str = format!("{} {}{}", piece, dir_char, target);
+                    if !rust_action_map.contains_key(&move_str) {
+                        rust_action_map.insert(move_str.clone(), action_idx);
+                        action_idx += 1;
+                    }
+
+                    let move_str2 = format!("{} {}{}", piece, target, dir_char);
+                    if !rust_action_map.contains_key(&move_str2) {
+                        rust_action_map.insert(move_str2.clone(), action_idx);
+                        action_idx += 1;
+                    }
+                }
+            }
+        }
+
+        // 3. Pass action
+        rust_action_map.insert("pass".to_string(), action_idx);
+        action_idx += 1;
+
+        // Now map move_order strings to numeric indices using the Rust `rust_action_map`
+        for mv in move_order.iter() {
+            let idx = rust_action_map.get(mv);
+            if let Some(&v) = idx {
+                move_order_idx.push(v);
+            } else {
+                // If the move isn't in the action space, push -1 as a sentinel
+                move_order_idx.push(-1);
+            }
+        }
+
+        // Expose both string and numeric move order. Older Python code may
+        // still expect strings; numeric order avoids re-conversion and is
+        // the authoritative mapping for training/selection.
         result.set_item("move_order", PyList::new(py, &move_order))?;
+        result.set_item("move_order_idx", PyList::new(py, &move_order_idx))?;
 
         Ok(result.into())
     }

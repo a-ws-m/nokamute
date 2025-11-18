@@ -612,6 +612,28 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                         valid_batch_idx, selected_global_for_valid
                     ]
 
+                    # Register hook to capture gradients for the selected
+                    # per-example action values. This helps us verify that
+                    # the policy/value head receives action-specific
+                    # gradients instead of diluting them across the batch.
+                    sel_action_grads = None
+                    try:
+                        if os.getenv(
+                            "NKAMUTE_DEBUG", os.getenv("NK_DEBUG", "")
+                        ).lower() in ("1", "true", "yes", "y"):
+                            sel_action_grads = []
+
+                            def _capture_sel(g):
+                                try:
+                                    sel_action_grads.append(g.detach().cpu())
+                                except Exception:
+                                    sel_action_grads.append(torch.zeros(()))
+
+                            # Register on the selected value tensor
+                            selected_vals_valid.register_hook(_capture_sel)
+                    except Exception:
+                        sel_action_grads = None
+
                     # DEBUG ASSERT: selected action values must be finite for current player
                     if not torch.isfinite(selected_vals_valid).all():
                         try:
@@ -781,7 +803,50 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
         # TD Loss (value network supervised by game outcome)
         loss = F.mse_loss(predictions, targets)
 
+        # If we are using per-example selected action supervision, register
+        # a backward hook on `action_values` to capture gradients per action.
+        action_values_grads = None
+        try:
+            if (
+                (
+                    os.getenv("NKAMUTE_DEBUG", os.getenv("NK_DEBUG", "")).lower()
+                    in ("1", "true", "yes", "y")
+                )
+                and action_values is not None
+                and hasattr(action_values, "register_hook")
+            ):
+                action_values_grads = []
+
+                def _capture(g):
+                    try:
+                        action_values_grads.append(g.detach().cpu())
+                    except Exception:
+                        action_values_grads.append(torch.zeros(()))
+
+                action_values.register_hook(_capture)
+        except Exception:
+            action_values_grads = None
+
         # Backward pass
+        # Debug: ensure predictions require grad when expected
+        try:
+            import logging
+
+            logger = logging.getLogger(__name__)
+            if os.getenv("NKAMUTE_DEBUG", os.getenv("NK_DEBUG", "")).lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+            ):
+                logger.debug(
+                    "Batch DEBUG: predictions_requires_grad=%s, predictions_grad_fn=%s",
+                    getattr(predictions, "requires_grad", None),
+                    getattr(predictions, "grad_fn", None),
+                )
+        except Exception:
+            pass
+
         loss.backward()
 
         # DEBUG: log predictions, targets, and gradient norms for diagnose
@@ -820,7 +885,9 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                 except Exception:
                     pass
 
-                # Compute gradient norm
+                # Compute gradient norm for the whole model and for the
+                # action_value_head (this is crucial to see whether the
+                # action-value parameters receive training signal).
                 grad_norm = 0.0
                 for p in model.parameters():
                     if p.grad is not None:
@@ -828,7 +895,25 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                             grad_norm += float(p.grad.detach().norm().item())
                         except Exception:
                             pass
+
+                # Per-parameter gradient diagnostics for action_value_head
+                head_grad_norms = {}
+                try:
+                    for name, p in model.named_parameters():
+                        if name.startswith("action_value_head"):
+                            if p.grad is not None:
+                                head_grad_norms[name] = float(
+                                    p.grad.detach().norm().item()
+                                )
+                            else:
+                                head_grad_norms[name] = 0.0
+                except Exception:
+                    head_grad_norms = {}
+
                 logger.debug("Batch DEBUG: grad_norm_before_step=%s", grad_norm)
+                logger.debug(
+                    "Batch DEBUG: action_value_head_grad_norms=%s", head_grad_norms
+                )
         except Exception:
             pass
         optimizer.step()
@@ -842,6 +927,72 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                     )
             except Exception:
                 pass
+        # Also append gradient info to the same debug file for triage
+        try:
+            if num_batches == 0 and "head_grad_norms" in locals():
+                with open("python/tmp/nokamute_debug_train.txt", "a") as f:
+                    f.write(f"DEBUG head_grad_norms={head_grad_norms}\n")
+        except Exception:
+            pass
+        # Write gradient diag to JSON file for later analysis
+        try:
+            import json
+
+            grad_diag = {
+                "batch": num_batches,
+                "grad_norm": grad_norm if "grad_norm" in locals() else None,
+                "action_head_grads": (
+                    head_grad_norms if "head_grad_norms" in locals() else {}
+                ),
+                "action_value_grads_selected": None,
+            }
+            os.makedirs("python/tmp", exist_ok=True)
+            with open("python/tmp/nokamute_debug_gradients.json", "a") as fh:
+                # If we captured action_values gradients, compute per-example
+                # gradient magnitude for the selected action entries and
+                # record them. This is helpful to detect gradient dilution
+                # when batching across many different examples.
+                try:
+                    if (
+                        action_values_grads is not None
+                        and len(action_values_grads) > 0
+                        and "selected_global_for_valid" in locals()
+                    ):
+                        g = action_values_grads[0]
+                        # g.shape expected [batch_size, num_actions]
+                        sel_grads = []
+                        for b_idx, g_idx in zip(
+                            valid_batch_idx.tolist(),
+                            selected_global_for_valid.tolist(),
+                        ):
+                            try:
+                                sel_grads.append(float(g[b_idx, g_idx].abs().item()))
+                            except Exception:
+                                sel_grads.append(None)
+                        grad_diag["action_value_grads_selected"] = sel_grads
+                except Exception:
+                    pass
+
+                # Also include the gradients captured on the per-example
+                # selected action values (if any). This will be a list
+                # of per-example gradient scalars corresponding to
+                # `selected_vals_valid`.
+                try:
+                    if sel_action_grads is not None and len(sel_action_grads) > 0:
+                        # sel_action_grads[0] contains gradient tensor for
+                        # each selected scalar; flatten to list
+                        sval = sel_action_grads[0].cpu().numpy().tolist()
+                        grad_diag["selected_vals_grad"] = sval
+                    else:
+                        grad_diag["selected_vals_grad"] = None
+                except Exception:
+                    grad_diag["selected_vals_grad"] = None
+                except Exception:
+                    pass
+
+                fh.write(json.dumps(grad_diag) + "\n")
+        except Exception:
+            pass
         num_batches += 1
 
     # Return average TD loss

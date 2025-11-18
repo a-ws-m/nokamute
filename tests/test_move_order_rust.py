@@ -11,10 +11,16 @@ def test_rust_move_order_present():
     b = nokamute.Board()
     graph_dict = b.to_graph()
 
-    assert "move_order" in graph_dict, "Rust must include move_order in graph dict"
+    # We prefer the numeric move_order provided by Rust; fall back to strings
+    # for backward compatibility with older Rust versions.
+    assert (
+        "move_order_idx" in graph_dict or "move_order" in graph_dict
+    ), "Rust must include move_order or move_order_idx in graph dict"
 
-    # Convert Rust move_order (list of UHP strings) to action indices
-    rust_move_order = [string_to_action(m) for m in graph_dict["move_order"]]
+    if "move_order_idx" in graph_dict:
+        rust_move_order = list(graph_dict["move_order_idx"])
+    else:
+        rust_move_order = [string_to_action(m) for m in graph_dict["move_order"]]
 
     # Now compute the Python-side unique list from move_to_action indices (should match)
     data, move_to_action_indices = board_to_hetero_data(graph_dict)
