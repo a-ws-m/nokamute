@@ -333,6 +333,178 @@ def test_first_move_action_value_evolution(monkeypatch):
         ), f"Only grasshopper moves should be positive; positives={pos_idxs}, grasshopper={grasshopper_indices}"
 
 
+def test_selected_action_indices_finite_in_batch():
+    """Create a small batch from self-play training examples and ensure the selected
+    per-example action indices map to finite action values when batched.
+
+    This verifies that `selected_action_idx` recorded during self-play aligns
+    with the model's batched action_values ordering and that finite masking is
+    correct.
+    """
+
+    model = create_policy_model({"hidden_dim": 64, "num_layers": 2, "num_heads": 2})
+    model.eval()
+
+    # Generate a handful of games to prepare training examples
+    player = SelfPlayGame(
+        model=model, epsilon=0.2, device="cpu", enable_branching=False, max_moves=10
+    )
+    games = player.generate_games(num_games=8)
+    training_examples = prepare_training_data(games)
+
+    # Keep only examples with a recorded selected_action_idx
+    filtered = [ex for ex in training_examples if ex[3] is not None and ex[3] >= 0]
+    assert len(filtered) > 0, "No training examples with selected_action_idx found"
+
+    # Build PyG dataset similar to train_epoch_selfplay
+    from torch_geometric.loader import DataLoader as PyGDataLoader
+
+    data_list = []
+    for (
+        hetero_data,
+        move_to_action_indices,
+        target,
+        selected_action_idx,
+        *_rest,
+    ) in filtered:
+        d = hetero_data.cpu()
+        d.move_to_action_indices = move_to_action_indices.cpu()
+        d.selected_action_idx = torch.tensor(
+            [int(selected_action_idx)], dtype=torch.long
+        )
+        # Restore actual current player from the training example tuple
+        # The training tuple format ends with `player` ("White"/"Black").
+        player = _rest[-1] if len(_rest) > 0 else "White"
+        d.current_player = torch.tensor(
+            [0 if player == "White" else 1], dtype=torch.long
+        )
+        d.y = torch.tensor([float(target)], dtype=torch.float32)
+        data_list.append(d)
+
+    loader = PyGDataLoader(data_list, batch_size=4, shuffle=False)
+    # Only test the first batch
+    for batch in loader:
+        batch = batch.to("cpu")
+        x_dict, edge_index_dict, edge_attr_dict, _ = prepare_model_inputs(
+            batch, batch.move_to_action_indices
+        )
+        action_values, white_value, black_value, _, _ = model(
+            x_dict, edge_index_dict, edge_attr_dict, batch.move_to_action_indices
+        )
+
+        # Ensure we can index per-example selected action
+        if hasattr(batch, "selected_action_idx"):
+            sel_idx = batch.selected_action_idx.view(-1).long()
+            if action_values.dim() == 2 and action_values.shape[0] == sel_idx.shape[0]:
+                # For each example in batch, ensure the selected action value is finite
+                for b_i in range(sel_idx.shape[0]):
+                    # Reconstruct move-edge batch assignment like the model does so we
+                    # can check which action indices belong to each example.
+                    move_edge_batch = []
+                    batch_dict = {
+                        nt: x_dict[nt].batch
+                        for nt in x_dict
+                        if hasattr(x_dict[nt], "batch")
+                    }
+                    for et in edge_index_dict.keys():
+                        if "move" in et[1] or "rev_move" in et[1]:
+                            edge_idx = edge_index_dict[et]
+                            if edge_idx.shape[1] > 0 and et[0] in batch_dict:
+                                move_edge_batch.append(batch_dict[et[0]][edge_idx[0]])
+                    all_move_batch = (
+                        torch.cat(move_edge_batch)
+                        if move_edge_batch
+                        else torch.empty(0, dtype=torch.long)
+                    )
+
+                    s = int(sel_idx[b_i].item())
+                    # Check membership
+                    if all_move_batch.numel() > 0:
+                        legal_action_idxs = batch.move_to_action_indices[
+                            all_move_batch == b_i
+                        ]
+                        legal_action_idxs = torch.unique(
+                            legal_action_idxs[legal_action_idxs >= 0]
+                        )
+                    else:
+                        legal_action_idxs = torch.tensor([], dtype=torch.long)
+
+                    if s >= 0:
+                        # If selection isn't in legal indices, that's a mapping / recording bug
+                        assert (len(legal_action_idxs) == 0 and False) or (
+                            s in legal_action_idxs.tolist()
+                        ), f"Selected action idx {s} not found among legal actions for example {b_i}. legal_action_idxs={legal_action_idxs.tolist()}"
+                        val = action_values[b_i, s]
+                        assert torch.isfinite(
+                            val
+                        ), f"Non-finite action value for batch {b_i}, sel_idx={s}"
+        break
+
+
+def test_no_infinite_action_values_for_current_player():
+    """Action values for current player's legal move edges must be finite.
+
+    This test ensures we do not use finite sentinel replacements for -inf.
+    If any non-finite values appear for the current player's moves it indicates
+    a bug in the graph construction / masking pipeline.
+    """
+
+    model = create_policy_model({"hidden_dim": 64, "num_layers": 2, "num_heads": 2})
+
+    # Build an initial board with at least one legal move
+    start_board = nokamute.Board()
+    graph_dict = start_board.to_graph()
+    data, move_to_action_indices = board_to_hetero_data(graph_dict)
+    x_dict, edge_index_dict, edge_attr_dict, move_to_idx = prepare_model_inputs(
+        data, move_to_action_indices
+    )
+
+    # Do a full forward pass (which runs compute_move_edge_values internally)
+    action_values, action_probs, value, action_idx = model.predict_action_info(
+        x_dict, edge_index_dict, edge_attr_dict, move_to_idx, current_player="White"
+    )
+
+    # Also assert that action_values for legal action indices are finite
+    # action_values shape: [1, num_actions]
+    # legal_action_indices from move_to_idx
+    legal_action_idxs = np.unique(move_to_idx[move_to_idx >= 0].cpu().numpy())
+    legal_action_idxs = sorted(legal_action_idxs)
+
+    assert torch.isfinite(
+        action_values.squeeze(0)[legal_action_idxs]
+    ).all(), "Action space values for legal actions should be finite (no inf)."
+
+
+def test_selected_action_index_matches_move_to_action_indices():
+    """Check that training examples' selected_action_idx map to a legal move index.
+
+    This looks for cases where a selected action recorded in training examples
+    points at a global action index that does not appear among the legal moves
+    for that position. Such mismatches indicate a bug in dataset construction
+    or in the mapping between move strings and action indices.
+    """
+
+    model = create_policy_model({"hidden_dim": 64, "num_layers": 2, "num_heads": 2})
+    player = SelfPlayGame(
+        model=model, epsilon=0.5, device="cpu", enable_branching=False, max_moves=10
+    )
+
+    # Generate a handful of games
+    games = [player.play_game() for _ in range(10)]
+    t_data = prepare_training_data(games)
+
+    for ex in t_data:
+        hetero_data, move_to_action_indices, target, selected_action_idx, *_ = ex
+        if selected_action_idx is None or selected_action_idx < 0:
+            continue
+
+        # Every selected_action_idx must be among the current player's legal actions
+        legal_actions = move_to_action_indices[move_to_action_indices >= 0].tolist()
+        assert (
+            selected_action_idx in legal_actions
+        ), f"Selected index {selected_action_idx} not in legal actions {legal_actions}"
+
+
 # Keep the helper functions unchanged below, but ensure that the plots path is also
 # updated to the `python/plots` directory when used from this new top-level
 # `tests/` path.

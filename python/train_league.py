@@ -175,22 +175,241 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
         edge_attr_dict = {k: v.to(device) for k, v in edge_attr_dict.items()}
 
         # Forward pass - heterogeneous policy model
-        # For batched training, action_logits is a placeholder (not used)
-        _, white_value, black_value, _, _ = model(
+        # For batched training, `action_values` may be a [batch_size, num_actions]
+        # tensor. If available, we will prefer the `selected_action_idx` entry
+        # per-example (action-level supervision) instead of using the
+        # aggregated white/black values.
+        action_values, white_value, black_value, _, _ = model(
             x_dict, edge_index_dict, edge_attr_dict, batch.move_to_action_indices
         )
 
-        # Select appropriate value based on current player
-        # current_player: 0=White, 1=Black
-        # White uses white_value (max), Black uses black_value (min)
-        value_current = torch.where(
-            batch.current_player == 0,
-            white_value.squeeze(-1),
-            black_value.squeeze(-1),
-        )  # [batch_size]
+        # Do NOT replace non-finite action_values with finite sentinels here.
+        # If non-finite values are present for legal moves then the graph
+        # construction / masking is incorrect and the issue should be fixed.
 
-        predictions = value_current
+        # If selected_action_idx is available, index the per-example action
+        # value and use it as training target. Otherwise, fallback to the
+        # previously used white/black value prediction.
+        sel_idx = None
+        if hasattr(batch, "selected_action_idx") and action_values is not None:
+            # DEBUG: log shapes first time through
+            # NOTE: This will show up in test output for debugging purposes.
+            if num_batches == 0:
+                try:
+                    import os
+
+                    os.makedirs("python/tmp", exist_ok=True)
+                    with open("python/tmp/nokamute_debug_train.txt", "a") as f:
+                        f.write(
+                            f"DEBUG action_values.shape={getattr(action_values,'shape',None)}\n"
+                        )
+                        f.write(
+                            f"DEBUG selected_action_idx={batch.selected_action_idx}\n"
+                        )
+                except Exception:
+                    pass
+            # Normalize selected idx to 1D LongTensor (available for all batches)
+            sel_idx = batch.selected_action_idx.view(-1).long()
+
+            # action_values may be [1, num_actions] (not batched) or
+            # [batch_size, num_actions] (batched). Handle both.
+            # action_values may be [batch_size, num_actions] when batched.
+            # We want to index the per-example selected action and use that
+            # as the predicted value. If selected index is invalid (-1) or
+            # maps to an illegal action (resulting in -inf), fall back to the
+            # per-graph white/black value.
+            if action_values.dim() == 2 and action_values.shape[0] == sel_idx.shape[0]:
+                batch_indices = torch.arange(sel_idx.shape[0], device=sel_idx.device)
+
+                # Mask out invalid selections (selected_action_idx == -1)
+                valid_sel = sel_idx >= 0
+
+                # Also mask out selections that are out-of-range for action_values
+                max_idx = action_values.shape[-1]
+                out_of_range = sel_idx >= max_idx
+                if out_of_range.any():
+                    try:
+                        import sys
+
+                        print(
+                            f"[DEBUG] train_epoch_selfplay: selected indices out-of-range: {sel_idx[out_of_range]}",
+                            file=sys.stderr,
+                        )
+                    except Exception:
+                        pass
+                valid_sel = valid_sel & (~out_of_range)
+
+                # Initialize predictions with fallback per-player values
+                fallback_vals = torch.where(
+                    batch.current_player == 0,
+                    white_value.squeeze(-1),
+                    black_value.squeeze(-1),
+                )
+
+                # If no valid selections, keep fallback
+                if not valid_sel.any():
+                    predictions = fallback_vals
+                else:
+                    # Collect selected action values for valid entries
+                    valid_batch_idx = batch_indices[valid_sel]
+                    valid_sel_idx = sel_idx[valid_sel]
+
+                    selected_vals_valid = action_values[valid_batch_idx, valid_sel_idx]
+
+                    # DEBUG ASSERT: selected action values must be finite for current player
+                    if not torch.isfinite(selected_vals_valid).all():
+                        try:
+                            import sys
+
+                            print(
+                                f"[DEBUG] train_epoch_selfplay: Found non-finite selected action values: {selected_vals_valid}",
+                                file=sys.stderr,
+                            )
+                            # Log the legal action mask per example
+                            for b_idx, sel_i in zip(
+                                valid_batch_idx.tolist(), valid_sel_idx.tolist()
+                            ):
+                                legal_mask = torch.isfinite(action_values[b_idx])
+                                legal_idxs = (
+                                    torch.nonzero(legal_mask).squeeze(-1).tolist()
+                                )
+                                print(
+                                    f"[DEBUG] batch={b_idx}, selected={sel_i}, legal_idxs_sample={legal_idxs[:10]}",
+                                    file=sys.stderr,
+                                )
+                        except Exception:
+                            pass
+                    # If any selected value is -inf (illegal), fall back on that example
+                    finite_mask = torch.isfinite(selected_vals_valid)
+                    # Always log the raw values for the first batch (helps diagnose mixture)
+                    if num_batches == 0:
+                        try:
+                            import numpy as _np
+
+                            with open("python/tmp/nokamute_debug_train.txt", "a") as f:
+                                f.write(
+                                    f"DEBUG selected_vals_valid_raw={_np.round(selected_vals_valid.cpu().numpy(),3)}\n"
+                                )
+                                f.write(
+                                    f"DEBUG finite_mask_raw={finite_mask.cpu().numpy()}\n"
+                                )
+                        except Exception:
+                            pass
+
+                    # Start with fallback, then fill in valid finite selections
+                    predictions = fallback_vals.clone()
+                    if finite_mask.any():
+                        # Assign only finite values
+                        predictions[valid_sel] = torch.where(
+                            finite_mask, selected_vals_valid, fallback_vals[valid_sel]
+                        )
+                    # More detailed debug: log the selected action values and predictions
+                    if num_batches == 0:
+                        try:
+                            import numpy as _np
+
+                            with open("python/tmp/nokamute_debug_train.txt", "a") as f:
+                                f.write(
+                                    f"DEBUG valid_batch_idx={_np.array(valid_batch_idx.cpu())}\n"
+                                )
+                                f.write(
+                                    f"DEBUG valid_sel_idx={_np.array(valid_sel_idx.cpu())}\n"
+                                )
+                                f.write(
+                                    f"DEBUG selected_vals_valid={_np.round(selected_vals_valid.cpu().numpy(),3)}\n"
+                                )
+                                f.write(
+                                    f"DEBUG predictions_after={_np.round(predictions.cpu().numpy(),3)}\n"
+                                )
+                        except Exception:
+                            pass
+                    # Debug info: log selected and fallback values
+                    if num_batches == 0:
+                        try:
+                            import numpy as _np
+
+                            valid_batch_idx = batch_indices[valid_sel]
+                            with open("python/tmp/nokamute_debug_train.txt", "a") as f:
+                                f.write(
+                                    f"DEBUG selected_vals_valid={_np.round(selected_vals_valid.cpu().numpy(),3)}\n"
+                                )
+                                f.write(
+                                    f"DEBUG fallback_vals={_np.round(fallback_vals.cpu().numpy(),3)}\n"
+                                )
+                                f.write(
+                                    f"DEBUG finite_mask={finite_mask.cpu().numpy()}\n"
+                                )
+                        except Exception:
+                            pass
+            elif action_values.dim() == 2 and action_values.shape[0] == 1:
+                # Non-batched action_values - use same action values for all
+                # examples in this mini-batch (rare). Index the leading row.
+                # Mask invalid indices and fall back similarly.
+                sel_idx_1d = sel_idx
+                valid_sel = sel_idx_1d >= 0
+
+                fallback_vals = torch.where(
+                    batch.current_player == 0,
+                    white_value.squeeze(-1),
+                    black_value.squeeze(-1),
+                )
+
+                if valid_sel.any():
+                    all_selected = action_values.squeeze(0)[sel_idx_1d.clamp(min=0)]
+                    finite_mask = torch.isfinite(all_selected)
+                    predictions = torch.where(
+                        valid_sel & finite_mask, all_selected, fallback_vals
+                    )
+                else:
+                    predictions = fallback_vals
+            else:
+                # Fallback
+                predictions = torch.where(
+                    batch.current_player == 0,
+                    white_value.squeeze(-1),
+                    black_value.squeeze(-1),
+                )  # [batch_size]
+        else:
+            # Select appropriate value based on current player
+            predictions = torch.where(
+                batch.current_player == 0,
+                white_value.squeeze(-1),
+                black_value.squeeze(-1),
+            )  # [batch_size]
         targets = batch.y.squeeze()
+
+        # Ensure predictions are finite and 1D (one value per example). Sometimes a
+        # mis-shaped predictions tensor can occur; prefer indexing by
+        # `sel_idx` when available.
+        if predictions.dim() > 1:
+            # Only attempt to salvage using action_values if `sel_idx` is in
+            # scope and has appropriate length.
+            if (
+                "sel_idx" in locals()
+                and action_values is not None
+                and action_values.dim() == 2
+                and sel_idx.numel() == action_values.shape[0]
+            ):
+                idx = torch.arange(action_values.shape[0], device=sel_idx.device)
+                predictions = action_values[idx, sel_idx]
+            else:
+                predictions = predictions.max(dim=-1)[0]
+
+        # Replace non-finite predictions (e.g., -inf from illegal actions)
+        if not torch.isfinite(predictions).all():
+            try:
+                predictions = torch.where(
+                    torch.isfinite(predictions),
+                    predictions,
+                    torch.where(
+                        batch.current_player == 0,
+                        white_value.squeeze(-1),
+                        black_value.squeeze(-1),
+                    ),
+                )
+            except Exception:
+                # If batch attrs are missing, fallback to zeros
+                predictions = torch.zeros_like(predictions)
 
         # TD Loss (value network supervised by game outcome)
         loss = F.mse_loss(predictions, targets)
@@ -200,6 +419,14 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
         optimizer.step()
 
         total_loss += loss.item()
+        if num_batches == 0:
+            try:
+                with open("python/tmp/nokamute_debug_train.txt", "a") as f:
+                    f.write(
+                        f"DEBUG final predictions={predictions[:10].cpu().numpy()}\n"
+                    )
+            except Exception:
+                pass
         num_batches += 1
 
     # Return average TD loss

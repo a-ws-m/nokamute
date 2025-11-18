@@ -9,6 +9,9 @@ The model processes the heterogeneous graph through multiple GNN layers and outp
 by reading move edge features (for edges representing current player's legal moves).
 """
 
+import logging
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -170,6 +173,7 @@ class HiveGNNPolicyHetero(nn.Module):
 
         all_move_edge_features = []
         all_move_edge_attrs = []
+        move_edge_info = []
 
         # Collect move edges from all edge types (including reverse edges from ToUndirected)
         for edge_type_tuple in edge_index_dict.keys():
@@ -192,6 +196,8 @@ class HiveGNNPolicyHetero(nn.Module):
 
                     # Keep track of which edges belong to current player
                     all_move_edge_attrs.append(edge_attr_dict[edge_type_tuple])
+                    # Record debug info about this block of edges
+                    move_edge_info.append((edge_type_tuple, edge_idx.shape[1]))
 
         if not all_move_edge_features:
             # No move edges at all - this is an error (should have at least one legal move)
@@ -205,6 +211,42 @@ class HiveGNNPolicyHetero(nn.Module):
             all_move_edge_features, dim=0
         )  # [total_move_edges, hidden_dim]
         all_move_attrs = torch.cat(all_move_edge_attrs, dim=0)  # [total_move_edges, 1]
+
+        # Debug: show the ordering / offsets of move edge concatenation
+        try:
+            total_edges = all_move_features.shape[0]
+            offs = 0
+            debug_info = []
+            for et, count in move_edge_info:
+                debug_info.append((et, offs, count))
+                offs += count
+            logger = logging.getLogger(__name__)
+            if os.getenv("NKAMUTE_DEBUG", os.getenv("NK_DEBUG", "")).lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+            ):
+                if not logger.handlers:
+                    ch = logging.StreamHandler()
+                    ch.setLevel(logging.DEBUG)
+                    formatter = logging.Formatter(
+                        "[%(levelname)s:%(name)s] %(message)s"
+                    )
+                    ch.setFormatter(formatter)
+                    logger.addHandler(ch)
+                logger.setLevel(logging.DEBUG)
+
+            if offs != total_edges:
+                logger.debug(
+                    "compute_move_edge_values ordering mismatch: offs=%d != total=%d",
+                    offs,
+                    total_edges,
+                )
+            else:
+                logger.debug("compute_move_edge_values ordering: %s", debug_info)
+        except Exception:
+            pass
 
         # Apply action_value_head to get value for each move edge
         all_move_values = self.action_value_head(all_move_features).squeeze(
@@ -221,15 +263,18 @@ class HiveGNNPolicyHetero(nn.Module):
                 "This indicates an error in graph construction."
             )
 
-        # Set non-current-player moves to -inf
+        # Set non-current-player moves to -inf (illegal from player's POV)
+        # We intentionally do NOT replace -inf with a finite sentinel.
+        # If non-finite values appear for current player moves that indicates
+        # malformed data or a bug in the graph construction / masking.
+        NEG_INF = torch.tensor(
+            float("-inf"), device=all_move_values.device, dtype=all_move_values.dtype
+        )
+
         masked_values = torch.where(
             current_player_mask,
             all_move_values,
-            torch.tensor(
-                float("-inf"),
-                device=all_move_values.device,
-                dtype=all_move_values.dtype,
-            ),
+            NEG_INF,
         )  # [total_move_edges]
 
         return masked_values, all_move_values, current_player_mask
@@ -332,8 +377,12 @@ class HiveGNNPolicyHetero(nn.Module):
         device = list(x_dict_current.values())[0].device
         # Infer dtype from computed values to handle mixed precision correctly
         dtype = masked_values.dtype if len(masked_values) > 0 else torch.float32
+        # Use real +/- infinity for masking illegal moves and sentinel argmin
+        NEG_INF = torch.tensor(float("-inf"), device=device, dtype=dtype)
+        POS_INF = torch.tensor(float("inf"), device=device, dtype=dtype)
+
         action_values = torch.full(
-            (self.num_actions,), float("-inf"), device=device, dtype=dtype
+            (self.num_actions,), NEG_INF, device=device, dtype=dtype
         )
 
         # Map move edge values to action space using move_to_action_indices
@@ -362,11 +411,7 @@ class HiveGNNPolicyHetero(nn.Module):
             safe_values = torch.where(
                 valid_mask,
                 masked_values,
-                torch.tensor(
-                    float("-inf"),
-                    device=masked_values.device,
-                    dtype=masked_values.dtype,
-                ),
+                NEG_INF.to(device=masked_values.device, dtype=masked_values.dtype),
             )
 
             # Use scatter_reduce with 'amax' to handle potential duplicates
@@ -399,17 +444,20 @@ class HiveGNNPolicyHetero(nn.Module):
                     white_masked = torch.where(
                         legal_mask,
                         action_values,
-                        torch.tensor(float("-inf"), device=device, dtype=dtype),
+                        NEG_INF.to(device=device, dtype=dtype),
                     )
                     white_action_idx = torch.argmax(white_masked).unsqueeze(0)  # [1]
 
                     # Black value: best outcome for Black (minimum)
                     black_value = legal_values.min().unsqueeze(0).unsqueeze(0)  # [1, 1]
                     # Find index of minimum among legal actions only
+                    # For black we need a large positive sentinel for argmin
+                    # For argmin, use +inf as sentinel to avoid selecting illegal actions
+                    POS_INF = torch.tensor(float("inf"), device=device, dtype=dtype)
                     black_masked = torch.where(
                         legal_mask,
                         action_values,
-                        torch.tensor(float("inf"), device=device, dtype=dtype),
+                        POS_INF,
                     )
                     black_action_idx = torch.argmin(black_masked).unsqueeze(0)  # [1]
                 else:
@@ -542,8 +590,72 @@ class HiveGNNPolicyHetero(nn.Module):
                     batch_size, device=device, dtype=torch.long
                 )
 
-            # For batched training, action_logits is not used (return placeholder)
-            action_values = action_values.unsqueeze(0)  # [1, num_actions]
+            # For batched training, we compute action_values per graph in
+            # the batch (shape [batch_size, num_actions]) so that training
+            # can index into action_values using per-example selected moves.
+            # We need to map each move-edge to (batch_index, action_index) and
+            # reduce using 'amax' to get the best value for each action per
+            # graph.
+
+            # Default: action_values is defined for the whole batch as a flat
+            # vector across edges. We can only map to per-graph action values
+            # if the move_to_action_indices aligns with the masked_values.
+            action_values_batched = None
+            if use_action_space and len(move_to_action_indices) == len(masked_values):
+                # all_move_batch and masked_values were created earlier
+                # (safe_indices and safe_values are computed below)
+                valid_mask = move_to_action_indices >= 0
+                safe_indices = torch.where(
+                    valid_mask,
+                    move_to_action_indices,
+                    torch.zeros_like(move_to_action_indices),
+                )
+
+                safe_values = torch.where(
+                    valid_mask,
+                    masked_values,
+                    NEG_INF.to(device=masked_values.device, dtype=masked_values.dtype),
+                )
+
+                # Build flattened indices for (batch_index, action_index)
+                index2 = all_move_batch * self.num_actions + safe_indices
+                # Allocate a flat vector for the batch of action values
+                flat_size = batch_size * self.num_actions
+                action_values_flat = torch.full(
+                    (flat_size,), NEG_INF.item(), device=device, dtype=dtype
+                )
+
+                # Scatter-reduce max across the combined index
+                action_values_flat.scatter_reduce_(
+                    0, index2, safe_values, reduce="amax", include_self=True
+                )
+
+                # Reshape to [batch_size, num_actions]
+                action_values_batched = action_values_flat.view(
+                    batch_size, self.num_actions
+                )
+                action_values = action_values_batched
+            else:
+                # If we cannot map to action space in batched mode, fallback to
+                # a placeholder (the network will still compute white/black values).
+                action_values = action_values.unsqueeze(0)  # [1, num_actions]
+
+        # Do not mask non-finite values here — if non-finite values are found
+        # that correspond to current player moves then the graph/edge masks are
+        # incorrect and should be fixed. Tests will assert finiteness of
+        # current-player move values.
+
+        # Debug: move_to_action_indices vs masked_values length
+        try:
+            if len(move_to_action_indices) != len(masked_values):
+                import sys
+
+                print(
+                    f"[DEBUG] forward() mapping length mismatch: move_to_action_indices={len(move_to_action_indices)}, masked_values={len(masked_values)}",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass
 
         return (
             action_values,

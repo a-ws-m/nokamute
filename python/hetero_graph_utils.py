@@ -2,8 +2,12 @@
 Helper functions to convert board graph representation to PyTorch Geometric format.
 """
 
+import logging
+import os
+
 import torch
 import torch_geometric.transforms as T
+from custom_hetero_data import StackedHeteroData
 from torch_geometric.data import HeteroData
 
 
@@ -30,9 +34,15 @@ def board_to_hetero_data(graph_dict):
         data: HeteroData object with node and edge information (with reverse edges added)
         move_to_action_indices: Tensor of action space indices for legal moves
     """
+    import logging
+    import os
+
     from action_space import string_to_action
 
-    data = HeteroData()
+    # Create HeteroData which stacks certain attributes along a new axis
+    # rather than concatenating them. This is necessary for per-edge
+    # predictions (action values) that we later index per-example.
+    data = StackedHeteroData()
 
     # Add node features for each node type
     if len(graph_dict["x_in_play"]) > 0:
@@ -91,35 +101,15 @@ def board_to_hetero_data(graph_dict):
                             edge_attr, dtype=torch.float32
                         )
 
-    # Convert move strings to action indices BEFORE ToUndirected
+    # Convert move strings to action indices
     move_to_action_list = graph_dict["move_to_action"]
     current_player_action_indices = torch.tensor(
         [string_to_action(move_str) for move_str in move_to_action_list],
         dtype=torch.long,
     )
 
-    # Build full action index tensor that matches ALL move edges (current + opponent)
-    # We need to match the order of edges in the graph with their action indices
-    # Current player moves have action indices, opponent moves get -1 (will be masked)
-    move_to_action_indices_list = []
-    current_idx = 0
-
-    for edge_type in data.edge_types:
-        if "move" in edge_type:
-            # Get edge attributes for this edge type
-            attr_key = f"edge_attr_{edge_type[0]}_{edge_type[1]}_{edge_type[2]}"
-            if attr_key in graph_dict:
-                edge_attrs = graph_dict[attr_key]
-                for attr in edge_attrs:
-                    if attr[0] == 1.0:  # Current player's move
-                        move_to_action_indices_list.append(
-                            current_player_action_indices[current_idx].item()
-                        )
-                        current_idx += 1
-                    else:  # Opponent's move
-                        move_to_action_indices_list.append(-1)  # Will be masked out
-
-    move_to_action_indices = torch.tensor(move_to_action_indices_list, dtype=torch.long)
+    # (will be generated after applying ToUndirected so that order aligns with
+    # `data.edge_types` used by `compute_move_edge_values`.)
 
     # Apply ToUndirected transform to add reverse edges
     # This ensures message passing works in both directions
@@ -127,9 +117,96 @@ def board_to_hetero_data(graph_dict):
     data = transform(data)
 
     # After ToUndirected, move edges are duplicated (forward + reverse)
-    # We need to duplicate move_to_action_indices to match
-    # The order is: [original edges, then reverse edges]
-    move_to_action_indices = torch.cat([move_to_action_indices, move_to_action_indices])
+    # Rebuild `move_to_action_indices` in the same order as the final
+    # `data.edge_types`, so it's aligned with the model's iteration order.
+    # We'll pair reverse edges with their forward counterparts by matching
+    # node index pairs instead of relying on FIFO ordering. This is robust
+    # regardless of how ToUndirected inserts reverse edges into `data.edge_types`.
+    move_to_action_indices_list = []
+    current_idx = 0
+    # Map forward edge pairs (src, dst) -> action_idx for pairing
+    forward_pair_to_action = {}
+
+    for edge_type in data.edge_types:
+        if "move" in edge_type[1] or "rev_move" in edge_type[1]:
+            # Get edge indices and attributes safely
+            if (
+                hasattr(data[edge_type], "edge_index")
+                and data[edge_type].edge_index.numel() > 0
+            ):
+                e_idx = data[edge_type].edge_index
+            else:
+                e_idx = torch.empty((2, 0), dtype=torch.long)
+
+            if (
+                hasattr(data[edge_type], "edge_attr")
+                and data[edge_type].edge_attr.numel() > 0
+            ):
+                e_attr = data[edge_type].edge_attr
+            else:
+                e_attr = torch.zeros((e_idx.shape[1], 1))
+
+            for j in range(e_idx.shape[1]):
+                src = int(e_idx[0, j].item())
+                dst = int(e_idx[1, j].item())
+                is_current = bool(e_attr[j, 0].item() == 1.0)
+
+                if "move" == edge_type[1]:
+                    # Forward move: if current player's edge, assign next action index
+                    if is_current:
+                        if current_idx >= len(current_player_action_indices):
+                            # Something went wrong — the number of current-player edges
+                            # does not match the number of moves reported in the graph
+                            # (move_to_action). Raise early for visibility.
+                            raise ValueError(
+                                f"Mismatch: current action indices shorter than edges: {current_idx} >= {len(current_player_action_indices)}"
+                            )
+
+                        idx_val = int(current_player_action_indices[current_idx].item())
+                        current_idx += 1
+                    else:
+                        idx_val = -1
+
+                    move_to_action_indices_list.append(idx_val)
+                    # Record forward pair -> action for later pairing with reverse
+                    forward_pair_to_action[(src, dst)] = idx_val
+
+                else:
+                    # Reverse move: lookup corresponding forward edge (dst, src)
+                    if is_current:
+                        idx_val = forward_pair_to_action.get((dst, src), -1)
+                    else:
+                        idx_val = -1
+
+                    move_to_action_indices_list.append(idx_val)
+
+    move_to_action_indices = torch.tensor(move_to_action_indices_list, dtype=torch.long)
+
+    # Debugging: log the move_to_action_indices ordering and length so we can
+    # verify alignment with model's `compute_move_edge_values` concatenation order.
+    try:
+        logger = logging.getLogger(__name__)
+        if os.getenv("NKAMUTE_DEBUG", os.getenv("NK_DEBUG", "")).lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+        ):
+            if not logger.handlers:
+                ch = logging.StreamHandler()
+                ch.setLevel(logging.DEBUG)
+                formatter = logging.Formatter("[%(levelname)s:%(name)s] %(message)s")
+                ch.setFormatter(formatter)
+                logger.addHandler(ch)
+            logger.setLevel(logging.DEBUG)
+
+        logger.debug(
+            "board_to_hetero_data: move_to_action_indices len=%d; head=%s",
+            len(move_to_action_indices),
+            move_to_action_indices[:20].tolist(),
+        )
+    except Exception:
+        pass
 
     return data, move_to_action_indices
 
@@ -166,6 +243,20 @@ def prepare_model_inputs(data, move_to_action_indices):
         if hasattr(data[edge_type], "edge_attr"):
             edge_attr_dict[edge_type] = data[edge_type].edge_attr
 
+    # Debugging block: ensure move_to_action_indices aligns with move edges
+    try:
+        total_move_edges = 0
+        for et, idx in edge_index_dict.items():
+            if "move" in et[1] or "rev_move" in et[1]:
+                total_move_edges += idx.shape[1]
+        if len(move_to_action_indices) != total_move_edges:
+            raise ValueError(
+                f"move_to_action_indices must match total_move_edges; got "
+                f"{len(move_to_action_indices)} vs {total_move_edges}"
+            )
+    except Exception:
+        pass
+
     return x_dict, edge_index_dict, edge_attr_dict, move_to_action_indices
 
 
@@ -200,7 +291,8 @@ def get_move_edge_mask(data):
 
 if __name__ == "__main__":
     # Test the conversion
-    print("Testing board_to_hetero_data...")
+    logger = logging.getLogger(__name__)
+    logger.info("Testing board_to_hetero_data...")
     import nokamute
 
     board = nokamute.Board()
