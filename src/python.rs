@@ -602,6 +602,22 @@ impl Board {
         // Move to action mapping (list of move strings for current player's legal moves)
         result.set_item("move_to_action", PyList::new(py, &move_to_action))?;
 
+        // Provide a canonical per-position ordering of legal actions (deduplicated)
+        // This preserves the first-appearance order among current player's move
+        // strings and mirrors the `ordered_unique_action_indices` behavior used in
+        // Python after ToUndirected(). Returning this from Rust makes the same
+        // canonical ordering available at graph creation time so the selection
+        // logic and training pipeline share the same source-of-truth.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut move_order: Vec<String> = Vec::new();
+        for mv in move_to_action.iter() {
+            if !seen.contains(mv) {
+                seen.insert(mv.clone());
+                move_order.push(mv.clone());
+            }
+        }
+        result.set_item("move_order", PyList::new(py, &move_order))?;
+
         Ok(result.into())
     }
 

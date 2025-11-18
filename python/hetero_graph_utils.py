@@ -205,6 +205,26 @@ def board_to_hetero_data(graph_dict):
             len(move_to_action_indices),
             move_to_action_indices[:20].tolist(),
         )
+
+        # Prefer a canonical move order returned by the Rust engine if present.
+        # This reduces drift between the order used during selection and the
+        # order used by the model at training time. `graph_dict` may include
+        # `move_order` as a list of UHP strings; convert those to action indices
+        # using the same `string_to_action` helper used for `move_to_action`.
+        try:
+            if "move_order" in graph_dict:
+                py_move_order = graph_dict["move_order"]
+                # Convert UHP move strings into action indices
+                data.move_order = [string_to_action(mv) for mv in py_move_order]
+                logger.debug(
+                    "board_to_hetero_data: move_order(from rust)=%s", data.move_order
+                )
+            else:
+                unique_ordered = ordered_unique_action_indices(move_to_action_indices)
+                data.move_order = unique_ordered
+                logger.debug("board_to_hetero_data: move_order=%s", unique_ordered)
+        except Exception:
+            pass
     except Exception:
         pass
 

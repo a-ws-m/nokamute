@@ -663,9 +663,13 @@ def test_first_move_action_value_evolution_with_train_main_agent(monkeypatch, tm
     config = LeagueConfig()
     # Increase epsilon to encourage exploration so we see non-greedy moves
     config.epsilon = 1.0
+    # Enable debug mapping prints in `train_epoch_selfplay` for diagnostics
+    monkeypatch.setenv("NKAMUTE_DEBUG", "1")
     # Small numbers for quicker tests
-    config.main_agent_games_per_iter = 20
-    config.main_agent_epochs = 5
+    config.main_agent_games_per_iter = 30
+    # Increase epochs to ensure the main agent has enough gradient steps to
+    # prefer grasshopper moves under the toy winner rule used in this test.
+    config.main_agent_epochs = 10
     config.main_agent_batch_size = 8
     # Ensure CPU for CI / developer machines
     config.gen_device = "cpu"
@@ -771,6 +775,48 @@ def test_first_move_action_value_evolution_with_train_main_agent(monkeypatch, tm
     history = np.array(values_history).squeeze()
     full_history = np.vstack(full_values_history)
 
+    # Additional verification: ensure TD targets for starting positions match
+    # the outcome for the first move (White grasshopper positive, otherwise negative).
+    # Use the final trained main agent to generate games for verification.
+    ckpt = torch.load(league_manager.current_main_agent.model_path, map_location="cpu")
+    cur_model = tracker._load_model(league_manager.current_main_agent, device="cpu")
+    cur_model.eval()
+
+    debug_player = SelfPlayGame(
+        model=cur_model, epsilon=1.0, device="cpu", enable_branching=False, max_moves=5
+    )
+    debug_games = debug_player.generate_games(num_games=40)
+    if not debug_games:
+        debug_games = [debug_player.play_game() for _ in range(40)]
+
+    bad_count = 0
+    from action_space import action_to_string
+
+    for gdata, gresult, _branch in debug_games:
+        t = prepare_training_data([(gdata, gresult, None)])
+        if not t:
+            continue
+        first = t[0]
+        _, _, td_target, selected_action_idx, *_ = first
+        if selected_action_idx is None or selected_action_idx < 0:
+            continue
+        s_label = action_to_string(int(selected_action_idx))
+        should_be_positive = s_label.startswith("wG")
+        if should_be_positive and td_target <= 0:
+            print(
+                f"[DEBUG] TD target mismatch: selected={s_label}, td_target={td_target}"
+            )
+            bad_count += 1
+        if (not should_be_positive) and td_target >= 0:
+            print(
+                f"[DEBUG] TD target mismatch: selected={s_label}, td_target={td_target}"
+            )
+            bad_count += 1
+
+    assert (
+        bad_count == 0
+    ), f"Found {bad_count} games where TD-target sign did not match first-move outcome"
+
     # Plot trend
     plots_dir = Path(__file__).resolve().parents[1] / "python" / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -795,4 +841,242 @@ def test_first_move_action_value_evolution_with_train_main_agent(monkeypatch, tm
     # Basic assertion: the file was written and has non-zero size
     assert out_path.exists() and out_path.stat().st_size > 0
 
-    # Note: Grasshopper improvement may be noisy in short runs; do not assert.
+    # Now assert that at the end of training the only positive-valued
+    # starting actions are grasshopper placements (UHP starts with 'wG').
+    # If this fails, dump the values and labels for diagnostic purposes.
+    if grasshopper_indices:
+        final_vals = full_history[-1]
+        pos_idxs = [i for i, v in enumerate(final_vals) if v > 0]
+        if set(pos_idxs) != set(grasshopper_indices):
+            print("[DEBUG] Final action values:")
+            for i, lab in enumerate(labels):
+                print(f"  idx={i}, label={lab}, value={final_vals[i]:.4f}")
+            raise AssertionError(
+                f"Only grasshopper moves should be positive; positives={pos_idxs}, grasshopper={grasshopper_indices}"
+            )
+
+
+def test_train_on_start_positions_prefers_grasshopper():
+    """Isolated test: train only on legal start positions and assert model learns to prefer grasshopper.
+
+    This test constructs a small training dataset containing only the start
+    position with all legal moves. It assigns a positive TD target for
+    grasshopper placements and negative target for others. Training should
+    increase grasshopper action values and reduce others.
+    """
+
+    model = create_policy_model({"hidden_dim": 64, "num_layers": 2, "num_heads": 2})
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # Build training dataset for the start position
+    start_board = nokamute.Board()
+    graph_dict = start_board.to_graph()
+    data, move_to_action_indices = board_to_hetero_data(graph_dict)
+
+    # Determine the ordered legal action list for this position
+    from hetero_graph_utils import ordered_unique_action_indices
+
+    legal_action_ids = ordered_unique_action_indices(move_to_action_indices)
+    assert len(legal_action_ids) > 0
+
+    # Create training examples: +1 for grasshopper, -1 for others
+    from action_space import action_to_string
+
+    examples = []
+    for local_idx, act_idx in enumerate(legal_action_ids):
+        move_str = action_to_string(int(act_idx))
+        target = 1.0 if move_str.startswith("wG") else -1.0
+        # Construct the training tuple expected by train loop in tests
+        examples.append(
+            (
+                data,
+                move_to_action_indices,
+                target,
+                int(act_idx),
+                int(local_idx),
+                None,
+                None,
+                "White",
+            )
+        )
+
+    # Sanity: ensure there is at least one grasshopper action
+    g_action_idxs = [
+        i
+        for i, a in enumerate(legal_action_ids)
+        if action_to_string(a).startswith("wG")
+    ]
+    assert (
+        len(g_action_idxs) >= 1
+    ), "No grasshopper moves in start position; cannot run test"
+
+    # Train for several epochs on these repeated examples
+    n_epochs = 120
+    batch_examples = examples * 4  # replicate to improve gradient signal
+
+    for epoch in range(n_epochs):
+        model.train()
+        optimizer.zero_grad()
+        losses = []
+
+        for ex in batch_examples:
+            hetero_data, move_to_action_indices, target, sel_idx, sel_local, *_ = ex
+            # Prepare inputs
+            hetero_data = hetero_data.cpu()
+            hetero_data.y = torch.tensor([float(target)], dtype=torch.float32)
+            hetero_data.move_to_action_indices = move_to_action_indices.cpu()
+            hetero_data.current_player = torch.tensor([0], dtype=torch.long)
+
+            x_dict, edge_index_dict, edge_attr_dict, m2a = prepare_model_inputs(
+                hetero_data, hetero_data.move_to_action_indices
+            )
+
+            action_values, white_value, black_value, _, _ = model(
+                x_dict, edge_index_dict, edge_attr_dict, m2a
+            )
+
+            # The selected action's value is the training prediction
+            value_current = action_values.squeeze(0)[int(sel_idx)]
+            value_current = value_current.unsqueeze(0)
+
+            loss = torch.nn.functional.mse_loss(
+                value_current, torch.tensor([float(target)], dtype=torch.float32)
+            )
+            loss.backward()
+            losses.append(float(loss.item()))
+
+        if losses:
+            optimizer.step()
+
+    # Evaluate start position
+    model.eval()
+    with torch.no_grad():
+        x_dict, edge_index_dict, edge_attr_dict, m2a = prepare_model_inputs(
+            data, move_to_action_indices
+        )
+        action_values, action_probs, value, action_idx = model.predict_action_info(
+            x_dict, edge_index_dict, edge_attr_dict, m2a, current_player="White"
+        )
+
+    # Extract legal action values
+    legal_ids = sorted(legal_action_ids)
+    vals = action_values.squeeze(0).cpu().numpy()
+    selected_vals = [vals[int(i)] for i in legal_ids]
+    labels = [action_to_string(i) for i in legal_ids]
+
+    # Diagnostics: ensure at least one grasshopper have positive value, and
+    # non-grasshopper moves are not positive
+    g_idxs = [i for i, l in enumerate(labels) if l.startswith("wG")]
+    assert len(g_idxs) > 0
+
+    pos_idxs = [i for i, v in enumerate(selected_vals) if v > 0]
+    # Require that all positive indices are a subset of grasshopper indices
+    assert set(pos_idxs).issubset(
+        set(g_idxs)
+    ), f"Non-grasshopper moves positive: {pos_idxs} vs grasshopper={g_idxs}"
+
+
+def test_train_epoch_selfplay_batches_start_positions(monkeypatch):
+    """Batch-training test using `train_epoch_selfplay` on the 7 legal start
+    positions to inspect batch mapping and gradient flow.
+
+    We train for multiple iterations using `train_epoch_selfplay` directly.
+    If batch-level mapping or the scatter step reduces gradients across the
+    batch incorrectly, the model may not prefer grasshopper moves.
+    """
+
+    # Small model & optimizer
+    model = create_policy_model({"hidden_dim": 64, "num_layers": 2, "num_heads": 2})
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # Prepare training data: start position with all legal moves enumerated
+    start_board = nokamute.Board()
+    graph_dict = start_board.to_graph()
+    data, move_to_action_indices = board_to_hetero_data(graph_dict)
+
+    # Get ordered legal actions and find grasshopper indices
+    from action_space import action_to_string
+    from hetero_graph_utils import ordered_unique_action_indices
+
+    legal_actions = ordered_unique_action_indices(move_to_action_indices)
+    labels = [action_to_string(a) for a in legal_actions]
+    grasshopper_indices = [i for i, lab in enumerate(labels) if lab.startswith("wG")]
+    assert len(legal_actions) == len(labels) and len(labels) == 7
+
+    # Build training examples for train_epoch_selfplay (structure: 8 items)
+    import copy
+
+    training_examples = []
+    player_obj = start_board.to_move()
+    for local_idx, global_act in enumerate(legal_actions):
+        tgt = 1.0 if action_to_string(global_act).startswith("wG") else -1.0
+        training_examples.append(
+            (
+                copy.deepcopy(data),
+                move_to_action_indices.clone(),
+                float(tgt),
+                int(global_act),
+                int(local_idx),
+                None,
+                None,
+                player_obj,
+            )
+        )
+
+    # Duplicate examples so each epoch contains several batches
+    training_examples = training_examples * 4
+
+    # Train for multiple epoch iterations using the `train_epoch_selfplay` function
+    from train_league import train_epoch_selfplay
+
+    # Enable debug logging for mapping
+    monkeypatch.setenv("NKAMUTE_DEBUG", "1")
+
+    n_epochs = 12
+    for epoch in range(n_epochs):
+        loss = train_epoch_selfplay(
+            model, training_examples, optimizer, batch_size=8, device="cpu"
+        )
+        print(f"train_epoch_selfplay epoch={epoch}, loss={loss}")
+
+    # Basic check: ensure training produced a gradient signal for model params
+    grad_exists = any(
+        (p.grad is not None and float(p.grad.abs().sum()) > 0)
+        for p in model.parameters()
+    )
+    assert (
+        grad_exists
+    ), "No parameter gradients found after call to train_epoch_selfplay"
+
+    # Evaluate start position after training
+    model.eval()
+    with torch.no_grad():
+        x_dict, e_idx, e_attr, m2a = prepare_model_inputs(data, move_to_action_indices)
+        action_values, action_probs, value, action_idx = model.predict_action_info(
+            x_dict, e_idx, e_attr, m2a, current_player="White"
+        )
+
+    vals = action_values.squeeze(0).cpu().numpy()
+    selected_vals = [float(vals[int(i)]) for i in legal_actions]
+
+    # Allow some tolerance: at least one grasshopper index should be positive
+    pos_idxs = [i for i, v in enumerate(selected_vals) if v > 0]
+    if len(pos_idxs) == 0:
+        # Show debug logs saved by train_epoch_selfplay
+        try:
+            with open("python/tmp/nokamute_debug_train.txt", "r") as f:
+                print(f.read())
+        except Exception:
+            pass
+
+    assert (
+        len(pos_idxs) > 0
+    ), f"No positive action values found after batched training. vals={selected_vals}"
+
+    # Ensure non-grasshopper positives are not dominant — require all positives to
+    # be grasshoppers OR no non-grasshoppers are positive. This verifies the
+    # batch mapping did not cause cross-example leakage
+    non_g_positive = [i for i in pos_idxs if i not in grasshopper_indices]
+    assert (
+        len(non_g_positive) == 0
+    ), f"Non-grasshopper actions positive after batch training: {non_g_positive}"

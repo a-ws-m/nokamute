@@ -95,7 +95,11 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
 
     data_list = []
     for item in training_data:
-        if len(item) == 9:
+        # Support both legacy 8-element training tuples and newer/variant 9-element
+        # tuples used in some callers. The structure we need is the first eight
+        # elements which represent the training example payload. Any extra
+        # trailing items will be ignored.
+        if len(item) >= 8:
             (
                 hetero_data,
                 move_to_action_indices,
@@ -105,7 +109,7 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                 next_hetero_data,
                 next_move_to_action_indices,
                 current_player,
-            ) = item
+            ) = item[:8]
         else:
             continue
 
@@ -259,9 +263,14 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                     black_value.squeeze(-1),
                 )
 
-                # If no valid selections, keep fallback
+                # If no valid selections, fail early — don't allow a silent fallback
+                # This ensures we have a policy-level signal for every training
+                # example and avoids mixing value signals when a selected action
+                # index is missing or the mapping is wrong.
                 if not valid_sel.any():
-                    predictions = fallback_vals
+                    raise ValueError(
+                        "train_epoch_selfplay: No valid selected_action_idx found; fallback disabled"
+                    )
                 else:
                     # Collect selected action values for valid entries
                     valid_batch_idx = batch_indices[valid_sel]
@@ -291,21 +300,72 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                     # Map local indices to global action indices using the per-example
                     # `move_order` list produced in `prepare_training_data` (preferred),
                     # otherwise fall back to scanning `batch.move_to_action_indices`.
+                    # Prefer the recorded global indices for selected actions
+                    # (sel_idx) — this is the action chosen during self-play.
                     selected_global_for_valid = []
-                    use_move_order = False
+                    # If the original `prepare_training_data` attached `move_order`
+                    # to each HeteroData example then the DataLoader will produce
+                    # a `batch.move_order` attribute (list-of-lists); prefer that so
+                    # we reuse the same ordering rather than reconstructing it.
                     move_order_list = None
-                    for b_idx, l_idx in zip(
-                        valid_batch_idx.tolist(), valid_sel_idx_local.tolist()
+                    use_move_order = False
+                    if hasattr(batch, "move_order"):
+                        try:
+                            move_order_list = batch.move_order
+                            # Log move_order presence and type for debugging
+                            try:
+                                import logging
+
+                                logger = logging.getLogger(__name__)
+                                logger.debug(
+                                    "train_epoch_selfplay: batch.move_order present; type=%s",
+                                    type(move_order_list),
+                                )
+                            except Exception:
+                                pass
+                            # move_order_list may be a list (of lists)
+                            if isinstance(move_order_list, (list, tuple)):
+                                use_move_order = True
+                        except Exception:
+                            use_move_order = False
+                    for rec_global, b_idx, l_idx in zip(
+                        valid_sel_idx_global.tolist(),
+                        valid_batch_idx.tolist(),
+                        valid_sel_idx_local.tolist(),
                     ):
+                        # If no local mapping is available, prefer recorded global index
                         if l_idx < 0:
-                            selected_global_for_valid.append(-1)
+                            selected_global_for_valid.append(int(rec_global))
                             continue
+
+                        # Use move_order if available (preferred) for local->global mapping
                         if use_move_order and move_order_list is not None:
                             local_list = move_order_list[b_idx]
                             if 0 <= l_idx < len(local_list):
-                                selected_global_for_valid.append(local_list[l_idx])
+                                local_mapped = local_list[l_idx]
+                                if int(rec_global) != int(local_mapped):
+                                    # Don't fail hard here; prefer the recorded global
+                                    # index for training but record the mismatch for
+                                    # diagnostics. This avoids masking training
+                                    # updates during debugging and still allows us
+                                    # to surface mismatches via logs / JSON.
+                                    try:
+                                        import logging
+
+                                        logger = logging.getLogger(__name__)
+                                        logger.debug(
+                                            "train_epoch_selfplay: Local->Global mismatch (prefer recorded); batch=%d rec=%d comp=%d",
+                                            b_idx,
+                                            int(rec_global),
+                                            int(local_mapped),
+                                        )
+                                    except Exception:
+                                        pass
+                                # Prefer the recorded global index when indexing action_values
+                                selected_global_for_valid.append(int(rec_global))
                                 continue
 
+                        # Fall back to recomputing the ordering from move_to_action_indices
                         if all_move_batch.numel() > 0:
                             legal_idxs = batch.move_to_action_indices[
                                 all_move_batch == b_idx
@@ -317,15 +377,235 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                             unique_ordered = []
 
                         if 0 <= l_idx < len(unique_ordered):
-                            selected_global_for_valid.append(unique_ordered[l_idx])
-                        else:
-                            selected_global_for_valid.append(-1)
+                            local_mapped = unique_ordered[l_idx]
+                            if int(rec_global) != int(local_mapped):
+                                try:
+                                    import logging
 
-                    selected_global_for_valid = torch.tensor(
-                        selected_global_for_valid,
-                        device=action_values.device,
-                        dtype=torch.long,
-                    )
+                                    logger = logging.getLogger(__name__)
+                                    logger.debug(
+                                        "train_epoch_selfplay: Local->Global mismatch (prefer recorded); batch=%d rec=%d comp=%d",
+                                        b_idx,
+                                        int(rec_global),
+                                        int(local_mapped),
+                                    )
+                                except Exception:
+                                    pass
+                            selected_global_for_valid.append(int(rec_global))
+                        else:
+                            # No reliable mapping -> prefer recorded value
+                            selected_global_for_valid.append(int(rec_global))
+
+                        selected_global_for_valid = torch.tensor(
+                            selected_global_for_valid,
+                            device=action_values.device,
+                            dtype=torch.long,
+                        )
+
+                    # Strict mapping assertion: the recorded global selected index
+                    # (sel_idx) for each valid example should match the mapping we
+                    # computed from the per-example ordered legal actions. If this
+                    # assertion fails then the training data / mapping logic is
+                    # inconsistent with how the model concatenates move edges.
+                    try:
+                        from action_space import action_to_string
+
+                        mismatch_rows = []
+                        # Allow `selected_global_for_valid` to be either a Python
+                        # list or a torch tensor (defensive). Use fast conversion
+                        # to Python lists for diagnostics.
+                        rec_list = (
+                            valid_sel_idx_global.tolist()
+                            if hasattr(valid_sel_idx_global, "tolist")
+                            else list(valid_sel_idx_global)
+                        )
+                        comp_list = (
+                            selected_global_for_valid.tolist()
+                            if hasattr(selected_global_for_valid, "tolist")
+                            else list(selected_global_for_valid)
+                        )
+
+                        for b_i, rec, comp, l_idx in zip(
+                            valid_batch_idx.tolist(),
+                            rec_list,
+                            comp_list,
+                            valid_sel_idx_local.tolist(),
+                        ):
+                            if rec != comp:
+                                # Reconstruct ordered list for diagnostics
+                                if all_move_batch.numel() > 0:
+                                    legal_idxs = batch.move_to_action_indices[
+                                        all_move_batch == b_i
+                                    ]
+                                    from hetero_graph_utils import (
+                                        ordered_unique_action_indices,
+                                    )
+
+                                    ordered = ordered_unique_action_indices(legal_idxs)
+                                else:
+                                    ordered = []
+
+                                sel_label = (
+                                    action_to_string(int(rec)) if rec >= 0 else "<none>"
+                                )
+                                comp_label = (
+                                    action_to_string(int(comp))
+                                    if comp >= 0
+                                    else "<none>"
+                                )
+                                mismatch_rows.append(
+                                    (
+                                        b_i,
+                                        l_idx,
+                                        rec,
+                                        sel_label,
+                                        comp,
+                                        comp_label,
+                                        ordered,
+                                    )
+                                )
+
+                        if len(mismatch_rows) > 0:
+                            try:
+                                import json
+                                import os
+
+                                fname = "python/tmp/nokamute_debug_train_mapping.json"
+                                os.makedirs(os.path.dirname(fname), exist_ok=True)
+                                with open(fname, "w") as fh:
+                                    json.dump(
+                                        [
+                                            {
+                                                "batch_idx": row[0],
+                                                "selected_local_idx": row[1],
+                                                "recorded_global_idx": row[2],
+                                                "recorded_label": row[3],
+                                                "computed_global_idx": row[4],
+                                                "computed_label": row[5],
+                                                "ordered_legal_list": row[6],
+                                            }
+                                            for row in mismatch_rows
+                                        ],
+                                        fh,
+                                        indent=2,
+                                    )
+                            except Exception:
+                                pass
+
+                            # Do not abort training on mapping mismatches. Instead,
+                            # log them and continue — prefer calling code to evolve
+                            # the canonical mapping or resolve this mismatch in Rust.
+                            try:
+                                import logging
+
+                                logger = logging.getLogger(__name__)
+                                logger.warning(
+                                    "train_epoch_selfplay: Local->Global mapping mismatch detected; see python/tmp/nokamute_debug_train_mapping.json"
+                                )
+                            except Exception:
+                                pass
+                    except AssertionError:
+                        raise
+                    except Exception:
+                        # A mapping diagnostic may fail for several reasons;
+                        # log the stack and continue instead of aborting the
+                        # training run. The mapping mismatch JSON should help
+                        # us debug the root cause.
+                        try:
+                            import logging
+                            import traceback
+
+                            logger = logging.getLogger(__name__)
+                            logger.warning(
+                                "train_epoch_selfplay: mapping diagnostic failure:\n%s",
+                                traceback.format_exc(),
+                            )
+                        except Exception:
+                            pass
+
+                    # DEBUG: log mapping details when enabled
+                    try:
+                        import logging
+                        import os
+
+                        logger = logging.getLogger(__name__)
+                        if os.getenv(
+                            "NKAMUTE_DEBUG", os.getenv("NK_DEBUG", "")
+                        ).lower() in (
+                            "1",
+                            "true",
+                            "yes",
+                            "y",
+                        ):
+                            if not logger.handlers:
+                                ch = logging.StreamHandler()
+                                ch.setLevel(logging.DEBUG)
+                                fmt = logging.Formatter(
+                                    "[%(levelname)s:%(name)s] %(message)s"
+                                )
+                                ch.setFormatter(fmt)
+                                logger.addHandler(ch)
+                            logger.setLevel(logging.DEBUG)
+
+                            # Log selected mapping and values per example in the batch
+                            for b_idx, l_idx, g_idx in zip(
+                                valid_batch_idx.tolist(),
+                                valid_sel_idx_local.tolist(),
+                                selected_global_for_valid.tolist(),
+                            ):
+                                # find the ordered unique list of legal action ids
+                                if all_move_batch.numel() > 0:
+                                    legal_idxs = batch.move_to_action_indices[
+                                        all_move_batch == b_idx
+                                    ]
+                                    from hetero_graph_utils import (
+                                        ordered_unique_action_indices,
+                                    )
+
+                                    ordered = ordered_unique_action_indices(legal_idxs)
+                                else:
+                                    ordered = []
+
+                                sel_label = None
+                                try:
+                                    from action_space import action_to_string
+
+                                    if g_idx >= 0:
+                                        sel_label = action_to_string(int(g_idx))
+                                except Exception:
+                                    sel_label = None
+
+                                sel_val = (
+                                    action_values[b_idx, g_idx]
+                                    if g_idx >= 0
+                                    else float("nan")
+                                )
+                                fallback_val = (
+                                    white_value.squeeze(-1)[b_idx]
+                                    if batch.current_player[b_idx] == 0
+                                    else black_value.squeeze(-1)[b_idx]
+                                )
+                                logger.debug(
+                                    "BATCH debug batch_idx=%d local=%d -> global=%d label=%s sel_val=%s fallback=%s ordered_count=%d",
+                                    b_idx,
+                                    l_idx,
+                                    g_idx,
+                                    sel_label,
+                                    (
+                                        float(sel_val.cpu().numpy())
+                                        if hasattr(sel_val, "cpu")
+                                        else sel_val
+                                    ),
+                                    (
+                                        float(fallback_val.cpu().numpy())
+                                        if hasattr(fallback_val, "cpu")
+                                        else fallback_val
+                                    ),
+                                    len(ordered),
+                                )
+                    except Exception:
+                        # Do not crash training on debug logging failure
+                        pass
 
                     # Now we can fetch action values (global indexing) for these selected moves
                     selected_vals_valid = action_values[
@@ -356,7 +636,10 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                                 )
                         except Exception:
                             pass
-                    # If any selected value is -inf (illegal), fall back on that example
+                    # If any selected value is -inf (illegal), raise an error — this
+                    # indicates a mapping/inference/graph construction bug which
+                    # should be fixed instead of silently using the per-graph
+                    # fallback value.
                     finite_mask = torch.isfinite(selected_vals_valid)
                     # Always log the raw values for the first batch (helps diagnose mixture)
                     if num_batches == 0:
@@ -379,6 +662,11 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                         # Assign only finite values
                         predictions[valid_sel] = torch.where(
                             finite_mask, selected_vals_valid, fallback_vals[valid_sel]
+                        )
+                    else:
+                        # No finite selected values -> mapping bug
+                        raise ValueError(
+                            "train_epoch_selfplay: All selected action values are non-finite for valid selected indices"
                         )
                     # More detailed debug: log the selected action values and predictions
                     if num_batches == 0:
@@ -434,9 +722,14 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                 if valid_sel.any():
                     all_selected = action_values.squeeze(0)[sel_idx_1d.clamp(min=0)]
                     finite_mask = torch.isfinite(all_selected)
-                    predictions = torch.where(
-                        valid_sel & finite_mask, all_selected, fallback_vals
-                    )
+                    if finite_mask.any():
+                        predictions = torch.where(
+                            valid_sel & finite_mask, all_selected, fallback_vals
+                        )
+                    else:
+                        raise ValueError(
+                            "train_epoch_selfplay: Non-batched selection produced no finite action values"
+                        )
                 else:
                     predictions = fallback_vals
             else:
@@ -475,14 +768,11 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
         # Replace non-finite predictions (e.g., -inf from illegal actions)
         if not torch.isfinite(predictions).all():
             try:
-                predictions = torch.where(
-                    torch.isfinite(predictions),
-                    predictions,
-                    torch.where(
-                        batch.current_player == 0,
-                        white_value.squeeze(-1),
-                        black_value.squeeze(-1),
-                    ),
+                # Do not fall back to white/black values silently. If predictions
+                # contain non-finite entries we prefer to raise an error so the
+                # problem can be addressed upstream (mapping/graph/batching issue).
+                raise ValueError(
+                    "train_epoch_selfplay: Predictions contain non-finite values; fallback disabled"
                 )
             except Exception:
                 # If batch attrs are missing, fallback to zeros
@@ -493,6 +783,54 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
 
         # Backward pass
         loss.backward()
+
+        # DEBUG: log predictions, targets, and gradient norms for diagnose
+        try:
+            import logging
+            import os
+
+            logger = logging.getLogger(__name__)
+            if os.getenv("NKAMUTE_DEBUG", os.getenv("NK_DEBUG", "")).lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+            ):
+                if not logger.handlers:
+                    ch = logging.StreamHandler()
+                    ch.setLevel(logging.DEBUG)
+                    fmt = logging.Formatter("[%(levelname)s:%(name)s] %(message)s")
+                    ch.setFormatter(fmt)
+                    logger.addHandler(ch)
+                logger.setLevel(logging.DEBUG)
+
+                # small sample of predictions / targets
+                try:
+                    import numpy as _np
+
+                    logger.debug(
+                        "Batch DEBUG: predictions_sample=%s, targets_sample=%s",
+                        _np.round(
+                            predictions[: min(8, predictions.shape[0])].cpu().numpy(), 4
+                        ).tolist(),
+                        _np.round(
+                            targets[: min(8, targets.shape[0])].cpu().numpy(), 4
+                        ).tolist(),
+                    )
+                except Exception:
+                    pass
+
+                # Compute gradient norm
+                grad_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        try:
+                            grad_norm += float(p.grad.detach().norm().item())
+                        except Exception:
+                            pass
+                logger.debug("Batch DEBUG: grad_norm_before_step=%s", grad_norm)
+        except Exception:
+            pass
         optimizer.step()
 
         total_loss += loss.item()

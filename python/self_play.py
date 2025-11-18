@@ -765,6 +765,35 @@ class SelfPlayGame:
                 if selected_move_idx < len(uhp_move_strings)
                 else ""
             )
+            # Compute global and local selected action indices using the
+            # canonical ordering attached to the HeteroData from
+            # `board_to_hetero_data`. This ensures the recorded local index
+            # matches the model's concatenation order at conversion time.
+            from action_space import string_to_action
+            from hetero_graph_utils import ordered_unique_action_indices
+
+            selected_action_idx = (
+                string_to_action(selected_move_uhp) if selected_move_uhp else -1
+            )
+
+            # Build ordered unique action list (should be attached in HeteroData)
+            try:
+                # Prefer stored `move_order` if available
+                unique_ordered = (
+                    hetero_data.move_order
+                    if hasattr(hetero_data, "move_order")
+                    else ordered_unique_action_indices(move_to_action_indices)
+                )
+            except Exception:
+                unique_ordered = ordered_unique_action_indices(move_to_action_indices)
+
+            if selected_action_idx >= 0 and selected_action_idx in unique_ordered:
+                selected_action_local_idx = unique_ordered.index(selected_action_idx)
+            else:
+                selected_action_local_idx = -1
+            # Also record the global selected action index (if we identified it)
+            # so that later stages can prefer the recorded global mapping when
+            # translating local indices back into action_ids.
             game_data.append(
                 (
                     hetero_data,
@@ -777,6 +806,8 @@ class SelfPlayGame:
                     uhp_move_strings,
                     selected_move_uhp,
                     selected_move_idx,
+                    selected_action_idx,
+                    selected_action_local_idx,
                 )
             )
             board.apply(selected_move)
@@ -977,6 +1008,7 @@ def prepare_training_data(games):
     from action_space import string_to_action
     from hetero_graph_utils import board_to_hetero_data
 
+    # rec_count removed to avoid debug-only side-effects
     # TD-lambda implementation (lambda=0.2)
     lambda_ = 0.8
     gamma = 0.99
@@ -989,7 +1021,22 @@ def prepare_training_data(games):
         # Collect all move_values for this trajectory
         move_values = []
         for idx, item in enumerate(game_data):
-            if len(item) == 10:
+            if len(item) == 12:
+                (
+                    hetero_data,
+                    move_to_action_indices,
+                    legal_moves,
+                    selected_move,
+                    player,
+                    pos_hash,
+                    move_value,
+                    uhp_move_strings,
+                    selected_move_uhp,
+                    selected_move_idx,
+                    recorded_selected_action_idx,
+                    recorded_selected_action_local_idx,
+                ) = item
+            elif len(item) == 11:
                 (
                     hetero_data,
                     move_to_action_indices,
@@ -1014,6 +1061,7 @@ def prepare_training_data(games):
                 ) = item
                 selected_move_uhp = ""
             else:
+                # Nothing to do for this item
                 continue
 
             move_values.append(move_value)
@@ -1037,7 +1085,36 @@ def prepare_training_data(games):
         for t in range(T):
             # Get selected action index from UHP string
             item = game_data[t]
-            if len(item) == 10:
+            if len(item) == 12:
+                (
+                    hetero_data,
+                    move_to_action_indices,
+                    legal_moves,
+                    selected_move,
+                    player,
+                    pos_hash,
+                    move_value,
+                    uhp_move_strings,
+                    selected_move_uhp,
+                    selected_move_idx,
+                    recorded_selected_action_idx,
+                    recorded_selected_action_local_idx,
+                ) = item
+            elif len(item) == 11:
+                (
+                    hetero_data,
+                    move_to_action_indices,
+                    legal_moves,
+                    selected_move,
+                    player,
+                    pos_hash,
+                    move_value,
+                    uhp_move_strings,
+                    selected_move_uhp,
+                    selected_move_idx,
+                    recorded_selected_action_local_idx,
+                ) = item
+            elif len(item) == 10:
                 (
                     hetero_data,
                     move_to_action_indices,
@@ -1064,9 +1141,15 @@ def prepare_training_data(games):
             else:
                 continue
 
-            selected_action_idx = (
-                string_to_action(selected_move_uhp) if selected_move_uhp else -1
-            )
+            # Prefer any recorded action index that was stored at play time
+            # (global action index) to avoid re-scanning UHP list which may
+            # not be perfectly aligned with `legal_moves` after transforms.
+            if len(item) >= 12:
+                selected_action_idx = int(recorded_selected_action_idx)
+            else:
+                selected_action_idx = (
+                    string_to_action(selected_move_uhp) if selected_move_uhp else -1
+                )
             # local index stored at end of the tuple (if present)
             # The `uhp_move_strings` list is added to the game_data tuple. This
             # makes the expected game_data tuple longer. First, try to extract
@@ -1113,6 +1196,14 @@ def prepare_training_data(games):
                     player,
                 )
             )
+            print(
+                f"[DEBUG] appended training example selected_action_idx={selected_action_idx} local={selected_action_local_idx}"
+            )
+            # Store the per-position ordered legal action list on the HeteroData
+            # itself so that `train_epoch_selfplay` can re-use it for strict
+            # mapping during batching. This avoids re-scanning `batch.move_to_action_indices`.
+            # move_order is now provided by `board_to_hetero_data` for each
+            # HeteroData. No need to set it here; keep for backward-compat.
 
     return training_examples
 

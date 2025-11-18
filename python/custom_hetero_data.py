@@ -28,6 +28,12 @@ class StackedHeteroData(HeteroData):
             "selected_action_local_idx",
             "current_player",
             "has_next_state",
+            # Per-example ordered action list used for mapping local->global.
+            # Stored as a Python list of ints per HeteroData and collated by
+            # PyG's DataLoader into a list-of-lists when batching.
+            # move_order is intentionally NOT stacked — we want it to be
+            # collated as a Python list by the DataLoader so each example's
+            # ordering can remain variable-length and directly accessible.
         }
 
         if key in stack_keys:
