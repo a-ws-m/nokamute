@@ -785,6 +785,13 @@ def test_first_move_action_value_evolution_with_train_main_agent(monkeypatch, tm
     plt.tight_layout()
     plt.savefig(out_path)
 
+    # Also save per-action curves for all legal first moves, like
+    # `test_first_move_action_value_evolution` does. Uses `_plot_action_value_history`
+    # helper which plots everything and writes to a file.
+    if labels is not None:
+        out_path_full = plots_dir / "first_move_action_values_main_agent_full.png"
+        _plot_action_value_history(full_history, labels, out_path_full)
+
     # Basic assertion: the file was written and has non-zero size
     assert out_path.exists() and out_path.stat().st_size > 0
 
