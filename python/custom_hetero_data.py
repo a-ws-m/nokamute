@@ -25,6 +25,7 @@ class StackedHeteroData(HeteroData):
         stack_keys = {
             "y",
             "selected_action_idx",
+            "selected_action_local_idx",
             "current_player",
             "has_next_state",
         }

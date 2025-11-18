@@ -722,7 +722,9 @@ class SelfPlayGame:
                         current_player,
                         pos_hash,
                         move_value,
+                        uhp_move_strings,
                         selected_move_uhp,
+                        selected_move_idx,
                     )
                 )
                 board.pass_turn()
@@ -772,7 +774,9 @@ class SelfPlayGame:
                     current_player,
                     pos_hash,
                     move_value,
+                    uhp_move_strings,
                     selected_move_uhp,
+                    selected_move_idx,
                 )
             )
             board.apply(selected_move)
@@ -805,7 +809,6 @@ class SelfPlayGame:
 
         for i in tqdm(range(num_games), desc="Generating games", unit="game"):
             game_data, result, _ = self.play_game(branch_id=f"seq_{i}")
-            games.append((game_data, result, f"seq_{i}"))
 
         return games
 
@@ -814,7 +817,7 @@ class SelfPlayGame:
         Generate games using branching MCMC.
 
         This exploits the fact that self-play is essentially MCMC sampling:
-        - Play initial games to build up a tree of positions
+                            uhp_move_strings,
         - Branch from promising intermediate positions to explore alternatives
         - Reuse early-game computation across multiple game trajectories
 
@@ -982,10 +985,11 @@ def prepare_training_data(games):
     for game_data, final_result, branch_id in tqdm(
         games, desc="Preparing training data", unit="game"
     ):
+        print(f"[DEBUG] Preparing game: len(game_data)={len(game_data)}")
         # Collect all move_values for this trajectory
         move_values = []
         for idx, item in enumerate(game_data):
-            if len(item) == 8:
+            if len(item) == 10:
                 (
                     hetero_data,
                     move_to_action_indices,
@@ -994,7 +998,9 @@ def prepare_training_data(games):
                     player,
                     pos_hash,
                     move_value,
-                    uhp_move_string,
+                    uhp_move_strings,
+                    selected_move_uhp,
+                    selected_move_idx,
                 ) = item
             elif len(item) == 7:
                 (
@@ -1006,7 +1012,7 @@ def prepare_training_data(games):
                     pos_hash,
                     move_value,
                 ) = item
-                uhp_move_string = ""
+                selected_move_uhp = ""
             else:
                 continue
 
@@ -1031,7 +1037,7 @@ def prepare_training_data(games):
         for t in range(T):
             # Get selected action index from UHP string
             item = game_data[t]
-            if len(item) == 8:
+            if len(item) == 10:
                 (
                     hetero_data,
                     move_to_action_indices,
@@ -1040,7 +1046,9 @@ def prepare_training_data(games):
                     player,
                     pos_hash,
                     move_value,
-                    uhp_move_string,
+                    uhp_move_strings,
+                    selected_move_uhp,
+                    selected_move_idx,
                 ) = item
             elif len(item) == 7:
                 (
@@ -1057,8 +1065,18 @@ def prepare_training_data(games):
                 continue
 
             selected_action_idx = (
-                string_to_action(uhp_move_string) if uhp_move_string else -1
+                string_to_action(selected_move_uhp) if selected_move_uhp else -1
             )
+            # local index stored at end of the tuple (if present)
+            # The `uhp_move_strings` list is added to the game_data tuple. This
+            # makes the expected game_data tuple longer. First, try to extract
+            # selected_action_local_idx (last element). Then we can build the
+            # ordered global action list from `uhp_move_strings` when producing
+            # training examples.
+            if len(item) >= 10:
+                selected_action_local_idx = int(item[-1])
+            else:
+                selected_action_local_idx = -1
 
             # Next state
             if t + 1 < T:
@@ -1068,12 +1086,26 @@ def prepare_training_data(games):
             else:
                 next_hetero_data, next_move_to_action_indices = None, None
 
+            # Compute local index as the index of selected_action_idx in the
+            # per-position ordered list of legal action IDs derived from
+            # `move_to_action_indices` (preserving order and excluding -1).
+            unique_ordered = []
+            for v in move_to_action_indices.tolist():
+                if v >= 0 and v not in unique_ordered:
+                    unique_ordered.append(int(v))
+
+            if selected_action_idx >= 0 and selected_action_idx in unique_ordered:
+                selected_action_local_idx = unique_ordered.index(selected_action_idx)
+            else:
+                selected_action_local_idx = -1
+
             training_examples.append(
                 (
                     hetero_data,
                     move_to_action_indices,
                     td_targets[t],
                     selected_action_idx,
+                    selected_action_local_idx,
                     next_hetero_data,
                     next_move_to_action_indices,
                     player,

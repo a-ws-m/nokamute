@@ -95,12 +95,13 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
 
     data_list = []
     for item in training_data:
-        if len(item) == 7:
+        if len(item) == 9:
             (
                 hetero_data,
                 move_to_action_indices,
                 target,
                 selected_action_idx,
+                selected_action_local_idx,
                 next_hetero_data,
                 next_move_to_action_indices,
                 current_player,
@@ -117,6 +118,12 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
         hetero_data.selected_action_idx = torch.tensor(
             [selected_action_idx], dtype=torch.long
         )
+        hetero_data.selected_action_local_idx = torch.tensor(
+            [selected_action_local_idx], dtype=torch.long
+        )
+        # No `move_order` stored on HeteroData anymore - we compute local->global
+        # mapping from `move_to_action_indices` on demand during training so
+        # move ordering is always derived from the final HeteroData structure.
         hetero_data.has_next_state = torch.tensor(
             [next_hetero_data is not None], dtype=torch.bool
         )
@@ -210,6 +217,11 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                     pass
             # Normalize selected idx to 1D LongTensor (available for all batches)
             sel_idx = batch.selected_action_idx.view(-1).long()
+            sel_local_idx = (
+                batch.selected_action_local_idx.view(-1).long()
+                if hasattr(batch, "selected_action_local_idx")
+                else torch.full_like(sel_idx, -1)
+            )
 
             # action_values may be [1, num_actions] (not batched) or
             # [batch_size, num_actions] (batched). Handle both.
@@ -221,8 +233,9 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
             if action_values.dim() == 2 and action_values.shape[0] == sel_idx.shape[0]:
                 batch_indices = torch.arange(sel_idx.shape[0], device=sel_idx.device)
 
-                # Mask out invalid selections (selected_action_idx == -1)
+                # Mask out invalid selections for both global and local
                 valid_sel = sel_idx >= 0
+                valid_local = sel_local_idx >= 0
 
                 # Also mask out selections that are out-of-range for action_values
                 max_idx = action_values.shape[-1]
@@ -252,9 +265,76 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                 else:
                     # Collect selected action values for valid entries
                     valid_batch_idx = batch_indices[valid_sel]
-                    valid_sel_idx = sel_idx[valid_sel]
+                    valid_sel_idx_global = sel_idx[valid_sel]
+                    valid_sel_idx_local = sel_local_idx[valid_sel]
 
-                    selected_vals_valid = action_values[valid_batch_idx, valid_sel_idx]
+                    # Build per-batch legal action lists to map local -> global
+                    batch_size_local = sel_idx.shape[0]
+                    # Reconstruct per-edge batch assignment
+                    move_edge_batch = []
+                    batch_dict = {
+                        nt: x_dict[nt].batch
+                        for nt in x_dict
+                        if hasattr(x_dict[nt], "batch")
+                    }
+                    for et in edge_index_dict.keys():
+                        if "move" in et[1] or "rev_move" in et[1]:
+                            edge_idx = edge_index_dict[et]
+                            if edge_idx.shape[1] > 0 and et[0] in batch_dict:
+                                move_edge_batch.append(batch_dict[et[0]][edge_idx[0]])
+                    all_move_batch = (
+                        torch.cat(move_edge_batch)
+                        if move_edge_batch
+                        else torch.empty(0, dtype=torch.long)
+                    )
+
+                    # Map local indices to global action indices using the per-example
+                    # `move_order` list produced in `prepare_training_data` (preferred),
+                    # otherwise fall back to scanning `batch.move_to_action_indices`.
+                    selected_global_for_valid = []
+                    use_move_order = False
+                    move_order_list = None
+                    for b_idx, l_idx in zip(
+                        valid_batch_idx.tolist(), valid_sel_idx_local.tolist()
+                    ):
+                        if l_idx < 0:
+                            selected_global_for_valid.append(-1)
+                            continue
+                        if use_move_order and move_order_list is not None:
+                            local_list = move_order_list[b_idx]
+                            if 0 <= l_idx < len(local_list):
+                                selected_global_for_valid.append(local_list[l_idx])
+                                continue
+
+                        if all_move_batch.numel() > 0:
+                            legal_idxs = batch.move_to_action_indices[
+                                all_move_batch == b_idx
+                            ]
+                            # preserve order of first appearance
+                            seen = set()
+                            unique_ordered = []
+                            for x in legal_idxs.tolist():
+                                if x >= 0 and x not in seen:
+                                    unique_ordered.append(x)
+                                    seen.add(x)
+                        else:
+                            unique_ordered = []
+
+                        if 0 <= l_idx < len(unique_ordered):
+                            selected_global_for_valid.append(unique_ordered[l_idx])
+                        else:
+                            selected_global_for_valid.append(-1)
+
+                    selected_global_for_valid = torch.tensor(
+                        selected_global_for_valid,
+                        device=action_values.device,
+                        dtype=torch.long,
+                    )
+
+                    # Now we can fetch action values (global indexing) for these selected moves
+                    selected_vals_valid = action_values[
+                        valid_batch_idx, selected_global_for_valid
+                    ]
 
                     # DEBUG ASSERT: selected action values must be finite for current player
                     if not torch.isfinite(selected_vals_valid).all():
@@ -267,7 +347,8 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                             )
                             # Log the legal action mask per example
                             for b_idx, sel_i in zip(
-                                valid_batch_idx.tolist(), valid_sel_idx.tolist()
+                                valid_batch_idx.tolist(),
+                                selected_global_for_valid.tolist(),
                             ):
                                 legal_mask = torch.isfinite(action_values[b_idx])
                                 legal_idxs = (
@@ -313,7 +394,7 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                                     f"DEBUG valid_batch_idx={_np.array(valid_batch_idx.cpu())}\n"
                                 )
                                 f.write(
-                                    f"DEBUG valid_sel_idx={_np.array(valid_sel_idx.cpu())}\n"
+                                    f"DEBUG valid_selected_global_idx={_np.array(selected_global_for_valid.cpu())}\n"
                                 )
                                 f.write(
                                     f"DEBUG selected_vals_valid={_np.round(selected_vals_valid.cpu().numpy(),3)}\n"
