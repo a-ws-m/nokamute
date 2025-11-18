@@ -67,12 +67,9 @@ def test_move_to_action_indices_batched_order_preserved():
             positive = [string_to_action(s) for s in g["move_to_action"]]
             # unique ordered from batch
             legal_idxs = batch.move_to_action_indices[all_move_batch == i]
-            seen = set()
-            unique_ordered = []
-            for v in legal_idxs.tolist():
-                if v >= 0 and v not in seen:
-                    unique_ordered.append(v)
-                    seen.add(v)
+            from hetero_graph_utils import ordered_unique_action_indices
+
+            unique_ordered = ordered_unique_action_indices(legal_idxs)
 
             if unique_ordered != positive:
                 print(f"unique_ordered({len(unique_ordered)}): {unique_ordered}")

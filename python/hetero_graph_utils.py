@@ -289,6 +289,37 @@ def get_move_edge_mask(data):
         return torch.empty(0, dtype=torch.bool)
 
 
+def ordered_unique_action_indices(move_to_action_indices):
+    """Return ordered, deduplicated list of non-negative action indices.
+
+    This preserves the order of the move edges as they appear in the
+    `move_to_action_indices` sequence. It is intentionally *not* sorted; the
+    model order depends on the PyG `data.edge_types` ordering and we must keep
+    the first-appearance ordering for a correct mapping between local and
+    global action indices.
+
+    Args:
+        move_to_action_indices: Iterable of ints (torch.Tensor or list)
+
+    Returns:
+        list of int: ordered unique non-negative action indices
+    """
+    seen = set()
+    uniq = []
+    # Support both torch.Tensor and Python list
+    if hasattr(move_to_action_indices, "tolist"):
+        seq = move_to_action_indices.tolist()
+    else:
+        seq = list(move_to_action_indices)
+
+    for v in seq:
+        if v >= 0 and v not in seen:
+            uniq.append(int(v))
+            seen.add(v)
+
+    return uniq
+
+
 if __name__ == "__main__":
     # Test the conversion
     logger = logging.getLogger(__name__)

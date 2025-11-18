@@ -310,13 +310,9 @@ def train_epoch_selfplay(model, training_data, optimizer, batch_size=32, device=
                             legal_idxs = batch.move_to_action_indices[
                                 all_move_batch == b_idx
                             ]
-                            # preserve order of first appearance
-                            seen = set()
-                            unique_ordered = []
-                            for x in legal_idxs.tolist():
-                                if x >= 0 and x not in seen:
-                                    unique_ordered.append(x)
-                                    seen.add(x)
+                            from hetero_graph_utils import ordered_unique_action_indices
+
+                            unique_ordered = ordered_unique_action_indices(legal_idxs)
                         else:
                             unique_ordered = []
 

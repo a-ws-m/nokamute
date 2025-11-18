@@ -1089,10 +1089,12 @@ def prepare_training_data(games):
             # Compute local index as the index of selected_action_idx in the
             # per-position ordered list of legal action IDs derived from
             # `move_to_action_indices` (preserving order and excluding -1).
-            unique_ordered = []
-            for v in move_to_action_indices.tolist():
-                if v >= 0 and v not in unique_ordered:
-                    unique_ordered.append(int(v))
+            # Build ordered unique list of legal action indices in the order they
+            # appear in the move_to_action_indices tensor. Use helper to centralize
+            # the logic and ensure consistent behavior across the codebase.
+            from hetero_graph_utils import ordered_unique_action_indices
+
+            unique_ordered = ordered_unique_action_indices(move_to_action_indices)
 
             if selected_action_idx >= 0 and selected_action_idx in unique_ordered:
                 selected_action_local_idx = unique_ordered.index(selected_action_idx)
