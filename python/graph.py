@@ -110,10 +110,14 @@ class BoardHeteroBuilder:
             idxs = torch.tensor(edges_adj_in_dest, dtype=torch.long).t().contiguous()
             data["in_play_piece", "adj", "destination"].edge_index = idxs
 
-        # Helper to convert moves -> edge lists
+        # Helper to convert moves -> edge lists and also build a map
+        # from created edges -> move string so we can translate scores back
+        # to human-readable moves later.
         def moves_to_edges(moves, rel_name: str, color_name: Optional[str] = None):
             in_edges = []
             out_edges = []
+            in_moves = []
+            out_moves = []
             out_seen = set()
             for m in moves:
                 if m.is_place():
@@ -128,6 +132,7 @@ class BoardHeteroBuilder:
                         # the single START_HEX), fall back to the single dest if present.
                         if hex in dest_map:
                             out_edges.append((out_map[key], dest_map[hex]))
+                            out_moves.append(str(m))
                         elif len(dest_map) == 1:
                             only_dest = list(dest_map.values())[0]
                             if rel_name == "next_move":
@@ -135,20 +140,26 @@ class BoardHeteroBuilder:
                                 # per out-of-play piece-type is required for the test.
                                 if out_map[key] not in out_seen:
                                     out_edges.append((out_map[key], only_dest))
+                                    out_moves.append(str(m))
                                     out_seen.add(out_map[key])
                             else:
                                 out_edges.append((out_map[key], only_dest))
+                                out_moves.append(str(m))
                 elif m.is_move():
                     from_hex, to_hex = m.get_move_info()
                     if from_hex in in_map and to_hex in dest_map:
                         in_edges.append((in_map[from_hex], dest_map[to_hex]))
+                        in_moves.append(str(m))
             # Set edges in heterodata if any
+            # Attach edges and mapping in the same order so they align
             if in_edges:
                 idxs = torch.tensor(in_edges, dtype=torch.long).t().contiguous()
                 data["in_play_piece", rel_name, "destination"].edge_index = idxs
+                data["in_play_piece", rel_name, "destination"].move_str = in_moves
             if out_edges:
                 idxs = torch.tensor(out_edges, dtype=torch.long).t().contiguous()
                 data["out_of_play_piece", rel_name, "destination"].edge_index = idxs
+                data["out_of_play_piece", rel_name, "destination"].move_str = out_moves
 
         # Current player moves
         moves_current = self.board.legal_moves()
