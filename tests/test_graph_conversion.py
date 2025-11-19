@@ -68,26 +68,38 @@ def test_sequence_moves_adjacency():
     # Position from sequence of moves in UHP notation. We'll use the 7-move
     # sequence specified and assert adjacency for black queen, beetle, grasshopper.
     s = (
-        "Base;InProgress;turn;"
+        "Base+M;InProgress;turn;"
         "wG1;"  # 1. wG1
         "bG1 -wG1;"  # 2. bG1 -wG1
         "wQ wG1-;"  # 3. wQ wG1-
         "bQ -bG1;"  # 4. bQ -bG1
         "wB1 wQ-;"  # 5. wB1 wQ-
         "bB1 \\bG1;"  # 6. bB1 \bG1  (escaped)
-        "wB1 wQ"  # 7. wB1 wQ
+        "wB1 wQ;"  # 7. wB1 wQ
+        "bG2 \\bQ;"  # 8. bG2 \bQ
+        "wM wB1-;"  # 9. wM wB1-
+        "bG3 /bG2;"  # 10. bG3 /bG2
+        "wM wB1"  # 11. wM wB1
     )
 
     board = Board.from_game_string(s)
     builder = BoardHeteroBuilder(board)
     data = builder.to_heterodata()
 
-    # Map hex -> in_play id
-    in_map = {n["hex"]: n["id"] for n in builder.raw.get("in_play_nodes", [])}
+    # Map hex -> topmost in_play id
+    in_map = {
+        n["hex"]: n["id"]
+        for n in builder.raw.get("in_play_nodes", [])
+        if not n.get("is_underneath", False)
+    }
 
     # Find hexes from Board.get_pieces for black queen, beetle, grasshopper
     # get_pieces returns tuples (hex,color,bug,height)
-    black_hexes = {p[2].lower(): p[0] for p in board.get_pieces() if p[1] == "Black"}
+    # Map bug -> list of hexes for black pieces
+    black_hexes = {}
+    for p in board.get_pieces():
+        if p[1] == "Black":
+            black_hexes.setdefault(p[2].lower(), []).append(p[0])
     # Ensure keys exist
     assert "queen" in black_hexes
     assert "beetle" in black_hexes
@@ -103,13 +115,33 @@ def test_sequence_moves_adjacency():
         for i in range(edges.shape[1])
     )
 
-    for bug in ("queen", "beetle", "grasshopper"):
-        h = black_hexes[bug]
-        assert h in in_map
-        id = in_map[h]
-        # Check that id appears in either src or dst of an adjacency edge
-        connected = any(id == a or id == b for (a, b) in edge_pairs)
-        assert connected, f"{bug} (id={id}) is not connected by adjacency"
+    # We'll gather ids for black queen, beetle and all grasshoppers
+    in_play_nodes = list(builder.raw.get("in_play_nodes", []))
+    black_beetle_id = next(
+        n["id"] for n in in_play_nodes if n["color"] == "Black" and n["bug"] == "beetle"
+    )
+    black_queen_id = next(
+        n["id"] for n in in_play_nodes if n["color"] == "Black" and n["bug"] == "queen"
+    )
+    black_grasshopper_ids = [
+        n["id"]
+        for n in in_play_nodes
+        if n["color"] == "Black" and n["bug"] == "grasshopper"
+    ]
+
+    # The black beetle should be adjacent to two black grasshoppers and the black queen
+    adj_with_beetle = {b for (a, b) in edge_pairs if a == black_beetle_id} | {
+        a for (a, b) in edge_pairs if b == black_beetle_id
+    }
+    assert black_queen_id in adj_with_beetle
+    assert len([g for g in black_grasshopper_ids if g in adj_with_beetle]) == 2
+
+    # The black queen should be adjacent to three black grasshoppers and the black beetle
+    adj_with_queen = {b for (a, b) in edge_pairs if a == black_queen_id} | {
+        a for (a, b) in edge_pairs if b == black_queen_id
+    }
+    assert black_beetle_id in adj_with_queen
+    assert len([g for g in black_grasshopper_ids if g in adj_with_queen]) == 3
 
     # Check is_above/is_underneath binary features on in_play nodes using HeteroData
     x = data["in_play_piece"].x
@@ -129,11 +161,11 @@ def test_sequence_moves_adjacency():
         n["id"] for n in in_play if n["color"] == "White" and n["bug"] == "queen"
     )
 
-    # White beetle should be above something
+    # White beetle should be both underneath and above (middle of a 3-stack)
+    assert x[wb_id, feat_under].item() == 1.0
     assert x[wb_id, feat_above].item() == 1.0
-    assert x[wb_id, feat_under].item() == 0.0
 
-    # Ensure white queen is underneath
+    # Ensure white queen is underneath (bottom of stack)
     assert x[wq_id, feat_under].item() == 1.0
     assert x[wq_id, feat_above].item() == 0.0
 
@@ -141,9 +173,20 @@ def test_sequence_moves_adjacency():
     for n in in_play:
         if n["id"] in (wb_id, wq_id):
             continue
+        # the white mosquito should be above something
+        if n["color"] == "White" and n["bug"] == "mosquito":
+            mid_mosq = n["id"]
+            assert x[mid_mosq, feat_above].item() == 1.0
+            assert x[mid_mosq, feat_under].item() == 0.0
+            continue
         id = n["id"]
         # Some pieces may be the underneath piece - skip them
         if x[id, feat_under].item() == 1.0 or x[id, feat_above].item() == 1.0:
             continue
         assert x[id, feat_under].item() == 0.0
         assert x[id, feat_above].item() == 0.0
+
+    # Verify that there are no out-of-play nodes for black grasshopper or black queen
+    out_nodes = list(builder.raw.get("out_of_play_nodes", []))
+    for n in out_nodes:
+        assert not (n["color"] == "Black" and n["bug"] in ("grasshopper", "queen"))
