@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from typing import Dict, Optional
 
 import torch
@@ -164,3 +165,80 @@ class MoveScorer(nn.Module):
         # Single graph case: just return tanh-activated scores
         action_scores = torch.tanh(logits)
         return action_scores
+
+    def action_scores_to_move_dicts(
+        self, data: HeteroData, action_scores: torch.Tensor | list
+    ) -> list:
+        """Convert action scores back to {move_string: score} OrderedDicts per graph.
+
+        This matches the ordering used in `forward` and groups batched scores
+        by the `destination.batch` vector. For each graph we return an
+        OrderedDict with moves ordered by descending score.
+        """
+
+        # Collect move strings in the same order we iterate in forward
+        all_moves = []
+        for etype, edge_index in data.edge_index_dict.items():
+            src_type, rel, dst_type = etype
+            if rel != "current_move" or dst_type != "destination":
+                continue
+            if src_type not in ("in_play_piece", "out_of_play_piece"):
+                continue
+
+            # move_str may be stored on the edge storage
+            ms = getattr(data[etype], "move_str", None)
+            if ms is None:
+                # create placeholders
+                ms = [None] * edge_index.shape[1]
+            else:
+                # flatten if collated as list-of-lists
+                if isinstance(ms, list) and len(ms) > 0 and isinstance(ms[0], list):
+                    ms = [s for inner in ms for s in inner]
+
+            # extend as strings
+            all_moves.extend(ms)
+
+        # Single graph
+        if isinstance(action_scores, torch.Tensor):
+            assert (
+                len(all_moves) == action_scores.numel()
+            ), "Mismatch between moves and scores"
+            scores = action_scores.detach().cpu()
+            # Pair and sort
+            pairs = list(zip(all_moves, scores.tolist()))
+            pairs.sort(key=lambda p: p[1], reverse=True)
+            return [OrderedDict(pairs)]
+
+        # Batched: action_scores is list of tensors; gather batch mapping
+        # Build batch_idx per edge by using destination index mapping
+        batch_idx_list = []
+        for etype, edge_index in data.edge_index_dict.items():
+            src_type, rel, dst_type = etype
+            if rel != "current_move" or dst_type != "destination":
+                continue
+            if src_type not in ("in_play_piece", "out_of_play_piece"):
+                continue
+            dst = edge_index[1]
+            batch_idx_list.append(data["destination"].batch[dst])
+
+        batch_idx = torch.cat(batch_idx_list, dim=0)
+        # Now gather per-graph moves and scores
+        num_graphs = int(batch_idx.max().item()) + 1 if batch_idx.numel() > 0 else 0
+        out = []
+        offset = 0
+        for g in range(num_graphs):
+            mask = batch_idx == g
+            n = mask.sum().item()
+            if n == 0:
+                out.append(OrderedDict())
+                continue
+            # take next n moves from all_moves
+            moves_g = all_moves[offset : offset + n]
+            scores_g = action_scores[g].detach().cpu().tolist()
+            assert len(moves_g) == len(scores_g)
+            pairs = list(zip(moves_g, scores_g))
+            pairs.sort(key=lambda p: p[1], reverse=True)
+            out.append(OrderedDict(pairs))
+            offset += n
+
+        return out
