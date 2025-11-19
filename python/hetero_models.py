@@ -102,9 +102,10 @@ class MoveScorer(nn.Module):
         self.hetero_encoder = to_hetero(self.node_encoder, data.metadata())
 
     def forward(self, data: HeteroData) -> tuple:
-        if not hasattr(self, "hetero_encoder"):
-            # Prepare using the graph metadata derived from the data
-            self.prepare_hetero(data)
+        # Always prepare the hetero encoder to account for graphs with
+        # different node feature sizes or types; this ensures we will
+        # correctly pad inputs when nodes change between positions.
+        self.prepare_hetero(data)
 
         # Run the hetero encoder to get per-node embeddings
         # It returns a dict keyed by node type.

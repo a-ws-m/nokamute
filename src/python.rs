@@ -1,5 +1,8 @@
 use crate::{Board as RustBoard, Bug as RustBug, Color as RustColor, Hex, Rules, Turn as RustTurn};
 use minimax::Game;
+#[cfg(not(target_arch = "wasm32"))]
+use minimax::{Negamax, Strategy};
+use crate::BasicEvaluator;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use std::collections::HashMap;
@@ -435,6 +438,19 @@ impl Board {
         graph.set_item("moves_next", py_next_moves)?;
 
         Ok(graph.into())
+    }
+
+    /// Choose a move using the built-in Rust engine (Negamax) at the
+    /// specified depth. Returns None if no move could be chosen.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn choose_move(&self, depth: u8) -> PyResult<Option<Turn>> {
+        let mut b = self.inner.clone();
+        let mut strategy = Negamax::new(BasicEvaluator::default(), depth);
+        let m = strategy.choose_move(&mut b);
+        match m {
+            Some(t) => Ok(Some(Turn { inner: t })),
+            None => Ok(None),
+        }
     }
 
     /// Get board state as a compact representation for features
