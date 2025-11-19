@@ -77,3 +77,39 @@ def test_move_scorer_batch_prediction():
         else:
             # Single flat list: ensure it has 7 entries
             assert len(move_str) == 7
+
+
+def test_action_scores_to_move_mapping_batch_varied():
+    # Initial position
+    b1 = Board()
+    builder1 = BoardHeteroBuilder(b1)
+    d1 = builder1.to_model_input()
+
+    # Sequence: wG1; bG1 -wG1; then white moves
+    s = "Base+M;InProgress;turn;" "wG1;" "bG1 -wG1"
+    b2 = Board.from_game_string(s)
+    builder2 = BoardHeteroBuilder(b2)
+    d2 = builder2.to_model_input()
+
+    from torch_geometric.loader import DataLoader
+
+    batch = next(iter(DataLoader([d1, d2], batch_size=2)))
+
+    model = MoveScorer(1, hidden_dim=32)
+    action_scores = model(batch)
+    assert isinstance(action_scores, list)
+
+    # Map scores to moves
+    maps = model.action_scores_to_move_dicts(batch, action_scores)
+    assert isinstance(maps, list)
+    # First graph: 7 unique actions
+    assert len(maps[0]) == 7
+    # Second graph: white has 16 unique moves (some symmetric), check >= 16
+    assert len(maps[1]) >= 16
+    # Highest-scoring move is first
+    for m in maps:
+        if len(m) == 0:
+            continue
+        first_score = list(m.values())[0]
+        for sc in m.values():
+            assert first_score >= sc
