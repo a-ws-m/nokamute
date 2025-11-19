@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch_geometric.data import HeteroData
@@ -21,7 +21,9 @@ class BoardHeteroBuilder:
     - (in_play_piece, 'next_move', destination)
     - (out_of_play_piece, 'next_move', destination)
 
-    Node features: one-hot of bug types (queen..pillbug = 8)
+    Node features: one-hot of bug types (queen..pillbug = 8) followed by
+    two binary features representing is_underneath and is_above.
+    The final feature vector layout is: [bug_one_hot, is_underneath, is_above].
     """
 
     BUGS = [
@@ -65,7 +67,9 @@ class BoardHeteroBuilder:
         # Node counts and features
         data["in_play_piece"].num_nodes = len(in_play)
         if len(in_play) > 0:
-            # Add two extra boolean features for is_underneath and is_above
+            # Add two extra binary features appended after the bug one-hot:
+            # index len(BUGS)   -> is_underneath (1 if this piece is underneath another)
+            # index len(BUGS)+1 -> is_above       (1 if there is a piece beneath this one)
             feature_dim = len(self.BUGS) + 2
             x = torch.zeros(len(in_play), feature_dim, dtype=torch.float32)
             for n in in_play:
@@ -106,7 +110,7 @@ class BoardHeteroBuilder:
             data["in_play_piece", "adj", "destination"].edge_index = idxs
 
         # Helper to convert moves -> edge lists
-        def moves_to_edges(moves, rel_name: str, color_name: str = None):
+        def moves_to_edges(moves, rel_name: str, color_name: Optional[str] = None):
             in_edges = []
             out_edges = []
             out_seen = set()
