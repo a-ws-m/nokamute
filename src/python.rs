@@ -148,6 +148,14 @@ impl Board {
         Board { inner: RustBoard::default() }
     }
 
+    #[staticmethod]
+    fn from_game_string(s: &str) -> PyResult<Self> {
+        match RustBoard::from_game_string(s) {
+            Ok(b) => Ok(Board { inner: b }),
+            Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!("{:?}", e))),
+        }
+    }
+
     /// Generate all legal moves for the current position
     fn legal_moves(&self) -> Vec<Turn> {
         let mut moves = Vec::new();
@@ -209,7 +217,7 @@ impl Board {
 
         // In-play pieces
         let mut in_play_nodes: Vec<PyObject> = Vec::new();
-        let mut hex_to_inplay: HashMap<Hex, usize> = HashMap::new();
+        let mut hex_to_inplay: HashMap<Hex, Vec<usize>> = HashMap::new();
         let mut idx: usize = 0;
         for color_idx in 0..2 {
             for &hex in self.inner.occupied_hexes[color_idx].iter() {
@@ -222,10 +230,31 @@ impl Board {
                 entry.set_item("height", self.inner.height(hex))?;
                 entry.set_item("bug_idx", node.bug() as u8)?;
                 entry.set_item("id", idx)?;
-                hex_to_inplay.insert(hex, idx);
+                // Topmost nodes: if the height() is > 1 there are pieces below it
+                entry.set_item("is_underneath", false)?;
+                entry.set_item("is_above", self.inner.height(hex) > 1)?;
+                hex_to_inplay.insert(hex, vec![idx]);
                 in_play_nodes.push(entry.into());
                 idx += 1;
             }
+        }
+
+        // Add underworld nodes as in-play if any (so stacked pieces below the top appear as nodes)
+        for under in self.inner.get_underworld() {
+            let node = under.node();
+            let entry = PyDict::new(py);
+            entry.set_item("hex", under.hex())?;
+            entry.set_item("color", if node.color() == RustColor::Black { "Black" } else { "White" })?;
+            entry.set_item("bug", node.bug().name())?;
+            entry.set_item("height", node.clipped_height())?;
+            entry.set_item("bug_idx", node.bug() as u8)?;
+            entry.set_item("id", idx)?;
+            // Underworld pieces are underneath other pieces; is_above means there's any piece below
+            entry.set_item("is_underneath", true)?;
+            entry.set_item("is_above", node.clipped_height() > 1)?;
+            hex_to_inplay.entry(under.hex()).or_default().push(idx);
+            in_play_nodes.push(entry.into());
+            idx += 1;
         }
 
         graph.set_item("in_play_nodes", PyList::new(py, in_play_nodes))?;
@@ -314,17 +343,32 @@ impl Board {
         // Adjacency edges: for each in-play piece, connect to neighboring in-play (if any),
         // or destination nodes for empty neighbors. Also add edge to top-of-piece destination if present.
         let mut adjacency: Vec<PyObject> = Vec::new();
-        for (hex, &src_idx) in hex_to_inplay.iter() {
-            for neighbor in crate::hex_grid::adjacent(*hex) {
-                if let Some(&dst_idx) = hex_to_inplay.get(&neighbor) {
-                    let tup = PyTuple::new(py, &[
-                        "in_play".into_py(py),
-                        (src_idx as u32).into_py(py),
-                        "in_play".into_py(py),
-                        (dst_idx as u32).into_py(py),
-                    ]);
-                    adjacency.push(tup.into());
-                } else if let Some(&dst_idx) = dest_map.get(&neighbor) {
+        for (hex, ids) in hex_to_inplay.iter() {
+            for &src_idx in ids.iter() {
+                for neighbor in crate::hex_grid::adjacent(*hex) {
+                    if let Some(dst_ids) = hex_to_inplay.get(&neighbor) {
+                        if !dst_ids.is_empty() {
+                            let tup = PyTuple::new(py, &[
+                                "in_play".into_py(py),
+                                (src_idx as u32).into_py(py),
+                                "in_play".into_py(py),
+                                (dst_ids[0] as u32).into_py(py),
+                            ]);
+                            adjacency.push(tup.into());
+                        }
+                    } else if let Some(&dst_idx) = dest_map.get(&neighbor) {
+                        let tup = PyTuple::new(py, &[
+                            "in_play".into_py(py),
+                            (src_idx as u32).into_py(py),
+                            "destination".into_py(py),
+                            (dst_idx as u32).into_py(py),
+                        ]);
+                        adjacency.push(tup.into());
+                    }
+                }
+
+                // Top space adjacency
+                if let Some(&dst_idx) = dest_map.get(hex) {
                     let tup = PyTuple::new(py, &[
                         "in_play".into_py(py),
                         (src_idx as u32).into_py(py),
@@ -334,17 +378,25 @@ impl Board {
                     adjacency.push(tup.into());
                 }
             }
-            // Top space adjacency
-            if let Some(&dst_idx) = dest_map.get(hex) {
-                let tup = PyTuple::new(py, &[
-                    "in_play".into_py(py),
-                    (src_idx as u32).into_py(py),
-                    "destination".into_py(py),
-                    (dst_idx as u32).into_py(py),
-                ]);
-                adjacency.push(tup.into());
+        }
+        // Add vertical adjacency between stacked pieces in the same hex.
+        for ids in hex_to_inplay.values() {
+            if ids.len() > 1 {
+                for i in 0..ids.len() {
+                    for j in 0..ids.len() {
+                        if i == j { continue; }
+                        let tup = PyTuple::new(py, &[
+                            "in_play".into_py(py),
+                            (ids[i] as u32).into_py(py),
+                            "in_play".into_py(py),
+                            (ids[j] as u32).into_py(py),
+                        ]);
+                        adjacency.push(tup.into());
+                    }
+                }
             }
         }
+
         graph.set_item("adjacency_edges", PyList::new(py, adjacency))?;
 
         // Current-player move edges using Rules::generate_moves

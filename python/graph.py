@@ -55,17 +55,27 @@ class BoardHeteroBuilder:
         )
 
         # Mappings
-        in_map = {n["hex"]: n["id"] for n in in_play}
+        # Map hex -> topmost in_play id (if there are multiple nodes per hex prefer topmost)
+        in_map = {
+            n["hex"]: n["id"] for n in in_play if not n.get("is_underneath", False)
+        }
         out_map = {(n["bug"], n["color"]): n["id"] for n in out_of_play}
         dest_map = {n["hex"]: n["id"] for n in destination}
 
         # Node counts and features
         data["in_play_piece"].num_nodes = len(in_play)
         if len(in_play) > 0:
-            x = torch.zeros(len(in_play), len(self.BUGS), dtype=torch.float32)
+            # Add two extra boolean features for is_underneath and is_above
+            feature_dim = len(self.BUGS) + 2
+            x = torch.zeros(len(in_play), feature_dim, dtype=torch.float32)
             for n in in_play:
                 bug_idx = n["bug_idx"]
                 x[n["id"], bug_idx] = 1.0
+                # extra features
+                if n.get("is_underneath", False):
+                    x[n["id"], len(self.BUGS)] = 1.0
+                if n.get("is_above", False):
+                    x[n["id"], len(self.BUGS) + 1] = 1.0
             data["in_play_piece"].x = x
 
         data["out_of_play_piece"].num_nodes = len(out_of_play)
