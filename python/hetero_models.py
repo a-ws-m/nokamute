@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import HeteroData
-from torch_geometric.nn import GCNConv, SAGEConv, to_hetero
+from torch_geometric.nn import GCNConv, SAGEConv, global_mean_pool, to_hetero
 
 
 class HeteroNodeEncoder(nn.Module):
@@ -62,6 +62,14 @@ class MoveScorer(nn.Module):
 
         # Softmax over edges will be applied externally in forward
 
+        # Critic head: pool node-level embeddings into graph-level embedding
+        # and predict a single scalar per graph.
+        self.critic_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
     def prepare_hetero(self, data: HeteroData):
         # Determine the maximum node feature dimension across types and
         # re-create the node encoder to accept that dimensionality.
@@ -93,7 +101,7 @@ class MoveScorer(nn.Module):
 
         self.hetero_encoder = to_hetero(self.node_encoder, data.metadata())
 
-    def forward(self, data: HeteroData) -> torch.Tensor | list:
+    def forward(self, data: HeteroData) -> tuple:
         if not hasattr(self, "hetero_encoder"):
             # Prepare using the graph metadata derived from the data
             self.prepare_hetero(data)
@@ -126,8 +134,8 @@ class MoveScorer(nn.Module):
             edges.append(scores)
 
         if not edges:
-            # No moves
-            return torch.tensor([])
+            # No moves; return empty actions and empty critic
+            return torch.tensor([]), torch.tensor([])
 
         logits = torch.cat(edges, dim=0)
 
@@ -160,11 +168,56 @@ class MoveScorer(nn.Module):
                 logits_g = logits[mask]
                 scores_g = torch.tanh(logits_g)
                 out.append(scores_g)
-            return out
+            # compute critic per graph
+            # build pooled graph embedding by concatenating all node types
+            x_all = []
+            batch_all = []
+            for ntype in data.node_types:
+                emb = node_emb.get(ntype, None)
+                if emb is None:
+                    continue
+                x_all.append(emb)
+                batch_vec = (
+                    data[ntype].batch
+                    if "batch" in data[ntype]
+                    else torch.zeros(emb.size(0), dtype=torch.long, device=emb.device)
+                )
+                batch_all.append(batch_vec)
+
+            if x_all:
+                x_all = torch.cat(x_all, dim=0)
+                batch_all = torch.cat(batch_all, dim=0)
+                pooled = global_mean_pool(x_all, batch_all)
+                critic_vals = self.critic_mlp(pooled).view(-1)
+            else:
+                critic_vals = torch.tensor([], dtype=torch.float32)
+
+            return out, critic_vals
 
         # Single graph case: just return tanh-activated scores
+        # Single graph case: compute critic
+        x_all = []
+        batch_all = []
+        for ntype in data.node_types:
+            emb = node_emb.get(ntype, None)
+            if emb is None:
+                continue
+            x_all.append(emb)
+            # No `batch` in single graphs: zeros
+            batch_all.append(
+                torch.zeros(emb.size(0), dtype=torch.long, device=emb.device)
+            )
+
+        if x_all:
+            x_all = torch.cat(x_all, dim=0)
+            batch_all = torch.cat(batch_all, dim=0)
+            pooled = global_mean_pool(x_all, batch_all)
+            critic_vals = self.critic_mlp(pooled).view(-1)
+        else:
+            critic_vals = torch.tensor([], dtype=torch.float32)
+
         action_scores = torch.tanh(logits)
-        return action_scores
+        return action_scores, critic_vals
 
     def action_scores_to_move_dicts(
         self, data: HeteroData, action_scores: torch.Tensor | list

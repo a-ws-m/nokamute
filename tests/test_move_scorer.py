@@ -1,3 +1,5 @@
+import torch
+
 import nokamute
 from nokamute import Board
 
@@ -22,11 +24,14 @@ def test_move_scorer_on_start():
 
     model = MoveScorer(1, hidden_dim=32)
     # The model will prepare its hetero encoder based on data in `forward`.
-    probs = model(data)
+    probs, critic = model(data)
     # If model returns a list for batched inputs, unpack for single graph
     if isinstance(probs, list):
         assert len(probs) == 1
         probs = probs[0]
+    # Critic should be a 1-element tensor for single graph
+    assert critic is not None
+    assert critic.numel() == 1
 
     # Starting position must have seven current-move edges (asserted in other tests)
     assert probs.numel() == 7
@@ -56,7 +61,7 @@ def test_move_scorer_batch_prediction():
     batch = next(iter(loader))
 
     model = MoveScorer(1, hidden_dim=32)
-    out = model(batch)
+    out, critic = model(batch)
     # We expect a list of results (one per graph)
     assert isinstance(out, list)
     assert len(out) == 2
@@ -77,6 +82,8 @@ def test_move_scorer_batch_prediction():
         else:
             # Single flat list: ensure it has 7 entries
             assert len(move_str) == 7
+    assert isinstance(critic, torch.Tensor)
+    assert critic.numel() == 2
 
 
 def test_action_scores_to_move_mapping_batch_varied():
@@ -96,7 +103,7 @@ def test_action_scores_to_move_mapping_batch_varied():
     batch = next(iter(DataLoader([d1, d2], batch_size=2)))
 
     model = MoveScorer(1, hidden_dim=32)
-    action_scores = model(batch)
+    action_scores, critic = model(batch)
     assert isinstance(action_scores, list)
 
     # Map scores to moves
@@ -113,3 +120,6 @@ def test_action_scores_to_move_mapping_batch_varied():
         first_score = list(m.values())[0]
         for sc in m.values():
             assert first_score >= sc
+    # Critic should be a 2-element tensor for this batch
+    assert isinstance(critic, torch.Tensor)
+    assert critic.numel() == 2
