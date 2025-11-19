@@ -17,12 +17,8 @@ class HeteroNodeEncoder(nn.Module):
     def __init__(self, in_channels: int, hidden_channels: int = 32):
         super().__init__()
         # Graph convs expect node features as `x` on each node type.
-        self.encoder = nn.Sequential(
-            nn.Linear(in_channels, hidden_channels),
-            nn.ReLU(),
-            nn.Linear(hidden_channels, hidden_channels),
-            nn.ReLU(),
-        )
+        self.lin1 = nn.Linear(in_channels, hidden_channels)
+        self.lin2 = nn.Linear(hidden_channels, hidden_channels)
 
         # We create one message passing conv and an MLP applied to its outputs.
         self.conv1 = SAGEConv(hidden_channels, hidden_channels)
@@ -33,8 +29,12 @@ class HeteroNodeEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         # This forward will be called by the to_hetero adapter for each node type
-        h = self.encoder(x)
+        # Linear layers applied per-node-type. Use functional ReLU because
+        # `to_hetero` has trouble when modules introduce intermediate graph
+        # nodes that do not get updated by all types.
+        h = F.relu(self.lin1(x))
         h = F.relu(self.conv1(h, edge_index))
+        h = F.relu(self.lin2(h))
         h = F.relu(self.conv2(h, edge_index))
         return h
 
@@ -80,14 +80,15 @@ class MoveScorer(nn.Module):
 
         # Pad features of all node types to `max_dim` so the shared encoder
         # can be applied uniformly.
-        for k, x in data.x_dict.items():
+        for k in list(data.x_dict.keys()):
+            x = data.x_dict[k]
             if x is None:
                 continue
             if x.size(1) < max_dim:
                 pad = torch.zeros(
                     (x.size(0), max_dim - x.size(1)), dtype=x.dtype, device=x.device
                 )
-                data.x_dict[k] = torch.cat([x, pad], dim=1)
+                data[k].x = torch.cat([x, pad], dim=1)
 
         self.hetero_encoder = to_hetero(self.node_encoder, data.metadata())
 
@@ -100,23 +101,28 @@ class MoveScorer(nn.Module):
         # It returns a dict keyed by node type.
         node_emb = self.hetero_encoder(data.x_dict, data.edge_index_dict)
 
-        # Collect all current_move edges from in_play and out_of_play
+        # Collect all edges of relation 'current_move' -> 'destination'
         edges = []
-        # Each of these edge types may exist
-        for src_type in ["in_play_piece", "out_of_play_piece"]:
-            etype = (src_type, "current_move", "destination")
-            if etype in data.edge_index_dict:
-                edge_index = data.edge_index_dict[etype]
-                # edge_index: [2, num_edges]
-                src, dst = edge_index
+        for etype, edge_index in data.edge_index_dict.items():
+            src_type, rel, dst_type = etype
+            if rel != "current_move" or dst_type != "destination":
+                continue
 
-                src_feat = node_emb[src_type][src]
-                dst_feat = node_emb["destination"][dst]
+            # Only accept source types in our two source buckets
+            if src_type not in ("in_play_piece", "out_of_play_piece"):
+                continue
 
-                # concatenated feature per edge
-                cat = torch.cat([src_feat, dst_feat], dim=1)
-                scores = self.edge_mlp(cat).view(-1)
-                edges.append(scores)
+            src, dst = edge_index
+
+            # Some nodes might be missing; make sure they exist in node_emb
+            if src_type not in node_emb or "destination" not in node_emb:
+                continue
+
+            src_feat = node_emb[src_type][src]
+            dst_feat = node_emb["destination"][dst]
+            cat = torch.cat([src_feat, dst_feat], dim=1)
+            scores = self.edge_mlp(cat).view(-1)
+            edges.append(scores)
 
         if not edges:
             # No moves

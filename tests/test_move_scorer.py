@@ -18,7 +18,7 @@ except Exception:
 def test_move_scorer_on_start():
     board = Board()
     builder = BoardHeteroBuilder(board)
-    data = builder.to_heterodata()
+    data = builder.to_model_input()
 
     model = MoveScorer(1, hidden_dim=32)
     # The model will prepare its hetero encoder based on data in `forward`.

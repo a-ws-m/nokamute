@@ -2,6 +2,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch_geometric.data import HeteroData
+from torch_geometric.transforms import ToUndirected
 
 
 class BoardHeteroBuilder:
@@ -167,4 +168,62 @@ class BoardHeteroBuilder:
             moves_next = []
         moves_to_edges(moves_next, "next_move", b2.to_move().name)
 
+        return data
+
+    def to_model_input(self) -> HeteroData:
+        """Return a HeteroData prepared for models.
+
+        This converts the directed adjacency to undirected edges (so both
+        directions are present) and guarantees that `in_play_piece` and
+        `out_of_play_piece` node types exist (adding a single dummy node
+        with zero features if necessary). The original `to_heterodata`
+        method is unchanged and used by tests that expect directed edges.
+        """
+
+        data = self.to_heterodata()
+
+        # Ensure both node types exist - add one dummy node with matching
+        # feature size if missing. This makes to_hetero transformations
+        # robust when a type is missing in a specific position.
+        # Add dummy in_play nodes if none were present.
+        if (
+            "in_play_piece" not in data.node_types
+            or data["in_play_piece"].num_nodes == 0
+        ):
+            feature_dim = len(self.BUGS) + 2
+            data["in_play_piece"].num_nodes = 1
+            data["in_play_piece"].x = torch.zeros(1, feature_dim, dtype=torch.float32)
+
+        # Make sure out_of_play nodes exist (16 at start); otherwise add one dummy.
+        if (
+            "out_of_play_piece" not in data.node_types
+            or data["out_of_play_piece"].num_nodes == 0
+        ):
+            feature_dim = len(self.BUGS)
+            data["out_of_play_piece"].num_nodes = 1
+            data["out_of_play_piece"].x = torch.zeros(
+                1, feature_dim, dtype=torch.float32
+            )
+
+        # Apply ToUndirected to mirror edges; this will double the current_move
+        # edge counts (one for each direction), but we filter edges by their
+        # relation and destination type in the model.
+        data = ToUndirected()(data)
+
+        # Some types (destination) do not carry features. Provide a default
+        # zero feature vector so models can run a shared encoder across types.
+        if "x" not in data["destination"] or data["destination"].x is None:
+            feature_dim = len(self.BUGS) + 2
+            data["destination"].x = torch.zeros(
+                data["destination"].num_nodes, feature_dim, dtype=torch.float32
+            )
+        # Ensure that each node type appears as a destination node in at least
+        # one edge — this makes `to_hetero` happy when mapping message
+        # passing operations (otherwise some types are not updated).
+        for ntype in data.node_types:
+            has_dst = any(k[2] == ntype for k in data.edge_index_dict.keys())
+            if not has_dst:
+                # Add a trivial self-loop edge so convolution will be applied.
+                idx = torch.tensor([[0], [0]], dtype=torch.long)
+                data[ntype, "adj", ntype].edge_index = idx
         return data
