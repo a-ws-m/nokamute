@@ -1,7 +1,8 @@
 use crate::{Board as RustBoard, Bug as RustBug, Color as RustColor, Hex, Rules, Turn as RustTurn};
 use minimax::Game;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyDict, PyList, PyTuple};
+use std::collections::HashMap;
 
 /// Represents a bug type in the Hive game
 #[pyclass]
@@ -201,56 +202,187 @@ impl Board {
     }
 
     /// Convert board state to a graph representation
-    /// Returns (node_features, edge_index, edge_features)
     fn to_graph(&self, py: Python) -> PyResult<PyObject> {
-        let mut nodes = Vec::new();
-        let mut edges_from = Vec::new();
-        let mut edges_to = Vec::new();
-        let mut node_features = Vec::new();
+        // Build a dictionary describing the heterogeneous graph.
+        // Node buckets: in_play pieces, out_of_play pieces (one per bug type if any remain), destination hexes
+        let graph = PyDict::new(py);
 
-        // Map hex positions to node indices
-        let mut hex_to_node: std::collections::HashMap<Hex, usize> =
-            std::collections::HashMap::new();
-
-        // Collect all occupied hexes and create nodes
+        // In-play pieces
+        let mut in_play_nodes: Vec<PyObject> = Vec::new();
+        let mut hex_to_inplay: HashMap<Hex, usize> = HashMap::new();
+        let mut idx: usize = 0;
         for color_idx in 0..2 {
             for &hex in self.inner.occupied_hexes[color_idx].iter() {
-                let node_idx = nodes.len();
-                hex_to_node.insert(hex, node_idx);
-                nodes.push(hex);
-
                 let node = self.inner.node(hex);
-                let height = self.inner.height(hex);
-
-                // Node features: [color (0/1), bug_type (0-7), height, on_top (0/1)]
-                let features = vec![
-                    node.color() as usize as f32,
-                    node.bug() as usize as f32,
-                    height as f32,
-                    if height > 1 { 1.0 } else { 0.0 },
-                ];
-                node_features.push(features);
+                let entry = PyDict::new(py);
+                entry.set_item("hex", hex)?;
+                let color_str = if node.color() == RustColor::Black { "Black" } else { "White" };
+                entry.set_item("color", color_str)?;
+                entry.set_item("bug", node.bug().name())?;
+                entry.set_item("height", self.inner.height(hex))?;
+                entry.set_item("bug_idx", node.bug() as u8)?;
+                entry.set_item("id", idx)?;
+                hex_to_inplay.insert(hex, idx);
+                in_play_nodes.push(entry.into());
+                idx += 1;
             }
         }
 
-        // Create edges between adjacent pieces
-        use crate::hex_grid::{adjacent, Direction};
-        for (i, &hex) in nodes.iter().enumerate() {
-            for &adj_hex in adjacent(hex).iter() {
-                if let Some(&j) = hex_to_node.get(&adj_hex) {
-                    edges_from.push(i);
-                    edges_to.push(j);
+        graph.set_item("in_play_nodes", PyList::new(py, in_play_nodes))?;
+
+        // Out-of-play nodes (one per bug type for each color if remaining)
+        let mut out_nodes: Vec<PyObject> = Vec::new();
+        let mut out_idx = 0usize;
+        for color_idx in 0..2 {
+            let rem = self.inner.remaining[color_idx];
+            for bug in RustBug::iter_all() {
+                let num_left = rem[bug as usize];
+                if num_left > 0 {
+                    let entry = PyDict::new(py);
+                    entry.set_item("bug", bug.name())?;
+                    let color_str = if color_idx == 1 { "Black" } else { "White" };
+                    entry.set_item("color", color_str)?;
+                    entry.set_item("num_left", num_left)?;
+                    entry.set_item("bug_idx", bug as u8)?;
+                    entry.set_item("id", out_idx)?;
+                    out_nodes.push(entry.into());
+                    out_idx += 1;
                 }
             }
         }
 
-        // Convert to Python objects
-        let node_features_py = PyList::new(py, node_features.iter().map(|f| PyList::new(py, f)));
-        let edge_index_py =
-            PyList::new(py, vec![PyList::new(py, &edges_from), PyList::new(py, &edges_to)]);
+        graph.set_item("out_of_play_nodes", PyList::new(py, out_nodes))?;
 
-        // Return as tuple
-        Ok((node_features_py, edge_index_py).into_py(py))
+        // Destination nodes: empty hex neighbors of in-play pieces, and a top-of-piece dest node
+        let mut dest_nodes: Vec<PyObject> = Vec::new();
+        let mut dest_map: HashMap<Hex, usize> = HashMap::new();
+        let mut dest_idx: usize = 0;
+
+        for &hex in self.inner.occupied_hexes[0].iter().chain(self.inner.occupied_hexes[1].iter()) {
+            for neighbor in crate::hex_grid::adjacent(hex) {
+                if !self.inner.occupied(neighbor) {
+                    if !dest_map.contains_key(&neighbor) {
+                        let entry = PyDict::new(py);
+                        entry.set_item("hex", neighbor)?;
+                        entry.set_item("is_top", false)?;
+                        entry.set_item("id", dest_idx)?;
+                        dest_nodes.push(entry.into());
+                        dest_map.insert(neighbor, dest_idx);
+                        dest_idx += 1;
+                    }
+                }
+            }
+
+            // Dest node on top of piece (if there is space above it)
+            let height = self.inner.height(hex);
+            // If the piece is not at a ridiculous height, allow a top-of-stack destination
+            // Heuristic: allow destination when height < 4 (depth limit in gameplay rarely exceeds 3).
+            if self.inner.node(hex).occupied() && height < 4 {
+                if !dest_map.contains_key(&hex) {
+                    let entry = PyDict::new(py);
+                    entry.set_item("hex", hex)?;
+                    entry.set_item("is_top", true)?;
+                    entry.set_item("id", dest_idx)?;
+                    dest_nodes.push(entry.into());
+                    dest_map.insert(hex, dest_idx);
+                    dest_idx += 1;
+                } else if let Some(&eidx) = dest_map.get(&hex) {
+                    // If there is already a destination for this hex (empty), mark it as top as well
+                    // so the Python side can inspect.
+                    let existing = dest_nodes.get(eidx).unwrap().as_ref(py).downcast::<PyDict>()?;
+                    existing.set_item("is_top", true)?;
+                }
+            }
+        }
+
+        graph.set_item("destination_nodes", PyList::new(py, dest_nodes))?;
+
+        // If there are no destination nodes (empty board), provide the start hex
+        // so first-turn placements can be represented as edges to a single abstract destination.
+        if dest_map.is_empty() {
+            let entry = PyDict::new(py);
+            entry.set_item("hex", crate::hex_grid::START_HEX)?;
+            entry.set_item("is_top", false)?;
+            entry.set_item("id", dest_idx)?;
+            dest_map.insert(crate::hex_grid::START_HEX, dest_idx);
+            // Append fallback to the list used earlier.
+            let mut dest_nodes: Vec<PyObject> = Vec::new();
+            dest_nodes.push(entry.into());
+            graph.set_item("destination_nodes", PyList::new(py, dest_nodes))?;
+        }
+
+        // Adjacency edges: for each in-play piece, connect to neighboring in-play (if any),
+        // or destination nodes for empty neighbors. Also add edge to top-of-piece destination if present.
+        let mut adjacency: Vec<PyObject> = Vec::new();
+        for (hex, &src_idx) in hex_to_inplay.iter() {
+            for neighbor in crate::hex_grid::adjacent(*hex) {
+                if let Some(&dst_idx) = hex_to_inplay.get(&neighbor) {
+                    let tup = PyTuple::new(py, &[
+                        "in_play".into_py(py),
+                        (src_idx as u32).into_py(py),
+                        "in_play".into_py(py),
+                        (dst_idx as u32).into_py(py),
+                    ]);
+                    adjacency.push(tup.into());
+                } else if let Some(&dst_idx) = dest_map.get(&neighbor) {
+                    let tup = PyTuple::new(py, &[
+                        "in_play".into_py(py),
+                        (src_idx as u32).into_py(py),
+                        "destination".into_py(py),
+                        (dst_idx as u32).into_py(py),
+                    ]);
+                    adjacency.push(tup.into());
+                }
+            }
+            // Top space adjacency
+            if let Some(&dst_idx) = dest_map.get(hex) {
+                let tup = PyTuple::new(py, &[
+                    "in_play".into_py(py),
+                    (src_idx as u32).into_py(py),
+                    "destination".into_py(py),
+                    (dst_idx as u32).into_py(py),
+                ]);
+                adjacency.push(tup.into());
+            }
+        }
+        graph.set_item("adjacency_edges", PyList::new(py, adjacency))?;
+
+        // Current-player move edges using Rules::generate_moves
+        let mut moves = Vec::new();
+        Rules::generate_moves(&self.inner, &mut moves);
+        let mut current_edges: Vec<PyObject> = Vec::new();
+        for mv in moves.iter() {
+            match mv {
+                RustTurn::Place(hex, bug) => {
+                    // Out-of-play bug -> destination
+                    // find out_of_play node for this bug for this color
+                    let color_idx = self.inner.to_move() as usize; // whose turn is placing
+                    // find out_of_play id
+                    // We used order color_idx 0..1 and Bug.iter_all order; recompute index
+                    // We need mapping: out_id = number of earlier out nodes for earlier colors
+                    // Build a combined mapping to ids
+                }
+                RustTurn::Move(from, to) => {
+                    // From (in-play piece) -> destination node
+                }
+                _ => {}
+            }
+        }
+
+        // For simplicity fill current move edges in Python side using the Rust turns list.
+        // Provide a list of turns for the current player.
+        let py_moves = PyList::new(py, moves.into_iter().map(|m| format!("{:?}", m)).collect::<Vec<String>>());
+        graph.set_item("moves_current", py_moves)?;
+
+        // Next-player moves: clone, apply pass, then generate moves
+        let mut clone = self.inner.clone();
+        clone.apply(RustTurn::Pass);
+        let mut next_moves = Vec::new();
+        Rules::generate_moves(&clone, &mut next_moves);
+        let py_next_moves = PyList::new(py, next_moves.into_iter().map(|m| format!("{:?}", m)).collect::<Vec<String>>());
+        graph.set_item("moves_next", py_next_moves)?;
+
+        Ok(graph.into())
     }
 
     /// Get board state as a compact representation for features
