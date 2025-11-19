@@ -167,7 +167,8 @@ class MoveScorer(nn.Module):
                     out.append(torch.tensor([]))
                     continue
                 logits_g = logits[mask]
-                scores_g = torch.tanh(logits_g)
+                # Softmax normalization applied per-graph
+                scores_g = F.softmax(logits_g, dim=0)
                 out.append(scores_g)
             # compute critic per graph
             # build pooled graph embedding by concatenating all node types
@@ -217,7 +218,7 @@ class MoveScorer(nn.Module):
         else:
             critic_vals = torch.tensor([], dtype=torch.float32)
 
-        action_scores = torch.tanh(logits)
+        action_scores = F.softmax(logits, dim=0)
         return action_scores, critic_vals
 
     def action_scores_to_move_dicts(

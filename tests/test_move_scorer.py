@@ -35,9 +35,10 @@ def test_move_scorer_on_start():
 
     # Starting position must have seven current-move edges (asserted in other tests)
     assert probs.numel() == 7
-    # action scores should be within (-1, 1) from tanh activation
+    # action probabilities should sum to 1 and be within [0, 1]
+    assert abs(probs.sum().item() - 1.0) < 1e-6
     assert probs.max().item() <= 1.0
-    assert probs.min().item() >= -1.0
+    assert probs.min().item() >= 0.0
     # mapping from edges to moves should be present for the current_move edge type
     cur_rel = ("out_of_play_piece", "current_move", "destination")
     assert cur_rel in data.edge_index_dict
@@ -67,8 +68,10 @@ def test_move_scorer_batch_prediction():
     assert len(out) == 2
     for i, p in enumerate(out):
         assert p.numel() == 7
+        # Per-graph softmax: each set should sum to 1
+        assert abs(p.sum().item() - 1.0) < 1e-6
         assert p.max().item() <= 1.0
-        assert p.min().item() >= -1.0
+        assert p.min().item() >= 0.0
         # ensure mapping exists for each graph
         cur_rel = ("out_of_play_piece", "current_move", "destination")
         assert cur_rel in batch.edge_index_dict
