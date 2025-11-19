@@ -190,3 +190,33 @@ def test_sequence_moves_adjacency():
     out_nodes = list(builder.raw.get("out_of_play_nodes", []))
     for n in out_nodes:
         assert not (n["color"] == "Black" and n["bug"] in ("grasshopper", "queen"))
+
+
+def test_destination_counts_after_sequence():
+    # Same position as test_sequence_moves_adjacency; there should be 22 destinations
+    #  - 15 empty neighbors around the hive
+    #  - 7 top-of-piece destinations (one for each piece with space above)
+    s = (
+        "Base+M;InProgress;turn;"
+        "wG1;"
+        "bG1 -wG1;"
+        "wQ wG1-;"
+        "bQ -bG1;"
+        "wB1 wQ-;"
+        "bB1 \\bG1;"
+        "wB1 wQ;"
+        "bG2 \\bQ;"
+        "wM wB1-;"
+        "bG3 /bG2;"
+        "wM wB1"
+    )
+
+    board = Board.from_game_string(s)
+    builder = BoardHeteroBuilder(board)
+    dest_nodes = list(builder.raw.get("destination_nodes", []))
+
+    assert len(dest_nodes) == 22
+    top_count = sum(1 for n in dest_nodes if n.get("is_top", False))
+    assert top_count == 7
+    around_count = sum(1 for n in dest_nodes if not n.get("is_top", False))
+    assert around_count == 15
