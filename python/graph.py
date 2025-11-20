@@ -98,12 +98,17 @@ class BoardHeteroBuilder:
                     x[local_id, len(self.BUGS) + 1] = 1.0
                 # global id
                 gid = in_offset + local_id
-                # add node with attributes
+                # add node with attributes including more human-readable fields
                 G.add_node(
                     gid,
                     node_type="in_play_piece",
                     node_feature=x[local_id],
                     node_label=local_id,
+                    hex=n.get("hex"),
+                    color=n.get("color"),
+                    bug=n.get("bug"),
+                    is_underneath=n.get("is_underneath", False),
+                    is_above=n.get("is_above", False),
                 )
 
         # Out-of-play nodes
@@ -119,6 +124,9 @@ class BoardHeteroBuilder:
                     node_type="out_of_play_piece",
                     node_feature=x_out[local_id],
                     node_label=local_id,
+                    bug=n.get("bug"),
+                    color=n.get("color"),
+                    num_left=n.get("num_left", 0),
                 )
 
         # Destination nodes
@@ -130,6 +138,8 @@ class BoardHeteroBuilder:
                 node_type="destination",
                 node_feature=torch.zeros(1),
                 node_label=local_id,
+                hex=n.get("hex"),
+                is_top=n.get("is_top", False),
             )
 
         # Collect adjacency edges and add to NX graph
