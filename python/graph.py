@@ -270,7 +270,19 @@ class BoardHeteroBuilder:
     def as_heterograph(self) -> HeteroGraph:
         """Return a deepsnap.HeteroGraph converted from the networkx graph."""
         G = self.as_networkx()
-        H = HeteroGraph(G)
+        # DeepSNAP's HeteroGraph treats any 'edge_label' attribute on edges as
+        # a numeric or tensor label. BoardHeteroBuilder attaches string labels
+        # (e.g. "Place(...)"), which raises a TypeError during HeteroGraph
+        # construction. To preserve the networkx graph but avoid HeteroGraph
+        # errors, make a shallow copy and remove the string labels only for
+        # the deepSNAP representation.
+        import copy
+
+        G_copy = copy.deepcopy(G)
+        for u, v, attrs in list(G_copy.edges(data=True)):
+            attrs.pop("edge_label", None)
+
+        H = HeteroGraph(G_copy)
         return H
 
     # Backwards compatibility: to_heterodata previously returned a PyG HeteroData. Now return DeepSNAP HeteroGraph
