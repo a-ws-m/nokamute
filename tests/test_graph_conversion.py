@@ -25,43 +25,92 @@ def test_basic_graph_conversion():
 
     board.apply(place_move)
     builder = BoardHeteroBuilder(board)
-    data = builder.to_heterodata()
+    G = builder.as_networkx()
 
     # Basic checks on node counts
-    assert data["in_play_piece"].num_nodes >= 1
-    assert data["destination"].num_nodes >= 6
+    assert (
+        sum(1 for _, d in G.nodes(data=True) if d.get("node_type") == "in_play_piece")
+        >= 1
+    )
+    assert (
+        sum(1 for _, d in G.nodes(data=True) if d.get("node_type") == "destination")
+        >= 6
+    )
 
     # We should have adjacency edges from the in-play node to the destination
-    assert ("in_play_piece", "adj", "destination") in data.edge_index_dict
+    assert any(
+        attrs.get("edge_type") == "adj"
+        and G.nodes[u].get("node_type") == "in_play_piece"
+        and G.nodes[v].get("node_type") == "destination"
+        for u, v, attrs in G.edges(data=True)
+    )
 
     # Check that current_move edges exist (some legal moves for the player after the placement)
-    assert ("in_play_piece", "current_move", "destination") in data.edge_index_dict or (
-        "out_of_play_piece",
-        "current_move",
-        "destination",
-    ) in data.edge_index_dict
+    assert any(
+        attrs.get("edge_type") == "current_move" for _, _, attrs in G.edges(data=True)
+    )
+    # Ensure edge_label exists for at least one current_move edge and looks like a Turn
+    assert any(
+        attrs.get("edge_type") == "current_move"
+        and attrs.get("edge_label") is not None
+        and hasattr(attrs.get("edge_label"), "is_place")
+        for _, _, attrs in G.edges(data=True)
+    )
 
 
 def test_starting_position_counts():
     board = Board()
     builder = BoardHeteroBuilder(board)
-    data = builder.to_heterodata()
+    G = builder.as_networkx()
 
     # Single destination node for starting position
-    assert data["destination"].num_nodes == 1
+    assert (
+        sum(1 for _, d in G.nodes(data=True) if d.get("node_type") == "destination")
+        == 1
+    )
 
     # 16 out-of-play piece nodes (8 white, 8 black)
-    assert data["out_of_play_piece"].num_nodes == 16
+    assert (
+        sum(
+            1
+            for _, d in G.nodes(data=True)
+            if d.get("node_type") == "out_of_play_piece"
+        )
+        == 16
+    )
 
     # There should be 7 current-player move edges (queen forbidden first move)
-    cur_rel = ("out_of_play_piece", "current_move", "destination")
-    assert cur_rel in data.edge_index_dict
-    assert data[cur_rel].edge_index.shape[1] == 7
+    cur_edges = [
+        (u, v, attrs)
+        for u, v, attrs in G.edges(data=True)
+        if attrs.get("edge_type") == "current_move"
+        and G.nodes[u].get("node_type") == "out_of_play_piece"
+        and G.nodes[v].get("node_type") == "destination"
+    ]
+    assert len(cur_edges) == 7
+    # Each current edge should have an edge_label (Turn) and be a placement in starting position
+    assert all(
+        attrs.get("edge_label") is not None
+        and hasattr(attrs.get("edge_label"), "is_place")
+        and attrs.get("edge_label").is_place()
+        for _, _, attrs in cur_edges
+    )
 
     # Next-player move edges after passing
-    next_rel = ("out_of_play_piece", "next_move", "destination")
-    assert next_rel in data.edge_index_dict
-    assert data[next_rel].edge_index.shape[1] == 7
+    next_edges = [
+        (u, v, attrs)
+        for u, v, attrs in G.edges(data=True)
+        if attrs.get("edge_type") == "next_move"
+        and G.nodes[u].get("node_type") == "out_of_play_piece"
+        and G.nodes[v].get("node_type") == "destination"
+    ]
+    assert len(next_edges) == 7
+    assert all(
+        attrs.get("edge_label") is not None
+        and hasattr(attrs.get("edge_label"), "is_place")
+        and attrs.get("edge_label").is_place()
+        for _, _, attrs in next_edges
+    )
 
 
 def test_sequence_moves_adjacency():
@@ -84,7 +133,7 @@ def test_sequence_moves_adjacency():
 
     board = Board.from_game_string(s)
     builder = BoardHeteroBuilder(board)
-    data = builder.to_heterodata()
+    G = builder.as_networkx()
 
     # Map hex -> topmost in_play id
     in_map = {
@@ -105,26 +154,51 @@ def test_sequence_moves_adjacency():
     assert "beetle" in black_hexes
     assert "grasshopper" in black_hexes
 
-    adj_key = ("in_play_piece", "adj", "in_play_piece")
-    assert adj_key in data.edge_index_dict
-    edges = data[adj_key].edge_index
-
-    # Convert to Python list for easier membership tests
-    edge_pairs = set(
-        (int(edges[0, i].item()), int(edges[1, i].item()))
-        for i in range(edges.shape[1])
-    )
+    # Find all adjacency edges between in_play nodes
+    edge_pairs = set()
+    for u, v, attrs in G.edges(data=True):
+        if (
+            attrs.get("edge_type") == "adj"
+            and G.nodes[u].get("node_type") == "in_play_piece"
+            and G.nodes[v].get("node_type") == "in_play_piece"
+        ):
+            edge_pairs.add((int(u), int(v)))
+            edge_pairs.add((int(v), int(u)))
 
     # We'll gather ids for black queen, beetle and all grasshoppers
     in_play_nodes = list(builder.raw.get("in_play_nodes", []))
-    black_beetle_id = next(
-        n["id"] for n in in_play_nodes if n["color"] == "Black" and n["bug"] == "beetle"
+    # Convert local in-play ids to global ids using offsets
+    in_count = sum(1 for n in builder.raw.get("in_play_nodes", []))
+    out_count = sum(1 for n in builder.raw.get("out_of_play_nodes", []))
+    out_offset = in_count
+    dest_offset = in_count + out_count
+
+    def local_to_global(kind, local_id):
+        if kind == "in_play":
+            return local_id
+        if kind == "out_of_play":
+            return out_offset + local_id
+        if kind == "destination":
+            return dest_offset + local_id
+
+    black_beetle_id = local_to_global(
+        "in_play",
+        next(
+            n["id"]
+            for n in in_play_nodes
+            if n["color"] == "Black" and n["bug"] == "beetle"
+        ),
     )
-    black_queen_id = next(
-        n["id"] for n in in_play_nodes if n["color"] == "Black" and n["bug"] == "queen"
+    black_queen_id = local_to_global(
+        "in_play",
+        next(
+            n["id"]
+            for n in in_play_nodes
+            if n["color"] == "Black" and n["bug"] == "queen"
+        ),
     )
     black_grasshopper_ids = [
-        n["id"]
+        local_to_global("in_play", n["id"])
         for n in in_play_nodes
         if n["color"] == "Black" and n["bug"] == "grasshopper"
     ]
@@ -144,7 +218,12 @@ def test_sequence_moves_adjacency():
     assert len([g for g in black_grasshopper_ids if g in adj_with_queen]) == 3
 
     # Check is_above/is_underneath binary features on in_play nodes using HeteroData
-    x = data["in_play_piece"].x
+    # Map node id -> feature vector tensor
+    x_map = {
+        n: d["node_feature"]
+        for n, d in G.nodes(data=True)
+        if d.get("node_type") == "in_play_piece"
+    }
     feat_under = len(BoardHeteroBuilder.BUGS)
     feat_above = feat_under + 1
 
@@ -152,39 +231,43 @@ def test_sequence_moves_adjacency():
     in_play = (
         list(builder.raw["in_play_nodes"]) if "in_play_nodes" in builder.raw else []
     )
-    wb_id = next(
-        n["id"] for n in in_play if n["color"] == "White" and n["bug"] == "beetle"
+    wb_id = local_to_global(
+        "in_play",
+        next(
+            n["id"] for n in in_play if n["color"] == "White" and n["bug"] == "beetle"
+        ),
     )
     # The white queen must be the underneath piece, since final move places the
     # white beetle on top of the white queen.
-    wq_id = next(
-        n["id"] for n in in_play if n["color"] == "White" and n["bug"] == "queen"
+    wq_id = local_to_global(
+        "in_play",
+        next(n["id"] for n in in_play if n["color"] == "White" and n["bug"] == "queen"),
     )
 
     # White beetle should be both underneath and above (middle of a 3-stack)
-    assert x[wb_id, feat_under].item() == 1.0
-    assert x[wb_id, feat_above].item() == 1.0
+    assert x_map[wb_id][feat_under].item() == 1.0
+    assert x_map[wb_id][feat_above].item() == 1.0
 
     # Ensure white queen is underneath (bottom of stack)
-    assert x[wq_id, feat_under].item() == 1.0
-    assert x[wq_id, feat_above].item() == 0.0
+    assert x_map[wq_id][feat_under].item() == 1.0
+    assert x_map[wq_id][feat_above].item() == 0.0
 
     # All others not having either
     for n in in_play:
-        if n["id"] in (wb_id, wq_id):
+        if local_to_global("in_play", n["id"]) in (wb_id, wq_id):
             continue
         # the white mosquito should be above something
         if n["color"] == "White" and n["bug"] == "mosquito":
-            mid_mosq = n["id"]
-            assert x[mid_mosq, feat_above].item() == 1.0
-            assert x[mid_mosq, feat_under].item() == 0.0
+            mid_mosq = local_to_global("in_play", n["id"])
+            assert x_map[mid_mosq][feat_above].item() == 1.0
+            assert x_map[mid_mosq][feat_under].item() == 0.0
             continue
-        id = n["id"]
+        id = local_to_global("in_play", n["id"])
         # Some pieces may be the underneath piece - skip them
-        if x[id, feat_under].item() == 1.0 or x[id, feat_above].item() == 1.0:
+        if x_map[id][feat_under].item() == 1.0 or x_map[id][feat_above].item() == 1.0:
             continue
-        assert x[id, feat_under].item() == 0.0
-        assert x[id, feat_above].item() == 0.0
+        assert x_map[id][feat_under].item() == 0.0
+        assert x_map[id][feat_above].item() == 0.0
 
     # Verify that there are no out-of-play nodes for black grasshopper or black queen
     out_nodes = list(builder.raw.get("out_of_play_nodes", []))
@@ -213,6 +296,7 @@ def test_destination_counts_after_sequence():
 
     board = Board.from_game_string(s)
     builder = BoardHeteroBuilder(board)
+    G = builder.as_networkx()
     dest_nodes = list(builder.raw.get("destination_nodes", []))
 
     assert len(dest_nodes) == 22

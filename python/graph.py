@@ -1,7 +1,8 @@
 from typing import Dict, List, Optional, Tuple
 
+import networkx as nx
 import torch
-from torch_geometric.data import HeteroData
+from deepsnap.hetero_graph import HeteroGraph
 
 
 class BoardHeteroBuilder:
@@ -41,8 +42,14 @@ class BoardHeteroBuilder:
         self.board = board
         self.raw = board.to_graph()
 
-    def to_heterodata(self) -> HeteroData:
-        data = HeteroData()
+    def as_networkx(self) -> nx.MultiGraph:
+        """Return a networkx MultiGraph for the current board state.
+
+        Nodes have attributes: node_type, node_label, node_feature, hex, color, bug, etc.
+        Edges have attributes: edge_type and for move edges an edge_label (Turn object).
+        """
+        # Build a networkx multi-graph with node/edge types compatible with deepsnap
+        G = nx.MultiGraph()
 
         in_play = list(self.raw["in_play_nodes"]) if "in_play_nodes" in self.raw else []
         out_of_play = (
@@ -65,7 +72,15 @@ class BoardHeteroBuilder:
         dest_map = {n["hex"]: n["id"] for n in destination}
 
         # Node counts and features
-        data["in_play_piece"].num_nodes = len(in_play)
+        # Assign offsets for each node bucket so all node ids are unique in the NX graph
+        in_count = len(in_play)
+        out_count = len(out_of_play)
+        dest_count = len(destination)
+        in_offset = 0
+        out_offset = in_count
+        dest_offset = in_count + out_count
+
+        # Add in-play nodes to graph
         if len(in_play) > 0:
             # Add two extra binary features appended after the bug one-hot:
             # index len(BUGS)   -> is_underneath (1 if this piece is underneath another)
@@ -74,80 +89,112 @@ class BoardHeteroBuilder:
             x = torch.zeros(len(in_play), feature_dim, dtype=torch.float32)
             for n in in_play:
                 bug_idx = n["bug_idx"]
-                x[n["id"], bug_idx] = 1.0
+                local_id = n["id"]
+                x[local_id, bug_idx] = 1.0
                 # extra features
                 if n.get("is_underneath", False):
-                    x[n["id"], len(self.BUGS)] = 1.0
+                    x[local_id, len(self.BUGS)] = 1.0
                 if n.get("is_above", False):
-                    x[n["id"], len(self.BUGS) + 1] = 1.0
-            data["in_play_piece"].x = x
+                    x[local_id, len(self.BUGS) + 1] = 1.0
+                # global id
+                gid = in_offset + local_id
+                # add node with attributes
+                G.add_node(
+                    gid,
+                    node_type="in_play_piece",
+                    node_feature=x[local_id],
+                    node_label=local_id,
+                )
 
-        data["out_of_play_piece"].num_nodes = len(out_of_play)
+        # Out-of-play nodes
         if len(out_of_play) > 0:
-            x = torch.zeros(len(out_of_play), len(self.BUGS), dtype=torch.float32)
+            x_out = torch.zeros(len(out_of_play), len(self.BUGS), dtype=torch.float32)
             for n in out_of_play:
                 bug_idx = n["bug_idx"]
-                x[n["id"], bug_idx] = 1.0
-            data["out_of_play_piece"].x = x
+                local_id = n["id"]
+                x_out[local_id, bug_idx] = 1.0
+                gid = out_offset + local_id
+                G.add_node(
+                    gid,
+                    node_type="out_of_play_piece",
+                    node_feature=x_out[local_id],
+                    node_label=local_id,
+                )
 
-        data["destination"].num_nodes = len(destination)
+        # Destination nodes
+        for n in destination:
+            local_id = n["id"]
+            gid = dest_offset + local_id
+            G.add_node(
+                gid,
+                node_type="destination",
+                node_feature=torch.zeros(1),
+                node_label=local_id,
+            )
 
-        # Collect adjacency edges
-        edges_adj_in_in = []
-        edges_adj_in_dest = []
+        # Collect adjacency edges and add to NX graph
         for tup in self.raw.get("adjacency_edges", []):
             src_kind, src_idx, dst_kind, dst_idx = tup
-            if src_kind == "in_play" and dst_kind == "in_play":
-                edges_adj_in_in.append((src_idx, dst_idx))
-            elif src_kind == "in_play" and dst_kind == "destination":
-                edges_adj_in_dest.append((src_idx, dst_idx))
-
-        if len(edges_adj_in_in) > 0:
-            idxs = torch.tensor(edges_adj_in_in, dtype=torch.long).t().contiguous()
-            data["in_play_piece", "adj", "in_play_piece"].edge_index = idxs
-        if len(edges_adj_in_dest) > 0:
-            idxs = torch.tensor(edges_adj_in_dest, dtype=torch.long).t().contiguous()
-            data["in_play_piece", "adj", "destination"].edge_index = idxs
+            # compute global ids
+            if src_kind == "in_play":
+                src_gid = in_offset + src_idx
+            elif src_kind == "out_of_play":
+                src_gid = out_offset + src_idx
+            elif src_kind == "destination":
+                src_gid = dest_offset + src_idx
+            else:
+                continue
+            if dst_kind == "in_play":
+                dst_gid = in_offset + dst_idx
+            elif dst_kind == "out_of_play":
+                dst_gid = out_offset + dst_idx
+            elif dst_kind == "destination":
+                dst_gid = dest_offset + dst_idx
+            else:
+                continue
+            # adjacency edges are undirected
+            G.add_edge(src_gid, dst_gid, edge_type="adj")
 
         # Helper to convert moves -> edge lists
         def moves_to_edges(moves, rel_name: str, color_name: Optional[str] = None):
-            in_edges = []
-            out_edges = []
             out_seen = set()
             for m in moves:
                 if m.is_place():
                     hex, bug = m.get_place_info()
-                    # Source is out-of-play piece.
-                    # Color for place is the to_move on the board which generated the moves.
                     color = color_name or self.board.to_move().name()
                     key = (bug, color)
                     if key in out_map:
-                        # If the exact hex isn't in the destination map (eg. a pass results
-                        # in placements on adjacent hexes while our node bucket only contains
-                        # the single START_HEX), fall back to the single dest if present.
                         if hex in dest_map:
-                            out_edges.append((out_map[key], dest_map[hex]))
+                            src_gid = out_offset + out_map[key]
+                            dst_gid = dest_offset + dest_map[hex]
+                            G.add_edge(
+                                src_gid, dst_gid, edge_type=rel_name, edge_label=m
+                            )
                         elif len(dest_map) == 1:
                             only_dest = list(dest_map.values())[0]
                             if rel_name == "next_move":
-                                # Deduplicate next-move placements by bug; only one edge
-                                # per out-of-play piece-type is required for the test.
                                 if out_map[key] not in out_seen:
-                                    out_edges.append((out_map[key], only_dest))
+                                    src_gid = out_offset + out_map[key]
+                                    dst_gid = dest_offset + only_dest
+                                    G.add_edge(
+                                        src_gid,
+                                        dst_gid,
+                                        edge_type=rel_name,
+                                        edge_label=m,
+                                    )
                                     out_seen.add(out_map[key])
                             else:
-                                out_edges.append((out_map[key], only_dest))
+                                src_gid = out_offset + out_map[key]
+                                dst_gid = dest_offset + only_dest
+                                G.add_edge(
+                                    src_gid, dst_gid, edge_type=rel_name, edge_label=m
+                                )
                 elif m.is_move():
                     from_hex, to_hex = m.get_move_info()
                     if from_hex in in_map and to_hex in dest_map:
-                        in_edges.append((in_map[from_hex], dest_map[to_hex]))
-            # Set edges in heterodata if any
-            if in_edges:
-                idxs = torch.tensor(in_edges, dtype=torch.long).t().contiguous()
-                data["in_play_piece", rel_name, "destination"].edge_index = idxs
-            if out_edges:
-                idxs = torch.tensor(out_edges, dtype=torch.long).t().contiguous()
-                data["out_of_play_piece", rel_name, "destination"].edge_index = idxs
+                        src_gid = in_offset + in_map[from_hex]
+                        dst_gid = dest_offset + dest_map[to_hex]
+                        G.add_edge(src_gid, dst_gid, edge_type=rel_name, edge_label=m)
 
         # Current player moves
         moves_current = self.board.legal_moves()
@@ -167,4 +214,14 @@ class BoardHeteroBuilder:
             moves_next = []
         moves_to_edges(moves_next, "next_move", b2.to_move().name)
 
-        return data
+        return G
+
+    def as_heterograph(self) -> HeteroGraph:
+        """Return a deepsnap.HeteroGraph converted from the networkx graph."""
+        G = self.as_networkx()
+        H = HeteroGraph(G)
+        return H
+
+    # Backwards compatibility: to_heterodata previously returned a PyG HeteroData. Now return DeepSNAP HeteroGraph
+    def to_heterodata(self) -> HeteroGraph:
+        return self.as_heterograph()
