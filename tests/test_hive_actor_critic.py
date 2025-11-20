@@ -49,3 +49,14 @@ def test_hive_actor_critic_empty_board_shapes():
 
     assert critic.shape[0] == 1
     assert critic.shape[1] == 1
+
+    # Also assert the helper returns logits in the same order as edge_label_index
+    edge_message_type = next(
+        mt for mt in batch.edge_label_index.keys() if mt[1] == "current_move"
+    )
+    logits_map = model.policy_logits_edge_index(batch)
+    assert edge_message_type in logits_map
+    logits = logits_map[edge_message_type]
+    # Expect the DeepSNAP edge_label_index width for this message type
+    e_count = batch.edge_label_index[edge_message_type].shape[1]
+    assert logits.shape == (e_count, 7)

@@ -67,10 +67,11 @@ class HiveActorCritic(nn.Module):
         self.relus1 = nn.ModuleDict()
         self.relus2 = nn.ModuleDict()
         for node_type in hetero.node_types:
-            # Use LayerNorm for small node counts; BatchNorm fails on size=1
-            self.bns1[node_type] = nn.LayerNorm(hidden_size)
+            # Use BatchNorm1d for per-node-type feature normalization. Tests use
+            # `model.eval()` to avoid BatchNorm misbehavior on tiny batches.
+            self.bns1[node_type] = nn.BatchNorm1d(hidden_size)
             # bns2 not used with our simplified trunk (only bns1 for encoder)
-            self.bns2[node_type] = nn.LayerNorm(hidden_size)
+            self.bns2[node_type] = nn.BatchNorm1d(hidden_size)
             self.relus1[node_type] = nn.LeakyReLU()
             self.relus2[node_type] = nn.LeakyReLU()
 
@@ -100,9 +101,10 @@ class HiveActorCritic(nn.Module):
             policy_logits: Tensor [total_edges_current_move, policy_dim]
             critic: Tensor [batch_size, 1]
         """
+        # Encode node-level representations (shared trunk)
         x = {}
         edge_index = data.edge_index
-        # encode each node type independently
+        x = self._encode(data)
         for node_type, feat in data.node_feature.items():
             if feat is None or feat.numel() == 0:
                 x[node_type] = feat
@@ -175,6 +177,61 @@ class HiveActorCritic(nn.Module):
         critic = self.critic_mlp(self.dropout(pooled))
 
         return policy_logits, critic
+
+    def _encode(self, data) -> Dict[str, torch.Tensor]:
+        """Encode nodes (shared trunk) and return per-node-type tensors.
+
+        This encapsulates the input encoders + normalisation so we can call it
+        from other helpers (e.g., mapping policy outputs to DeepSNAP ordering).
+        """
+        x = {}
+        for node_type, feat in data.node_feature.items():
+            if feat is None or feat.numel() == 0:
+                x[node_type] = feat
+                continue
+            h = self.input_encoders[node_type](feat)
+            # BatchNorm expects [N, C]
+            h = self.bns1[node_type](h)
+            h = self.relus1[node_type](h)
+            x[node_type] = h
+        return x
+
+    def policy_logits_edge_index(
+        self, data
+    ) -> Dict[Tuple[str, str, str], torch.Tensor]:
+        """Return policy logits arranged in the same order as
+        `data.edge_label_index` across message_types.
+
+        Returns a dictionary mapping message_type -> logits tensor of shape
+        [E, policy_dim], where E == data.edge_label_index[message_type].shape[1].
+        """
+        x = self._encode(data)
+        out = {}
+        for message_type, idx in data.edge_label_index.items():
+            if message_type[1] != "current_move":
+                continue
+            if idx is None or idx.numel() == 0:
+                out[message_type] = torch.zeros(
+                    0, self.policy_dim, device=next(self.parameters()).device
+                )
+                continue
+            src_type, _, dst_type = message_type
+            # build concatenated tensor and offsets so we can index uniformly
+            # Map message indices to the concatenated tensor using
+            # data.node_to_tensor_mapping. This maps graph node IDs -> positions
+            # in the concatenated per-type node tensor.
+            node_to_tensor = data.node_to_tensor_mapping
+            node_types = list(x.keys())
+            x_all = torch.cat([x[nt] for nt in node_types], dim=0)
+
+            src_map = node_to_tensor[idx[0, :].long()]
+            dst_map = node_to_tensor[idx[1, :].long()]
+            src_nodes = x_all[src_map]
+            dst_nodes = x_all[dst_map]
+            pair = src_nodes * dst_nodes
+            logits = self.policy_mlp(self.dropout(pair))
+            out[message_type] = logits
+        return out
 
 
 __all__ = ["HiveActorCritic"]
