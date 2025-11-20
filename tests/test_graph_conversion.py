@@ -37,6 +37,179 @@ def test_basic_graph_conversion_networkx():
     )
 
 
+def test_transposition_hash_equivalence():
+    """Two different move sequences that result in the same board position
+    should produce identical Weisfeiler-Lehman hashes when using node
+    features and edge types.
+    """
+    s1 = (
+        "Base+M;InProgress;turn;"
+        "wG1;"
+        "bG1 -wG1;"
+        "wQ wG1\\;"
+        "bQ /bG1;"
+        "wB1 wG1/;"
+        "bB1 \\bG1"
+    )
+
+    s2 = (
+        "Base+M;InProgress;turn;"
+        "wG1;"
+        "bG1 -wG1;"
+        "wB1 wG1/;"
+        "bB1 \\bG1;"
+        "wQ wG1\\;"
+        "bQ /bG1"
+    )
+
+    b1 = Board.from_game_string(s1)
+    b2 = Board.from_game_string(s2)
+
+    from python.graph import BoardHeteroBuilder
+
+    h1 = BoardHeteroBuilder(b1)
+    h2 = BoardHeteroBuilder(b2)
+
+    assert h1.weisfeiler_lehman_hash() == h2.weisfeiler_lehman_hash()
+
+
+def test_transposition_hash_equivalence_permutation():
+    """A permutation of the same moves produces an identical board; verify
+    WL hash equality.
+    """
+    s1 = (
+        "Base+M;InProgress;turn;"
+        "wG1;"
+        "bG1 -wG1;"
+        "wQ wG1\\;"
+        "bQ /bG1;"
+        "wB1 wG1/;"
+        "bB1 \\bG1"
+    )
+
+    s3 = (
+        "Base+M;InProgress;turn;"
+        "wG1;"
+        "bG1 -wG1;"
+        "wB1 wG1/;"
+        "bB1 \\bG1;"
+        "wQ wG1\\;"
+        "bQ /bG1"
+    )
+
+    b1 = Board.from_game_string(s1)
+    b3 = Board.from_game_string(s3)
+
+    from python.graph import BoardHeteroBuilder
+
+    h1 = BoardHeteroBuilder(b1)
+    h3 = BoardHeteroBuilder(b3)
+
+    assert h1.weisfeiler_lehman_hash() == h3.weisfeiler_lehman_hash()
+
+
+def test_transposition_hash_symmetry_debug():
+    """Check WL hash for a symmetric variant (rotation/reflection). If the
+    hash differs, dump human-friendly diagnostics so we can see why the graphs
+    are not considered equivalent.
+    """
+    s1 = (
+        "Base+M;InProgress;turn;"
+        "wG1;"
+        "bG1 -wG1;"
+        "wQ wG1\\;"
+        "bQ /bG1;"
+        "wB1 wG1/;"
+        "bB1 \\bG1"
+    )
+
+    s_sym = (
+        "Base+M;InProgress;turn;"
+        "wG1;"
+        "bG1 -wG1;"
+        "wB1 wG1\\;"
+        "bB1 /bG1;"
+        "wQ wG1/;"
+        "bQ \\bG1"
+    )
+
+    s3 = (
+        "Base+M;InProgress;turn;"
+        "wG1;"
+        "bG1 -wG1;"
+        "wB1 wG1/;"
+        "bB1 \\bG1;"
+        "wQ wG1\\;"
+        "bQ /bG1"
+    )
+
+    from collections import Counter
+
+    from python.graph import BoardHeteroBuilder
+
+    b1 = Board.from_game_string(s1)
+    bsym = Board.from_game_string(s_sym)
+    b3 = Board.from_game_string(s3)
+
+    h1 = BoardHeteroBuilder(b1).weisfeiler_lehman_hash()
+    hs = BoardHeteroBuilder(bsym).weisfeiler_lehman_hash()
+    h3 = BoardHeteroBuilder(b3).weisfeiler_lehman_hash()
+
+    print(f"hash s1={h1}\nhash sym={hs}\nhash s3={h3}")
+
+    if not (h1 == hs == h3):
+        # Dump node feature counts and edge type counts for each graph
+        for name, board in [("s1", b1), ("sym", bsym), ("s3", b3)]:
+            G = BoardHeteroBuilder(board).as_networkx()
+            feat_cnt = Counter()
+            for _, d in G.nodes(data=True):
+                nf = d.get("node_feature")
+                if nf is None:
+                    feat_cnt[None] += 1
+                else:
+                    try:
+                        import torch
+
+                        if isinstance(nf, torch.Tensor):
+                            key = tuple(nf.detach().cpu().tolist())
+                        else:
+                            key = tuple(nf)
+                    except Exception:
+                        key = str(nf)
+                    feat_cnt[key] += 1
+            edge_cnt = Counter(
+                [attrs.get("edge_type") for _, _, attrs in G.edges(data=True)]
+            )
+            print("")
+            print(name)
+            print(" node feature counts:")
+            for k, v in feat_cnt.most_common():
+                print(k, v)
+            print(" edge type counts:")
+            print(edge_cnt)
+
+            # list the current move and next_move edges to compare
+            cur = [
+                (u, v, attrs.get("edge_label"))
+                for u, v, attrs in G.edges(data=True)
+                if attrs.get("edge_type") == "current_move"
+            ]
+            nxt = [
+                (u, v, attrs.get("edge_label"))
+                for u, v, attrs in G.edges(data=True)
+                if attrs.get("edge_type") == "next_move"
+            ]
+            print(name, "current_move count", len(cur))
+            print(name, "next_move count", len(nxt))
+            print(name, "sample current_move labels:", [c[2] for c in cur][:10])
+        # Fail test so we can iterate and fix code
+        assert (
+            False
+        ), "WL hashes differ between symmetric transpositions; see debug output"
+    # If they match, assert equality to the canonical sample
+    assert h1 == h3
+
+
 def test_starting_position_counts_networkx():
     G = BoardHeteroBuilder(Board()).as_networkx()
     assert (

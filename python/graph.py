@@ -42,6 +42,53 @@ class BoardHeteroBuilder:
         self.board = board
         self.raw = board.to_graph()
 
+    def weisfeiler_lehman_hash(
+        self, node_attr: str = "wl_node_feature", edge_attr: str = "edge_type"
+    ) -> str:
+        """Return a Weisfeiler-Lehman graph hash based on node features and edge_type.
+
+        Node features are taken from the node attribute `node_feature` and cast to a
+        tuple so they are stable and hashable. Edge attribute is taken from the
+        `edge_attr` parameter (default 'edge_type'). Returns the WL hash string.
+        """
+        G = self.as_networkx()
+        # Prepare node attribute for hashing
+        for n, d in G.nodes(data=True):
+            nf = d.get("node_feature")
+            if nf is None:
+                d[node_attr] = None
+                continue
+            # Try to convert torch tensors to native python lists/tuples
+            try:
+                import torch
+
+                if isinstance(nf, torch.Tensor):
+                    # Convert to python tuple for stable hashing
+                    d[node_attr] = tuple(nf.detach().cpu().tolist())
+                else:
+                    d[node_attr] = tuple(nf) if isinstance(nf, (list, tuple)) else nf
+            except Exception:
+                d[node_attr] = nf
+
+        import networkx as nx
+
+        # Convert MultiGraph -> Graph for WL hashing. Combine parallel-edge
+        # types into a single string attribute so edge ``edge_attr`` is stable.
+        simple = nx.Graph()
+        simple.add_nodes_from(G.nodes(data=True))
+        edge_types = {}
+        for u, v, attrs in G.edges(data=True):
+            et = attrs.get(edge_attr)
+            key = (min(u, v), max(u, v))
+            edge_types.setdefault(key, set()).add(str(et))
+
+        for (u, v), types in edge_types.items():
+            simple.add_edge(u, v, **{edge_attr: ",".join(sorted(types))})
+
+        return nx.weisfeiler_lehman_graph_hash(
+            simple, node_attr=node_attr, edge_attr=edge_attr
+        )
+
     def as_networkx(self) -> nx.MultiGraph:
         """Return a networkx MultiGraph for the current board state.
 
