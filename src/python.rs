@@ -108,6 +108,72 @@ impl Turn {
         }
     }
 
+    /// Construct a Turn from its string representation produced by `format!("{:?}", turn)`
+    #[staticmethod]
+    fn from_string(s: &str) -> PyResult<Self> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("Pass") || s.eq_ignore_ascii_case("Turn::Pass") {
+            return Ok(Turn { inner: RustTurn::Pass });
+        }
+
+        // Place(HEX, BugVariant) or Place(HEX, Variant)
+        if let Some(inside) = s.strip_prefix("Place(") {
+            if let Some(rest) = inside.strip_suffix(")") {
+                let parts: Vec<&str> = rest.split(',').map(|p| p.trim()).collect();
+                if parts.len() == 2 {
+                    let hex_res = parts[0].parse::<u16>();
+                    if let Ok(hex) = hex_res {
+                        let bug_name = parts[1].to_lowercase();
+                        let bug = match bug_name.as_str() {
+                            "queen" => RustBug::Queen,
+                            "grasshopper" => RustBug::Grasshopper,
+                            "spider" => RustBug::Spider,
+                            "ant" => RustBug::Ant,
+                            "beetle" => RustBug::Beetle,
+                            "mosquito" => RustBug::Mosquito,
+                            "ladybug" => RustBug::Ladybug,
+                            "pillbug" => RustBug::Pillbug,
+                            // also accept CamelCase variant names emitted by Debug, e.g. "Queen"
+                            "queen" => RustBug::Queen,
+                            _ => {
+                                // try to strip any surrounding identifiers like "Bug('queen')" or bare variant
+                                let cleaned = bug_name.trim_matches(|c: char| !c.is_alphanumeric());
+                                match cleaned.to_lowercase().as_str() {
+                                    "queen" => RustBug::Queen,
+                                    "grasshopper" => RustBug::Grasshopper,
+                                    "spider" => RustBug::Spider,
+                                    "ant" => RustBug::Ant,
+                                    "beetle" => RustBug::Beetle,
+                                    "mosquito" => RustBug::Mosquito,
+                                    "ladybug" => RustBug::Ladybug,
+                                    "pillbug" => RustBug::Pillbug,
+                                    _ => return Err(pyo3::exceptions::PyValueError::new_err("Invalid bug name in Turn string")),
+                                }
+                            }
+                        };
+                        return Ok(Turn { inner: RustTurn::Place(hex as Hex, bug) });
+                    }
+                }
+            }
+        }
+
+        // Move(FROM, TO)
+        if let Some(inside) = s.strip_prefix("Move(") {
+            if let Some(rest) = inside.strip_suffix(")") {
+                let parts: Vec<&str> = rest.split(',').map(|p| p.trim()).collect();
+                if parts.len() == 2 {
+                    let f = parts[0].parse::<u16>();
+                    let t = parts[1].parse::<u16>();
+                    if let (Ok(from), Ok(to)) = (f, t) {
+                        return Ok(Turn { inner: RustTurn::Move(from as Hex, to as Hex) });
+                    }
+                }
+            }
+        }
+
+        Err(pyo3::exceptions::PyValueError::new_err("Unrecognized Turn string"))
+    }
+
     fn is_place(&self) -> bool {
         matches!(self.inner, RustTurn::Place(_, _))
     }

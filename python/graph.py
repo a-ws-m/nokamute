@@ -165,63 +165,104 @@ class BoardHeteroBuilder:
             # adjacency edges are undirected
             G.add_edge(src_gid, dst_gid, edge_type="adj")
 
-        # Helper to convert moves -> edge lists
+        # Helper to convert stringified moves -> edge lists
         def moves_to_edges(moves, rel_name: str, color_name: Optional[str] = None):
+            """Convert stringified moves (from Rust `format!("{:?}", turn)`) into edges.
+
+            Expected formats:
+            - "Place(<hex>, <BugVariant>)"
+            - "Move(<from>, <to>)"
+            - "Pass"
+            """
             out_seen = set()
             for m in moves:
-                if m.is_place():
-                    hex, bug = m.get_place_info()
-                    color = color_name or self.board.to_move().name()
-                    key = (bug, color)
-                    if key in out_map:
-                        if hex in dest_map:
-                            src_gid = out_offset + out_map[key]
-                            dst_gid = dest_offset + dest_map[hex]
-                            G.add_edge(
-                                src_gid, dst_gid, edge_type=rel_name, edge_label=m
-                            )
-                        elif len(dest_map) == 1:
-                            only_dest = list(dest_map.values())[0]
-                            if rel_name == "next_move":
-                                if out_map[key] not in out_seen:
+                # only accept strings from the Rust side
+                if not isinstance(m, str):
+                    raise ValueError(
+                        f"Expected move string from Rust, got {type(m)!r}: {m!r}"
+                    )
+
+                ms = m.strip()
+                # Place
+                if ms.startswith("Place("):
+                    try:
+                        inner = ms[len("Place(") : -1]
+                        parts = [p.strip() for p in inner.split(",")]
+                        if len(parts) == 2:
+                            hex_val = int(parts[0])
+                            bug_variant = parts[1]
+                            bug_name = bug_variant.strip().lower()
+                            color = color_name or self.board.to_move().name
+                            key = (bug_name, color)
+                            if key in out_map:
+                                if hex_val in dest_map:
                                     src_gid = out_offset + out_map[key]
-                                    dst_gid = dest_offset + only_dest
+                                    dst_gid = dest_offset + dest_map[hex_val]
                                     G.add_edge(
                                         src_gid,
                                         dst_gid,
                                         edge_type=rel_name,
                                         edge_label=m,
                                     )
-                                    out_seen.add(out_map[key])
-                            else:
-                                src_gid = out_offset + out_map[key]
-                                dst_gid = dest_offset + only_dest
+                                elif len(dest_map) == 1:
+                                    only_dest = list(dest_map.values())[0]
+                                    if rel_name == "next_move":
+                                        if out_map[key] not in out_seen:
+                                            src_gid = out_offset + out_map[key]
+                                            dst_gid = dest_offset + only_dest
+                                            G.add_edge(
+                                                src_gid,
+                                                dst_gid,
+                                                edge_type=rel_name,
+                                                edge_label=m,
+                                            )
+                                            out_seen.add(out_map[key])
+                                    else:
+                                        src_gid = out_offset + out_map[key]
+                                        dst_gid = dest_offset + only_dest
+                                        G.add_edge(
+                                            src_gid,
+                                            dst_gid,
+                                            edge_type=rel_name,
+                                            edge_label=m,
+                                        )
+                    except Exception as e:
+                        raise ValueError(f"Malformed Place move string: {m!r}: {e}")
+
+                # Move
+                elif ms.startswith("Move("):
+                    try:
+                        inner = ms[len("Move(") : -1]
+                        parts = [p.strip() for p in inner.split(",")]
+                        if len(parts) == 2:
+                            from_hex = int(parts[0])
+                            to_hex = int(parts[1])
+                            if from_hex in in_map and to_hex in dest_map:
+                                src_gid = in_offset + in_map[from_hex]
+                                dst_gid = dest_offset + dest_map[to_hex]
                                 G.add_edge(
                                     src_gid, dst_gid, edge_type=rel_name, edge_label=m
                                 )
-                elif m.is_move():
-                    from_hex, to_hex = m.get_move_info()
-                    if from_hex in in_map and to_hex in dest_map:
-                        src_gid = in_offset + in_map[from_hex]
-                        dst_gid = dest_offset + dest_map[to_hex]
-                        G.add_edge(src_gid, dst_gid, edge_type=rel_name, edge_label=m)
+                    except Exception as e:
+                        raise ValueError(f"Malformed Move move string: {m!r}: {e}")
+                else:
+                    # Pass is allowed and produces no edges; otherwise it's an error
+                    if ms.lower() in ("pass", "turn::pass"):
+                        continue
+                    raise ValueError(f"Unrecognized Turn string: {m!r}")
 
-        # Current player moves
-        moves_current = self.board.legal_moves()
+        # Current player moves: use the Rust-produced string list in the `to_graph` output
+        moves_current = [m for m in self.raw.get("moves_current", [])]
         moves_to_edges(moves_current, "current_move", self.board.to_move().name)
 
-        # Next player moves: simulate a pass
+        # Next player moves: use the Rust-produced `moves_next` strings (these are produced
+        # from a cloned board with a Pass applied). We still create a clone and apply Pass
+        # only to obtain the correct `to_move().name` for labeling.
+        moves_next = [m for m in self.raw.get("moves_next", [])]
         b2 = self.board.clone()
-        # Use exported Turn class from the nokamute module to pass.
         import nokamute as _nm
 
-        # Use getattr because `pass` is a Python keyword and cannot be used as an attribute name in code.
         b2.apply(getattr(_nm.Turn, "pass")())
-        # Fallback: use the rust-provided textual move list for next moves
-        try:
-            moves_next = b2.legal_moves()
-        except Exception:
-            moves_next = []
         moves_to_edges(moves_next, "next_move", b2.to_move().name)
 
         return G

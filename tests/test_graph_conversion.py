@@ -59,10 +59,11 @@ def test_starting_position_counts_networkx():
         and G.nodes[v].get("node_type") == "destination"
     ]
     assert len(cur_edges) == 7
+    import nokamute as _nm
+
     assert all(
-        attrs.get("edge_label") is not None
-        and hasattr(attrs.get("edge_label"), "is_place")
-        and attrs.get("edge_label").is_place()
+        isinstance(attrs.get("edge_label"), str)
+        and _nm.Turn.from_string(attrs.get("edge_label")).is_place()
         for _, _, attrs in cur_edges
     )
     next_edges = [
@@ -74,9 +75,8 @@ def test_starting_position_counts_networkx():
     ]
     assert len(next_edges) == 7
     assert all(
-        attrs.get("edge_label") is not None
-        and hasattr(attrs.get("edge_label"), "is_place")
-        and attrs.get("edge_label").is_place()
+        isinstance(attrs.get("edge_label"), str)
+        and _nm.Turn.from_string(attrs.get("edge_label")).is_place()
         for _, _, attrs in next_edges
     )
 
