@@ -3,6 +3,7 @@ extern crate minimax;
 use crate::bug::Bug;
 use crate::hex_grid::*;
 use std::cmp::{max, min};
+use std::fmt;
 use std::collections::hash_map::DefaultHasher;
 use std::default::Default;
 use std::hash::Hasher;
@@ -338,6 +339,16 @@ pub enum Turn {
     Move(Hex, Hex),
     #[default]
     Pass,
+}
+
+impl fmt::Display for Turn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Turn::Place(hex, bug) => write!(f, "Place({}, {})", hex, bug.name()),
+            Turn::Move(from, to) => write!(f, "Move({}, {})", from, to),
+            Turn::Pass => write!(f, "Pass"),
+        }
+    }
 }
 
 impl Board {

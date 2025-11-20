@@ -489,7 +489,7 @@ impl Board {
 
         // For simplicity fill current move edges in Python side using the Rust turns list.
         // Provide a list of turns for the current player.
-        let py_moves = PyList::new(py, moves.into_iter().map(|m| format!("{:?}", m)).collect::<Vec<String>>());
+        let py_moves = PyList::new(py, moves.into_iter().map(|m| m.to_string()).collect::<Vec<String>>());
         graph.set_item("moves_current", py_moves)?;
 
         // Next-player moves: clone, apply pass, then generate moves
@@ -497,7 +497,7 @@ impl Board {
         clone.apply(RustTurn::Pass);
         let mut next_moves = Vec::new();
         Rules::generate_moves(&clone, &mut next_moves);
-        let py_next_moves = PyList::new(py, next_moves.into_iter().map(|m| format!("{:?}", m)).collect::<Vec<String>>());
+        let py_next_moves = PyList::new(py, next_moves.into_iter().map(|m| m.to_string()).collect::<Vec<String>>());
         graph.set_item("moves_next", py_next_moves)?;
 
         Ok(graph.into())
